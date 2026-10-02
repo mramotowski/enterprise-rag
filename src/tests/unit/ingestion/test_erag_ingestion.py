@@ -14,13 +14,14 @@ def mock_vectorstore():
     class MockDbClient:
         def __init__(self, *args, **kwargs):
             pass
-        def add_texts(texts, **kwargs):
+        async def add_texts(self, texts, embeddings, metadatas=None):
             return texts
-        def similarity_search_by_vector(**kwargs):
+        def similarity_search_by_vector(self, **kwargs):
             return [SearchRes('a'), SearchRes('b')]
-    with mock.patch('comps.vectorstores.utils.connectors.connector_redis.ConnectorRedis', return_value=MockDbClient):
+    with mock.patch('comps.vectorstores.utils.connectors.connector_redis.ConnectorRedis', return_value=MockDbClient()):
         yield
 
+@pytest.mark.asyncio
 async def test_ingest_multiple_docs(mock_vectorstore):
     docs = [
         EmbedDoc(text="doc1", embedding=[1,2,3]),
@@ -32,6 +33,7 @@ async def test_ingest_multiple_docs(mock_vectorstore):
 
     assert len(result.docs) == 2
 
+@pytest.mark.asyncio
 async def test_ingest_single_docs(mock_vectorstore):
     doc = EmbedDoc(text="doc1", embedding=[1,2,3])
 

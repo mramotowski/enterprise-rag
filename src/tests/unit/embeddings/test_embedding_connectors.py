@@ -49,7 +49,16 @@ def test_EmbeddingConnector_not_implemented():
         EmbeddingConnector("model", "endpoint")
 
 # TODO: Fix the tests below.
-# Currently, they are skipped because the configuration option asyncio_default_fixture_loop_scope is unset
+# They used to be skipped silently (unmarked async tests). They fail because
+# OVMSConnector passes the endpoint URL as `model`, which langchain-huggingface
+# rejects ("`model` must be a HuggingFace repo ID, not a URL"). Drop the xfail
+# once the connector is fixed.
+OVMS_URL_AS_MODEL = pytest.mark.xfail(
+    strict=True,
+    reason="OVMSConnector passes the endpoint URL as `model`; langchain-huggingface rejects URLs",
+)
+@OVMS_URL_AS_MODEL
+@pytest.mark.asyncio
 async def test_connector_initialization(teardown):
     model_name = "test_model"
     endpoint = "http://test-endpoint"
@@ -61,6 +70,8 @@ async def test_connector_initialization(teardown):
     assert embedding._embedder is not None
 
 
+@OVMS_URL_AS_MODEL
+@pytest.mark.asyncio
 async def test_connector_singleton_behavior(teardown):
     with mock.patch.object(OVMSConnector, '_validate', new=mock.AsyncMock(return_value=None)):
         instance1 = OVMSConnector("model1", "http://endpoint1")
@@ -69,6 +80,8 @@ async def test_connector_singleton_behavior(teardown):
         assert instance1 is instance2
 
 
+@OVMS_URL_AS_MODEL
+@pytest.mark.asyncio
 async def test_connector_singleton_behavior_wrong_model(teardown):
     with mock.patch.object(OVMSConnector, '_validate', new=mock.AsyncMock(return_value=None)):
         instance1 = OVMSConnector("model1", "http://endpoint1")
@@ -77,6 +90,8 @@ async def test_connector_singleton_behavior_wrong_model(teardown):
         assert instance1 is instance2
 
 
+@OVMS_URL_AS_MODEL
+@pytest.mark.asyncio
 async def test_connector_embedder_types(teardown):
     model_name = "test_model"
     endpoint = "http://test-endpoint"
