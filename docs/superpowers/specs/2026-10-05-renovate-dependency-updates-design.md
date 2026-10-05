@@ -77,8 +77,11 @@ Renovate runs self-hosted inside this repo:
 
 - `.github/workflows/renovate.yml`, SHA-pinned actions, `step-security/harden-runner`
   with egress allowlist. Triggers: `schedule` (Monday 03:00 UTC) and
-  `workflow_dispatch` with inputs `dry_run` (`full|lookup|extract|none`, default `full`),
-  `log_level` (`info|debug`) and `automerge` (bool, default false).
+  `workflow_dispatch` without inputs (Checkov `CKV_GHA_7` forbids them). Run
+  mode comes from repository variables: `RENOVATE_DRY_RUN`
+  (`full|lookup|extract|none`, unset = `full`), `RENOVATE_LOG_LEVEL`
+  (`info|debug`) and `RENOVATE_AUTOMERGE` (`true|false`). Only `none` writes
+  anything, so a fork stays in dry-run mode until an operator flips the variable.
 - Action `renovatebot/github-action` pinned by SHA; `renovate-image` is the
   `-full` image pinned by tag and digest, annotated so Renovate updates itself
   through the same workflow.
@@ -122,7 +125,7 @@ Key settings, with the reason each exists:
   `.github/workflows/renovate.yml` carries a `# renovate:` comment matched by
   the workflow regex manager, so the runner is in the weekly PR too.
 - Automerge is a runtime switch, not config: `RENOVATE_AUTOMERGE` env, default
-  `false`, exposed as a `workflow_dispatch` input. The config carries
+  `false`, fed from the repository variable of the same name. The config carries
   `automergeType: "pr"` and `platformAutomerge: true` so flipping the switch
   later needs no config PR. Branch protection still gates merges.
 - `schedule: ["before 6am on monday"]`, `timezone: "UTC"`. One run, one batch.

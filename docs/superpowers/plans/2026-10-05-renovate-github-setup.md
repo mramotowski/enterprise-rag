@@ -26,6 +26,14 @@ Install the app: App page → Install App → your account → "Only select repo
 - `RENOVATE_APP_PRIVATE_KEY` = full contents of the .pem file
 - Optional: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (read-only access token) to avoid Docker Hub rate limits
 
+Repository **variables** (same page, "Variables" tab) control the run mode; no code change needed to flip them:
+
+- `RENOVATE_DRY_RUN` = `full` for now (`full` | `lookup` | `extract` | `none`; unset behaves as `full`)
+- `RENOVATE_LOG_LEVEL` = `debug` for the first runs (`info` | `debug`)
+- `RENOVATE_AUTOMERGE` = `false` (`true` | `false`)
+
+Checkov rule CKV_GHA_7 forbids `workflow_dispatch` inputs, which is why these are variables.
+
 ## 3. Repository settings on the fork
 
 - Settings → General → Features: enable **Issues** (Dependency Dashboard is an issue).
@@ -46,11 +54,11 @@ its config from the default branch, and `schedule` only fires there.
 
 ## 5. First runs
 
-1. Actions → "Sec :: Renovate" → Run workflow → dry_run = `full`, log_level = `debug`. Read the log:
-   it lists every detected dependency and every branch it would create. The local dry run never
-   reaches the branch worker, so this is the first place file replacement is exercised: grep the
-   log for `Error updating branch` and `Digest is not updated` before any real run.
-2. Run again with dry_run = `none`. Expect: a "Dependency Dashboard (Renovate)" issue,
+1. With `RENOVATE_DRY_RUN=full` and `RENOVATE_LOG_LEVEL=debug`: Actions → "Sec :: Renovate" → Run workflow.
+   Read the log: it lists every detected dependency and every branch it would create. The local dry
+   run never reaches the branch worker, so this is the first place file replacement is exercised:
+   grep the log for `Error updating branch` and `Digest is not updated` before any real run.
+2. Set `RENOVATE_DRY_RUN=none` (and `RENOVATE_LOG_LEVEL=info`), run again. Expect: a "Dependency Dashboard (Renovate)" issue,
    a PR from branch `renovate/weekly`, zero or more `renovate/major-*` PRs, and
    `security`-labelled PRs if alerts are open.
 3. Close the open Dependabot PRs on the fork once the Renovate PRs cover them.

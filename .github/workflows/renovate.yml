@@ -10,8 +10,14 @@ name: "Sec :: Renovate"
 # App permissions: contents, pull requests, issues, workflows (write);
 # vulnerability alerts, metadata (read).
 #
-# The workflow_dispatch default is a *dry run* (nothing is written). Pick
-# dry_run=none for a real run. Automerge is off unless the input says otherwise.
+# Run mode comes from repository *variables* (Settings -> Secrets and variables
+# -> Actions -> Variables), not from workflow_dispatch inputs: Checkov
+# CKV_GHA_7 forbids dispatch inputs, and a variable also governs the scheduled
+# runs, so a fork can stay in dry-run mode until an operator flips it.
+#   RENOVATE_DRY_RUN   full | lookup | extract | none   (unset = full, i.e. dry)
+#   RENOVATE_LOG_LEVEL info | debug                     (unset = info)
+#   RENOVATE_AUTOMERGE true | false                     (unset = false)
+# Only RENOVATE_DRY_RUN=none creates branches, PRs and the dashboard issue.
 #
 # `schedule` only fires on the default branch. renovate.json5 narrows the
 # window further ("before 6am on monday"), so a manual run on another day only
@@ -21,21 +27,6 @@ on:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Dry run mode (none = real run that creates branches/PRs)"
-        type: choice
-        options: [full, lookup, extract, none]
-        default: full
-      log_level:
-        description: "Renovate log level"
-        type: choice
-        options: [info, debug]
-        default: info
-      automerge:
-        description: "Allow Renovate to automerge PRs that pass all checks"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -143,15 +134,17 @@ jobs:
           # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate versioning=docker
           renovate-image: ghcr.io/renovatebot/renovate:44.133.0-full@sha256:f8172bfd142f957ae5dd9cec535d2cceeb784e9fd6c1e708d2f57bbab1de0990
         env:
-          LOG_LEVEL: ${{ inputs.log_level || 'info' }}
+          LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL || 'info' }}
           RENOVATE_PLATFORM: github
           RENOVATE_REPOSITORIES: ${{ github.repository }}
           RENOVATE_ONBOARDING: "false"
           RENOVATE_REQUIRE_CONFIG: required
           RENOVATE_GIT_AUTHOR: ${{ steps.bot.outputs.git_author }}
           RENOVATE_HOST_RULES: ${{ steps.hostrules.outputs.rules }}
-          RENOVATE_AUTOMERGE: ${{ inputs.automerge == true && 'true' || 'false' }}
-          # Empty string = real run. Scheduled runs are always real.
-          RENOVATE_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run != 'none') && inputs.dry_run || '' }}
+          RENOVATE_AUTOMERGE: ${{ vars.RENOVATE_AUTOMERGE == 'true' && 'true' || 'false' }}
+          # Empty string = real run; anything else is a dry-run mode. Unset
+          # variable defaults to a full dry run, so nothing is written until
+          # an operator sets RENOVATE_DRY_RUN=none.
+          RENOVATE_DRY_RUN: ${{ (vars.RENOVATE_DRY_RUN || 'full') != 'none' && (vars.RENOVATE_DRY_RUN || 'full') || '' }}
           # Read access to other GitHub repos for release notes and github-* datasources.
           GITHUB_COM_TOKEN: ${{ steps.app-token.outputs.token }}
