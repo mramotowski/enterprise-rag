@@ -49,7 +49,7 @@ Added to the POC (native manager or a one-line regex rule):
 |---|---|---|
 | Compose images (`vllm-cpu-release-repo`, `mongo:8.0.11`, `postgres:16.4`, `redis/redis-stack`, `chrislusf/seaweedfs:4.16`) | 9 `docker-compose.y*ml` under `src/comps/**` and `deployment/components/external-seaweedfs` | `docker-compose` |
 | Workflow `container:` image and `setup-uv` `version:` input | `val-unit-tests.yml` | `github-actions` (native `container` and `uses-with` dep types) |
-| Scanner tool pins in workflows: `bandit==`, `checkov==`, `ansible-lint==`, `python-version: '3.12.14'`, trivy `version: v0.74.0` (x3), `SHELLCHECK_VERSION` | `bandit.yml`, `checkov.yml`, `ansible-lint.yml`, `trivy.yml`, `shellcheck.yml` | regex with `# renovate: datasource=… depName=…` comments (pypi, python-version, github-releases) |
+| Scanner tool pins in workflows: `bandit`, `checkov`, `ansible-lint` via annotated env vars; `setup-python` `python-version`, trivy-action `version`, `setup-uv` `version` and `container:` images are detected natively | `bandit.yml`, `checkov.yml`, `ansible-lint.yml`, `trivy.yml`, `val-unit-tests.yml` | regex (`# renovate:` comments) and `github-actions` (`uses-with`, `container` dep types) |
 | seaweedfs Helm chart `version: "4.37.0"` + `repo:` | `deployment/components/edp/values.yaml` | regex, datasource `helm`, `registryUrlTemplate` from the `repo:` line |
 | Image tags in Ansible defaults (`busybox:1.36`, redis `tag: "8.2.2"`) and scripts (`REDIS_IMAGE=`, `REGISTRY_IMAGE=registry:2`) | `deployment/roles/*/defaults/main.yaml`, `*.sh` | regex, datasource `docker` |
 | `corepack prepare pnpm@10.33.4` (x3 UI Dockerfiles) | `src/ui/apps/*/Dockerfile` | regex, datasource `npm`, grouped with `npm` |
@@ -63,7 +63,9 @@ Deferred to phase 2 (needs coordination or a bespoke rule):
 - Hugging Face model `revision="<sha>"` pins in 13 guardrail scanner files. No built-in datasource; the `git-refs` datasource against `huggingface.co/<org>/<model>` is possible but untested.
 - Security-only lane on `release-X.Y` branches (`baseBranches` + `matchBaseBranches`).
 
-Not Renovate's job (manual hygiene, see section 6): apt `openssl=3.5.7-1~deb13u3` pin in 24 Dockerfiles (no Debian datasource), floating `epel-release-latest-9` RPM and unpinned `curl https://astral.sh/uv/install.sh | sh` in the vLLM UBI Dockerfile, first-party `*-base:latest` build-stage images, `deployment/version.yaml`.
+Partly covered: the apt `openssl=3.5.7-1~deb13u3` pins in 24 Dockerfiles are tracked by the `dockerfile` manager's `deb` datasource against trixie main (point releases). The `trixie-security` pocket publishes only `Packages.xz`, which Renovate cannot read, so security-only builds show up at the next point release.
+
+Not Renovate's job (manual hygiene, see section 5): floating `epel-release-latest-9` RPM and unpinned `curl https://astral.sh/uv/install.sh | sh` in the vLLM UBI Dockerfile, first-party `*-base:latest` build-stage images, `deployment/version.yaml`. `shellcheck.yml` stays manual: its download is checksum-verified via `SHELLCHECK_SHA256`, which Renovate cannot regenerate.
 
 Out of scope: ai-solutions and inference repos (same config applies later), automerge.
 
@@ -177,8 +179,16 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
    `tox`, `tox-uv`, `uv` so they always move together (they must match or tox
    self-provisions a second copy; see knowledge `rag/ci/unit-tests`).
 3. **uv in `COPY --from=ghcr.io/astral-sh/uv:0.8.0`.** Native `dockerfile`
-   manager already handles `COPY --from`; a rule groups it with the `uv` tool
-   rule above so one version is used repo-wide.
+   manager already handles `COPY --from`; it lands in the same weekly PR as
+   the `uv` tool pins.
+4. **Generic annotation manager.** Any line preceded by
+   `# renovate: datasource=… depName=… [versioning=…] [extractVersion=…] [registryUrl=…]`
+   in workflows, `deployment/**` YAML, shell scripts and Dockerfiles. The value
+   may carry `@sha256:<digest>`. Used for the seaweedfs chart version,
+   busybox/redis/registry image tags, pnpm, the redis source tag, the Polish
+   spaCy model, scanner tool pins (as env vars) and the Renovate image itself.
+   The tox.ini and workflow pins share dep names (`tox`, `tox-uv`, `uv`), so
+   they move in one branch without an explicit group.
 
 ### 3.5 Guardrails and verification
 
@@ -191,6 +201,12 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
   automerge `digest` and `pin` updates on green CI.
 - Dry run (`RENOVATE_DRY_RUN=full`) before the first real run; the log is the
   onboarding report for the proposal.
+- Local reproduction: `.github/scripts/renovate-local.sh validate|extract|lookup|full`
+  runs the same Renovate version in `--platform=local` mode (git-tracked files
+  only, no branch processing). Every config change in the POC was verified
+  this way before being committed; the ARG-split digest replacement was
+  additionally verified by calling Renovate's `doAutoReplace` on a copy of
+  `src/edp/Dockerfile`.
 
 ### 3.6 Failure handling
 
@@ -225,11 +241,12 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
 Found during the sweep. Each is a small separate PR; none blocks the POC, and
 several are the kind of drift the POC proposal argues against.
 
-1. **openssl apt pin** `3.5.7-1~deb13u3` duplicated in 24 Dockerfiles. When
-   Debian publishes `~deb13u4` the pinned `apt-get install --only-upgrade`
-   fails and every image build breaks at once. Options: drop the version and
-   rely on the digest-pinned base plus an unpinned `--only-upgrade`, or move the
-   value to one build arg. Decision for upstream.
+1. **openssl apt pin** `3.5.7-1~deb13u3` duplicated in 24 Dockerfiles.
+   Renovate now tracks it against trixie main, but a security-pocket bump to
+   `~deb13u4` still breaks every image build until the next point release
+   folds it into main. Options: drop the version and rely on the digest-pinned
+   base plus an unpinned `--only-upgrade`, or move the value to one build arg.
+   Decision for upstream.
 2. **Floating Helm chart**: `prometheus-adapter` installed with no
    `chart_version` in `deployment/roles/app_hpa/tasks/install.yaml`. Pin it;
    then Renovate can track it.
