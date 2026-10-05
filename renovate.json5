@@ -47,6 +47,9 @@
     "**/__fixtures__/**",
     "**/.tox/**",
     "**/.venv/**",
+    // Release stages only reference first-party `<name>-base:latest` images
+    // built earlier in the same pipeline.
+    "**/Dockerfile.release",
   ],
   // Helm templates and Ansible role files carry plain `image: name:tag` lines.
   kubernetes: {
@@ -127,6 +130,16 @@
     },
     // Lane 3 (CVE fixes) is configured in vulnerabilityAlerts above: own
     // branch per fix, no schedule, no cooldown.
+
+    // Images built by this repo (deployment/images.yaml) are versioned by the
+    // release, not by a registry lookup. Helm values split them into
+    // repository "docker.io/intel" + image "enterprise-rag-<svc>".
+    {
+      description: "First-party images are not dependencies",
+      matchDatasources: ["docker"],
+      matchPackageNames: ["/^enterprise-rag-/", "docker.io/intel", "/-base$/"],
+      enabled: false,
+    },
 
     // Digest-only updates have no release date; cooldown would stall them.
     {
