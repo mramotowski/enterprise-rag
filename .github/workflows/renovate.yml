@@ -1,0 +1,154 @@
+---
+name: "Sec :: Renovate"
+
+# Self-hosted Renovate: one weekly grouped dependency PR, separate PRs for
+# majors, immediate PRs for CVE fixes. Repo config lives in /renovate.json5
+# (see docs/superpowers/specs/2026-10-05-renovate-dependency-updates-design.md).
+#
+# Authentication is a GitHub App token minted per run. GITHUB_TOKEN would not
+# do: it cannot modify .github/workflows/* and PRs it opens do not trigger CI.
+# App permissions: contents, pull requests, issues, workflows (write);
+# vulnerability alerts, metadata (read).
+#
+# The workflow_dispatch default is a *dry run* (nothing is written). Pick
+# dry_run=none for a real run. Automerge is off unless the input says otherwise.
+#
+# `schedule` only fires on the default branch. renovate.json5 narrows the
+# window further ("before 6am on monday"), so a manual run on another day only
+# touches security PRs, which are allowed "at any time".
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run mode (none = real run that creates branches/PRs)"
+        type: choice
+        options: [full, lookup, extract, none]
+        default: full
+      log_level:
+        description: "Renovate log level"
+        type: choice
+        options: [info, debug]
+        default: info
+      automerge:
+        description: "Allow Renovate to automerge PRs that pass all checks"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          # Switch to `block` after the first real run confirms this list.
+          egress-policy: audit
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            registry-1.docker.io:443
+            auth.docker.io:443
+            index.docker.io:443
+            production.cloudflare.docker.com:443
+            public.ecr.aws:443
+            quay.io:443
+            registry.access.redhat.com:443
+            mcr.microsoft.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
+            registry.npmjs.org:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            charts.apiseven.com:443
+            seaweedfs.github.io:443
+            deb.debian.org:443
+            api.osv.dev:443
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: write
+          permission-vulnerability-alerts: read
+          permission-metadata: read
+
+      - name: Resolve bot identity
+        # Commits must be authored by the app's bot user so the DCO sign-off
+        # (:gitSignOff) carries the right identity.
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          user_id=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          echo "git_author=${APP_SLUG}[bot] <${user_id}+${APP_SLUG}[bot]@users.noreply.github.com>" >> "$GITHUB_OUTPUT"
+
+      - name: Compose registry credentials
+        # Optional read-only Docker Hub token avoids anonymous pull-rate limits
+        # during digest lookups across 70+ Dockerfiles.
+        id: hostrules
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
+            rules=$(jq -cn --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
+              '[{matchHost:"docker.io",username:$u,password:$p}]')
+          else
+            rules='[]'
+          fi
+          echo "::add-mask::${rules}"
+          echo "rules=${rules}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@230ce922b08968d0a4f6f70f295601daff09ef1d # v46.3.7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          renovate-image: ghcr.io/renovatebot/renovate
+          # Renovate updates this line itself through the '# renovate:' manager.
+          # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate versioning=docker
+          renovate-version: 44.133.0-full@sha256:f8172bfd142f957ae5dd9cec535d2cceeb784e9fd6c1e708d2f57bbab1de0990
+        env:
+          LOG_LEVEL: ${{ inputs.log_level || 'info' }}
+          RENOVATE_PLATFORM: github
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_REQUIRE_CONFIG: required
+          RENOVATE_GIT_AUTHOR: ${{ steps.bot.outputs.git_author }}
+          RENOVATE_HOST_RULES: ${{ steps.hostrules.outputs.rules }}
+          RENOVATE_AUTOMERGE: ${{ inputs.automerge == true && 'true' || 'false' }}
+          # Empty string = real run. Scheduled runs are always real.
+          RENOVATE_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run != 'none') && inputs.dry_run || '' }}
+          # Read access to other GitHub repos for release notes and github-* datasources.
+          GITHUB_COM_TOKEN: ${{ steps.app-token.outputs.token }}
