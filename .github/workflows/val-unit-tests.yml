@@ -30,6 +30,14 @@ jobs:
     container: python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
     env:
       DEBIAN_FRONTEND: noninteractive
+      # Must equal [tox] requires in src/tox.ini, otherwise tox provisions a
+      # second copy of itself in .tox/.tox on every run. Renovate bumps both.
+      # renovate: datasource=pypi depName=uv
+      UV_VERSION: "0.8.17"
+      # renovate: datasource=pypi depName=tox
+      TOX_VERSION: "4.30.2"
+      # renovate: datasource=pypi depName=tox-uv
+      TOX_UV_VERSION: "1.28.0"
     strategy:
       fail-fast: false
       matrix:
@@ -68,19 +76,17 @@ jobs:
           apt-get update
           apt-get -y install --no-install-recommends libgl1 build-essential
 
-      # Versions must match [tox] requires in src/tox.ini, otherwise tox
-      # provisions a second copy of itself in .tox/.tox on every run.
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.8.17"
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-python: true
           cache-suffix: ${{ matrix.test-name }}
 
       - name: Install tox
         run: |
-          uv tool install tox==4.30.2 --with tox-uv==1.28.0 --with uv==0.8.17
+          uv tool install "tox==${TOX_VERSION}" --with "tox-uv==${TOX_UV_VERSION}" --with "uv==${UV_VERSION}"
           uv tool dir --bin >> "$GITHUB_PATH"
 
       - name: Run unit tests

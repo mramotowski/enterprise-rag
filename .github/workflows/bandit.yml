@@ -67,9 +67,12 @@ jobs:
           python-version: '3.12.14'
 
       - name: Install Bandit
+        env:
+          # renovate: datasource=pypi depName=bandit
+          BANDIT_VERSION: "1.9.4"
         run: >-
           pip install --disable-pip-version-check
-          "bandit[sarif,toml]==1.9.4"
+          "bandit[sarif,toml]==${BANDIT_VERSION}"
 
       # Skipped tests, and why each one cannot be true here:
       #   B101 assert_used                  -- asserts in test code
