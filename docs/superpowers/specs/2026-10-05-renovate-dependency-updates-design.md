@@ -41,9 +41,31 @@ Dependency surfaces in the repo and the Renovate manager that owns each:
 | GitHub Actions `uses:` | `.github/workflows/*.yml` | `github-actions` |
 | Tool versions in workflows and tox | `setup-uv` `version:`, `uv tool install tox==…`, `src/tox.ini` `requires` | custom regex manager with `# renovate:` comments |
 
-Out of scope for the POC: ai-solutions and inference repos (same config applies
-later), automerge, model versions in `deployment/models.yaml`, apt package pins
-inside Dockerfiles.
+### 2.1 Additional surfaces found by a full-repo sweep
+
+Added to the POC (native manager or a one-line regex rule):
+
+| Surface | Files | Manager |
+|---|---|---|
+| Compose images (`vllm-cpu-release-repo`, `mongo:8.0.11`, `postgres:16.4`, `redis/redis-stack`, `chrislusf/seaweedfs:4.16`) | 9 `docker-compose.y*ml` under `src/comps/**` and `deployment/components/external-seaweedfs` | `docker-compose` |
+| Workflow `container:` image and `setup-uv` `version:` input | `val-unit-tests.yml` | `github-actions` (native `container` and `uses-with` dep types) |
+| Scanner tool pins in workflows: `bandit==`, `checkov==`, `ansible-lint==`, `python-version: '3.12.14'`, trivy `version: v0.74.0` (x3), `SHELLCHECK_VERSION` | `bandit.yml`, `checkov.yml`, `ansible-lint.yml`, `trivy.yml`, `shellcheck.yml` | regex with `# renovate: datasource=… depName=…` comments (pypi, python-version, github-releases) |
+| seaweedfs Helm chart `version: "4.37.0"` + `repo:` | `deployment/components/edp/values.yaml` | regex, datasource `helm`, `registryUrlTemplate` from the `repo:` line |
+| Image tags in Ansible defaults (`busybox:1.36`, redis `tag: "8.2.2"`) and scripts (`REDIS_IMAGE=`, `REGISTRY_IMAGE=registry:2`) | `deployment/roles/*/defaults/main.yaml`, `*.sh` | regex, datasource `docker` |
+| `corepack prepare pnpm@10.33.4` (x3 UI Dockerfiles) | `src/ui/apps/*/Dockerfile` | regex, datasource `npm`, grouped with `npm` |
+| `ARG REDIS_VERSION=8.2.2` (git clone tag), spaCy model `pl_core_news_sm-3.8.0` release URL | `vectorstores/.../redis-svs-vamana/Dockerfile`, `retrievers/.../Dockerfile` | regex, `github-tags` / `github-releases` |
+
+Deferred to phase 2 (needs coordination or a bespoke rule):
+
+- `deployment/models.yaml` vLLM image tags: three versions under `runtimes.vllm.versions` keyed by version string, plus 20 `server_version:` entries and `default_version` that must stay consistent. Bumping the image alone would break the mapping. Needs a decision on the data model first.
+- Go tooling in `src/gmc/Makefile` (kustomize, controller-tools, golangci-lint, envtest release branch).
+- vLLM CPU UBI Dockerfile ARGs (`NUMACTL_VERSION`, `GPERFTOOLS_VERSION`, `VLLM_VERSION="releases/v0.18.0"` which is a branch, not a tag), `pkgs.k8s.io` kubectl repo minor `v1.34`.
+- Hugging Face model `revision="<sha>"` pins in 13 guardrail scanner files. No built-in datasource; the `git-refs` datasource against `huggingface.co/<org>/<model>` is possible but untested.
+- Security-only lane on `release-X.Y` branches (`baseBranches` + `matchBaseBranches`).
+
+Not Renovate's job (manual hygiene, see section 6): apt `openssl=3.5.7-1~deb13u3` pin in 24 Dockerfiles (no Debian datasource), floating `epel-release-latest-9` RPM and unpinned `curl https://astral.sh/uv/install.sh | sh` in the vLLM UBI Dockerfile, first-party `*-base:latest` build-stage images, `deployment/version.yaml`.
+
+Out of scope: ai-solutions and inference repos (same config applies later), automerge.
 
 ## 3. Design
 
@@ -78,9 +100,24 @@ to `block` after the first real run confirms the list.
 
 Key settings, with the reason each exists:
 
-- `extends: ["config:best-practices", ":dependencyDashboard", "helpers:pinGitHubActionDigests"]`.
+- `extends: ["config:best-practices", ":dependencyDashboard", ":gitSignOff", ":semanticCommits", "helpers:pinGitHubActionDigests"]`.
   `config:best-practices` brings `pinDigests`, `configMigration`,
-  `minimumReleaseAge` baseline and `abandonmentThreshold`.
+  `minimumReleaseAge` baseline and `abandonmentThreshold`. `:gitSignOff` adds
+  the DCO `Signed-off-by` trailer that `CONTRIBUTING.md` requires on every commit.
+- `enabledManagers` is an explicit allowlist (`github-actions`, `pep621`,
+  `pip_requirements`, `npm`, `gomod`, `dockerfile`, `docker-compose`,
+  `helm-values`, `helmv3`, `kubernetes`, `custom.regex`). Nothing runs that was
+  not reviewed; new managers are a config change with a diff.
+- Base-image policy via update types, not version caps: `python`, `node`,
+  `golang` images get `major`/`minor` disabled and `patch` + `digest` enabled.
+  `ghcr.io/astral-sh/uv` and the `uv`/`tox`/`tox-uv` tool group move together.
+- Renovate updates itself: the Renovate image reference in
+  `.github/workflows/renovate.yml` carries a `# renovate:` comment matched by
+  the workflow regex manager, so the runner is in the weekly PR too.
+- Automerge is a runtime switch, not config: `RENOVATE_AUTOMERGE` env, default
+  `false`, exposed as a `workflow_dispatch` input. The config carries
+  `automergeType: "pr"` and `platformAutomerge: true` so flipping the switch
+  later needs no config PR. Branch protection still gates merges.
 - `schedule: ["before 6am on monday"]`, `timezone: "UTC"`. One run, one batch.
 - `minimumReleaseAge: "3 days"` for all package updates except digests. Fresh
   releases are the main supply-chain attack vector (maintainer account
@@ -113,9 +150,10 @@ Three lanes via `packageRules`:
    release notes links, grouped by manager.
 2. **Major updates**: `matchUpdateTypes: ["major"]`, not grouped, one PR per
    dependency, same schedule. A breaking bump must not block the weekly batch.
-   The Python base image is excluded from this lane: `allowedVersions: "<3.12"`
-   blocks 3.12 entirely, because moving it requires changing `requires-python`
-   in 29 `pyproject.toml` files, which is a manual, coordinated change.
+   Base images (`python`, `node`, `golang`) are excluded from this lane:
+   `major`/`minor` disabled per section 3.2. Python 3.12 in particular requires
+   changing `requires-python` in 29 `pyproject.toml` files, a manual,
+   coordinated change.
 3. **Security PRs**: produced by `vulnerabilityAlerts`/OSV, `schedule: at any time`,
    `minimumReleaseAge: null`, `prPriority: 10`, not grouped, label `security`.
 
@@ -182,7 +220,40 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
    recommendation to close #27 and disable Dependabot security updates.
 7. Record non-obvious findings in the OKF bundle (`okf-update`).
 
-## 5. Alternatives rejected
+## 5. Hygiene findings to fix outside Renovate
+
+Found during the sweep. Each is a small separate PR; none blocks the POC, and
+several are the kind of drift the POC proposal argues against.
+
+1. **openssl apt pin** `3.5.7-1~deb13u3` duplicated in 24 Dockerfiles. When
+   Debian publishes `~deb13u4` the pinned `apt-get install --only-upgrade`
+   fails and every image build breaks at once. Options: drop the version and
+   rely on the digest-pinned base plus an unpinned `--only-upgrade`, or move the
+   value to one build arg. Decision for upstream.
+2. **Floating Helm chart**: `prometheus-adapter` installed with no
+   `chart_version` in `deployment/roles/app_hpa/tasks/install.yaml`. Pin it;
+   then Renovate can track it.
+3. **Dead variable**: `apisix_helm_chart_version: "2.10.0"` in
+   `roles/app_apisix/defaults/main.yaml` is unreferenced; the real dependency
+   is `2.14.1` in `components/apisix/Chart.yaml`. Delete.
+4. **Unpinned installs** in `src/comps/llms/impl/model_server/vllm/docker/cpu_ubi/Dockerfile`:
+   `curl https://astral.sh/uv/install.sh | sh` and `epel-release-latest-9.noarch.rpm`.
+   Replace with a pinned `COPY --from=ghcr.io/astral-sh/uv:<ver>@sha256:…` like
+   the other 24 Dockerfiles, and a versioned EPEL RPM.
+5. **Divergent copies of the same dependency**: vLLM CPU image appears as
+   `v0.11.2`, `v0.14.0`, `v0.19.1` (compose), `v0.24.0`/`v0.21.0`/`v0.19.1`
+   (models.yaml) and `0.22.1` (asr Dockerfile); redis `8.2.2` in five places;
+   `mongo:5.0.6` in a test helper vs `mongo:8.0.11` in compose. Renovate will
+   bump each copy independently, which is correct, but a single source per
+   dependency would make the weekly PR smaller.
+6. **Must-match pairs** Renovate cannot enforce: `golang:1.25.12` (Dockerfile)
+   vs `go 1.25.12` (go.mod), `pl_core_news_sm-3.8.0` vs `spacy==3.8.11`
+   major.minor. Group them in `packageRules` so they land in the same commit
+   and reviewers see both.
+7. `rag-utils` init-container tag `1.5.0` while `version.yaml` says `3.0.0`.
+   Likely stale.
+
+## 6. Alternatives rejected
 
 - **Dependabot with `dependabot.yml` and multi-ecosystem groups.** No custom
   manager, so `ARG`-split base images, tool versions in `run:` lines and tox
