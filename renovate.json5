@@ -1,0 +1,11 @@
+// Renovate configuration for enterprise-rag.
+//
+// Design: docs/superpowers/specs/2026-10-05-renovate-dependency-updates-design.md
+// Runner: .github/workflows/renovate.yml (self-hosted, weekly) and
+//         .github/workflows/renovate-validate.yml (validates this file on PRs).
+// Local check before pushing: .github/scripts/renovate-local.sh validate|extract|lookup
+// Reference: https://docs.renovatebot.com/configuration-options/
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:best-practices"],
+}
