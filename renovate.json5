@@ -7,5 +7,101 @@
 // Reference: https://docs.renovatebot.com/configuration-options/
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
-  extends: ["config:best-practices"],
+
+  // config:best-practices = config:recommended + digest pinning for Docker and
+  // GitHub Actions + config migration + abandonment detection + weekly lock
+  // file maintenance. :gitSignOff adds the DCO trailer CONTRIBUTING.md requires.
+  extends: [
+    "config:best-practices",
+    ":dependencyDashboard",
+    ":gitSignOff",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests",
+  ],
+
+  // ---------------------------------------------------------------------------
+  // Scope
+  // ---------------------------------------------------------------------------
+  // Explicit allowlist: a manager that is not listed never runs, even if
+  // Renovate adds new ones. terraform is deliberately absent
+  // (src/edp/terraform is a sample, not a shipped artefact).
+  enabledManagers: [
+    "github-actions",
+    "pep621",
+    "pip_requirements",
+    "npm",
+    "gomod",
+    "dockerfile",
+    "docker-compose",
+    "helm-values",
+    "helmv3",
+    "kubernetes",
+    "custom.regex",
+  ],
+  // config:recommended ignores **/tests/** and **/test/**. We want
+  // src/tests/**/requirements.txt managed, so the list is restated without them.
+  ignorePaths: [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/__fixtures__/**",
+    "**/.tox/**",
+    "**/.venv/**",
+  ],
+  // Helm templates and Ansible role files carry plain `image: name:tag` lines.
+  kubernetes: {
+    managerFilePatterns: [
+      "/^deployment/components/[^/]+/templates/.+\\.ya?ml$/",
+      "/^deployment/roles/.+\\.ya?ml$/",
+    ],
+  },
+  // ~500 of ~700 pyproject specifiers are `==` pins. "bump" moves the pin and
+  // regenerates uv.lock in the same commit instead of leaving pins frozen.
+  pep621: {
+    rangeStrategy: "bump",
+  },
+
+  // ---------------------------------------------------------------------------
+  // Cadence and PR shape
+  // ---------------------------------------------------------------------------
+  timezone: "UTC",
+  schedule: ["before 6am on monday"],
+  // Weekly lock refresh picks up transitive updates that no direct pin covers.
+  // Grouped into the weekly PR by the packageRules below.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 6am on monday"],
+  },
+  // Fresh releases are the supply-chain attack vector (maintainer account
+  // takeover). Three days lets a malicious release be yanked before we pull
+  // it. Digest-only updates and vulnerability fixes are exempt (see rules).
+  minimumReleaseAge: "3 days",
+  prConcurrentLimit: 10,
+  prHourlyLimit: 0,
+  branchConcurrentLimit: 0,
+  rebaseWhen: "behind-base-branch",
+  labels: ["dependencies", "renovate"],
+  semanticCommitType: "build",
+  semanticCommitScope: "deps",
+  dependencyDashboardTitle: "Dependency Dashboard (Renovate)",
+  // Automerge itself is OFF by default; the runner workflow flips it via the
+  // RENOVATE_AUTOMERGE environment variable. These two settings only define
+  // HOW an automerge happens when it is enabled, so no config PR is needed then.
+  automergeType: "pr",
+  platformAutomerge: true,
+
+  // ---------------------------------------------------------------------------
+  // Security lane: CVE fixes bypass schedule, grouping and cooldown
+  // ---------------------------------------------------------------------------
+  // Needs the Dependabot alerts feed (GitHub App permission
+  // "vulnerability alerts: read"); OSV covers ecosystems GitHub does not.
+  // PR priority for these lives in packageRules (matchIsVulnerabilityAlert).
+  vulnerabilityAlerts: {
+    enabled: true,
+    labels: ["dependencies", "renovate", "security"],
+    schedule: ["at any time"],
+    minimumReleaseAge: null,
+    groupName: null,
+  },
+  osvVulnerabilityAlerts: true,
 }
