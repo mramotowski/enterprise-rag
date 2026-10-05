@@ -67,6 +67,7 @@ jobs:
             registry-1.docker.io:443
             auth.docker.io:443
             index.docker.io:443
+            hub.docker.com:443
             production.cloudflare.docker.com:443
             public.ecr.aws:443
             quay.io:443
@@ -74,6 +75,8 @@ jobs:
             mcr.microsoft.com:443
             pypi.org:443
             files.pythonhosted.org:443
+            download.pytorch.org:443
+            www.python.org:443
             registry.npmjs.org:443
             proxy.golang.org:443
             sum.golang.org:443
@@ -135,10 +138,10 @@ jobs:
         uses: renovatebot/github-action@230ce922b08968d0a4f6f70f295601daff09ef1d # v46.3.7
         with:
           token: ${{ steps.app-token.outputs.token }}
-          renovate-image: ghcr.io/renovatebot/renovate
-          # Renovate updates this line itself through the '# renovate:' manager.
+          # Full image pinned by tag and digest. Renovate updates this line
+          # itself through the '# renovate:' manager.
           # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate versioning=docker
-          renovate-version: 44.133.0-full@sha256:f8172bfd142f957ae5dd9cec535d2cceeb784e9fd6c1e708d2f57bbab1de0990
+          renovate-image: ghcr.io/renovatebot/renovate:44.133.0-full@sha256:f8172bfd142f957ae5dd9cec535d2cceeb784e9fd6c1e708d2f57bbab1de0990
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_PLATFORM: github

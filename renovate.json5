@@ -70,7 +70,8 @@
   timezone: "UTC",
   schedule: ["before 6am on monday"],
   // Weekly lock refresh picks up transitive updates that no direct pin covers.
-  // Grouped into the weekly PR by the packageRules below.
+  // Same schedule and group as the weekly PR; Renovate keeps it on its own
+  // branch (renovate/lock-file-maintenance-weekly) by design.
   lockFileMaintenance: {
     enabled: true,
     schedule: ["before 6am on monday"],
@@ -79,9 +80,10 @@
   // takeover). Three days lets a malicious release be yanked before we pull
   // it. Digest-only updates and vulnerability fixes are exempt (see rules).
   minimumReleaseAge: "3 days",
+  // branchConcurrentLimit follows prConcurrentLimit (default), so at most 10
+  // branches exist without a PR-less backlog of uv.lock regenerations.
   prConcurrentLimit: 10,
   prHourlyLimit: 0,
-  branchConcurrentLimit: 0,
   rebaseWhen: "behind-base-branch",
   labels: ["dependencies", "renovate"],
   semanticCommitType: "build",
@@ -112,9 +114,13 @@
   // ---------------------------------------------------------------------------
   packageRules: [
     // Lane 1: everything non-breaking lands in ONE weekly PR.
+    // No matchPackageNames here on purpose: the lockFileMaintenance pseudo
+    // update has no package name and would otherwise fall out of the group.
+    // Renovate still gives grouped lock file maintenance its own branch
+    // (renovate/lock-file-maintenance-weekly), so Monday yields two PRs:
+    // the dependency batch and the lock refresh.
     {
       description: "Weekly grouped PR for all minor/patch/digest/pin/lockfile updates",
-      matchPackageNames: ["*"],
       matchUpdateTypes: ["minor", "patch", "pin", "digest", "pinDigest", "lockFileMaintenance"],
       groupName: "weekly dependencies",
       groupSlug: "weekly",
@@ -123,7 +129,6 @@
     // blocks the weekly batch. Branch prefix makes them easy to filter.
     {
       description: "Major updates: separate PR per dependency",
-      matchPackageNames: ["*"],
       matchUpdateTypes: ["major"],
       additionalBranchPrefix: "major-",
       prPriority: -1,
@@ -152,6 +157,15 @@
     {
       description: "No digest pinning in Helm values / templates",
       matchManagers: ["helm-values", "kubernetes", "helmv3"],
+      pinDigests: false,
+    },
+    // Annotated pins (Ansible defaults, shell variables, Dockerfile ARGs) have
+    // no autoReplaceStringTemplate, so a pinDigest upgrade could not be
+    // written and would fail the whole weekly branch. Deps that already carry
+    // @sha256 (python base, Renovate image) still get digest updates.
+    {
+      description: "No digest pinning for custom regex pins",
+      matchManagers: ["custom.regex"],
       pinDigests: false,
     },
 

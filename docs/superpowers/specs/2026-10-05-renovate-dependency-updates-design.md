@@ -36,10 +36,10 @@ Dependency surfaces in the repo and the Renovate manager that owns each:
 | Container base images, plain `FROM` and `COPY --from` | 73 Dockerfiles | `dockerfile` |
 | Container base image split into `ARG python_version` / `python_image_digest` | 24 Dockerfiles | custom regex manager |
 | Helm chart image tags | `deployment/components/*/values.yaml` | `helm-values` |
-| Inline `image:` in templates and manifests | `deployment/**/*.yaml` | `kubernetes` (scoped by `fileMatch`) |
+| Inline `image:` in templates and manifests | `deployment/components/*/templates/**`, `deployment/roles/**` | `kubernetes` (scoped by `managerFilePatterns`) |
 | External chart dependency | `deployment/components/apisix/Chart.yaml` | `helmv3` |
 | GitHub Actions `uses:` | `.github/workflows/*.yml` | `github-actions` |
-| Tool versions in workflows and tox | `setup-uv` `version:`, `uv tool install tox==…`, `src/tox.ini` `requires` | custom regex manager with `# renovate:` comments |
+| Tool versions in workflows and tox | `UV_VERSION`/`TOX_VERSION`/`TOX_UV_VERSION` env vars in `val-unit-tests.yml`, `src/tox.ini` `requires` | custom regex managers (`# renovate:` comments; tox.ini pattern) |
 
 ### 2.1 Additional surfaces found by a full-repo sweep
 
@@ -77,9 +77,11 @@ Renovate runs self-hosted inside this repo:
 
 - `.github/workflows/renovate.yml`, SHA-pinned actions, `step-security/harden-runner`
   with egress allowlist. Triggers: `schedule` (Monday 03:00 UTC) and
-  `workflow_dispatch` with inputs `dryRun` (bool) and `logLevel`.
-- Action `renovatebot/github-action` pinned by SHA, Renovate image pinned by
-  version and digest (Renovate updates itself through the same workflow).
+  `workflow_dispatch` with inputs `dry_run` (`full|lookup|extract|none`, default `full`),
+  `log_level` (`info|debug`) and `automerge` (bool, default false).
+- Action `renovatebot/github-action` pinned by SHA; `renovate-image` is the
+  `-full` image pinned by tag and digest, annotated so Renovate updates itself
+  through the same workflow.
 - Authentication: a GitHub App installed on the repo with permissions
   `contents: write`, `pull_requests: write`, `issues: write`, `workflows: write`.
   Token minted per run with `actions/create-github-app-token`. Reasons:
@@ -90,13 +92,16 @@ Renovate runs self-hosted inside this repo:
   pull-rate limits during digest lookups across 73 Dockerfiles.
 - `permissions: contents: read` at workflow level; the app token carries write.
 
-Egress allowlist: `api.github.com`, `github.com`, `objects.githubusercontent.com`,
-`ghcr.io`, `pkg-containers.githubusercontent.com`, `registry-1.docker.io`,
-`auth.docker.io`, `index.docker.io`, `production.cloudflare.docker.com`,
-`quay.io`, `registry.access.redhat.com`, `mcr.microsoft.com`, `pypi.org`,
-`files.pythonhosted.org`, `registry.npmjs.org`, `proxy.golang.org`,
-`sum.golang.org`, `charts.apiseven.com`. Start in `egress-policy: audit`, switch
-to `block` after the first real run confirms the list.
+Egress allowlist (authoritative copy in the workflow): GitHub (`api.github.com`,
+`github.com`, `objects.githubusercontent.com`, `raw.githubusercontent.com`),
+GHCR, Docker Hub (`registry-1.docker.io`, `auth.docker.io`, `index.docker.io`,
+`hub.docker.com`, `production.cloudflare.docker.com`), `public.ecr.aws`, `quay.io`,
+`registry.access.redhat.com`, `mcr.microsoft.com`, PyPI (`pypi.org`,
+`files.pythonhosted.org`, `download.pytorch.org`, `www.python.org`),
+`registry.npmjs.org`, Go (`proxy.golang.org`, `sum.golang.org`,
+`storage.googleapis.com`), Helm repos (`charts.apiseven.com`,
+`seaweedfs.github.io`), `deb.debian.org`, `api.osv.dev`. Start in
+`egress-policy: audit`, switch to `block` after the first real run confirms it.
 
 ### 3.2 Configuration (`renovate.json5` at repo root)
 
@@ -128,8 +133,10 @@ Key settings, with the reason each exists:
 - `pinDigests: true` for `docker`, `github-actions` and the custom python-base
   manager. Satisfies OpenSSF Scorecard Pinned-Dependencies.
 - `rangeStrategy: "bump"` for pep621 so `==` pins move and `uv.lock` is
-  regenerated in the same commit. `lockFileMaintenance` enabled, grouped into
-  the weekly PR, so transitive deps refresh (this replaces #27).
+  regenerated in the same commit. `lockFileMaintenance` enabled on the same
+  Monday schedule so transitive deps refresh (this replaces #27); it lands as
+  a second weekly PR because Renovate keeps lock file maintenance on its own
+  branch even when grouped.
 - `prConcurrentLimit: 10`, `prHourlyLimit: 0`, `rebaseWhen: "behind-base-branch"`.
 - `labels: ["dependencies", "renovate"]`, `commitMessagePrefix` conventional
   (`build(deps):`), semantic commit style matching repo history.
@@ -147,9 +154,11 @@ Three lanes via `packageRules`:
 
 1. **Weekly deps PR** (`groupName: "weekly dependencies"`,
    `groupSlug: "weekly"`): every `minor`, `patch`, `pin`, `digest`,
-   `lockFileMaintenance` update across all managers. One branch
-   `renovate/weekly`, one PR, rebased weekly. PR body lists every change with
-   release notes links, grouped by manager.
+   update across all managers. One branch `renovate/weekly`, one PR, rebased
+   weekly. PR body lists every change with release notes links, grouped by
+   manager. Lock file maintenance shares the schedule and group but Renovate
+   always puts it on its own branch (`renovate/lock-file-maintenance-weekly`),
+   so Monday produces two PRs: the dependency batch and the lock refresh.
 2. **Major updates**: `matchUpdateTypes: ["major"]`, not grouped, one PR per
    dependency, same schedule. A breaking bump must not block the weekly batch.
    Base images (`python`, `node`, `golang`) are excluded from this lane:
@@ -157,7 +166,8 @@ Three lanes via `packageRules`:
    changing `requires-python` in 29 `pyproject.toml` files, a manual,
    coordinated change.
 3. **Security PRs**: produced by `vulnerabilityAlerts`/OSV, `schedule: at any time`,
-   `minimumReleaseAge: null`, `prPriority: 10`, not grouped, label `security`.
+   `minimumReleaseAge: null`, not grouped, label `security`. (Renovate 44 has no
+   vulnerability selector for `packageRules`, so no extra priority is set.)
 
 Dependabot: keep *alerts* on (they feed Renovate's `vulnerabilityAlerts`), turn
 off *security updates* in repo settings once Renovate is on `main`, close the
@@ -172,12 +182,13 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
    `currentValueTemplate`, `currentDigest` from the digest ARG. Renovate
    writes the same new digest into all 24 files in one commit. Variant suffix
    (`-slim-trixie`) stays fixed; only the version and digest move.
-2. **Tool versions in workflows.** Lines annotated
-   `# renovate: datasource=pypi depName=tox` (and `tox-uv`, `uv`) above
-   `version: "0.8.17"` / `uv tool install tox==4.30.2 --with tox-uv==1.28.0 --with uv==0.8.17`.
-   `src/tox.ini` `requires` block gets the same annotations. One rule groups
-   `tox`, `tox-uv`, `uv` so they always move together (they must match or tox
-   self-provisions a second copy; see knowledge `rag/ci/unit-tests`).
+2. **Tool versions in workflows.** `val-unit-tests.yml` carries job-level env
+   vars `UV_VERSION`, `TOX_VERSION`, `TOX_UV_VERSION`, each preceded by
+   `# renovate: datasource=pypi depName=…`; `setup-uv` and the
+   `uv tool install` line read them. `src/tox.ini` `requires` has a dedicated
+   regex manager with the same dep names, so both files move in one branch
+   (they must match or tox self-provisions a second copy; see knowledge
+   `rag/ci/unit-tests`).
 3. **uv in `COPY --from=ghcr.io/astral-sh/uv:0.8.0`.** Native `dockerfile`
    manager already handles `COPY --from`; it lands in the same weekly PR as
    the `uv` tool pins.
@@ -192,8 +203,8 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
 
 ### 3.5 Guardrails and verification
 
-- `renovate-config-validator` runs in PR CI on changes to `renovate.json5`,
-  `.github/workflows/renovate.yml`, and in the Renovate job itself before the run.
+- `renovate-config-validator --strict` runs in PR CI (`Sec :: Renovate config`)
+  on changes to `renovate.json5` or the two Renovate workflows.
 - Dependency Dashboard issue: lists detected deps, pending (cooldown), rate
   limited, and errored updates. This answers "is it targeting everything".
 - Existing PR gates stay the only merge gate: `Val :: Unit tests`, Trivy,
@@ -229,7 +240,9 @@ open Dependabot PRs. Two bots on the same deps create duplicate PRs.
    annotations in `val-unit-tests.yml` and `src/tox.ini`, validator step.
 3. Merge to fork `main` (Renovate needs its config on the default branch and
    `schedule` only fires there).
-4. `workflow_dispatch` with `dryRun=full`, review log; then real run.
+4. `workflow_dispatch` with `dry_run=full`, `log_level=debug`; grep the log for
+   `Error updating branch` / `Digest is not updated` (the local dry run never
+   reaches the branch worker); then real run.
 5. Demo artefacts: Dependency Dashboard issue, one `renovate/weekly` PR, major
    PRs, any security PR, Scorecard Pinned-Dependencies delta.
 6. Upstream proposal: this document, the diff, the dry-run summary, and the

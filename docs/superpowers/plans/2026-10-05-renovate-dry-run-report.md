@@ -22,7 +22,7 @@ The `src/gmc` Go module slice (1 go.mod, 99 deps) extracts fine but its lookups 
 ## Post-filter result
 
 - Filtered out 58 disabled update(s). 1009 update(s) remaining.
-- Returning 75 branch(es)
+- Returning 75 branch(es) (72 after pending filter; one is lock file maintenance. After review, `matchPackageNames` was dropped from the lane rules so it joins the weekly group; Renovate still names its branch `renovate/lock-file-maintenance-weekly`, i.e. two PRs on Monday)
 - Disabled updates are python/node/go major+minor bumps and first-party images.
 
 ## Proposed updates per branch (pre-filter)
@@ -115,7 +115,7 @@ The `src/gmc` Go module slice (1 go.mod, 99 deps) extracts fine but its lookups 
 
 ## Lanes
 
-- Weekly lane: `renovate/weekly` (719 updates in one PR).
+- Weekly lane: `renovate/weekly` (719 pre-filter updates in one PR; after the review fix pass the regex-pin `pinDigest` entries are gone; lock file maintenance is a second Monday PR).
 - Major lane: 54 branches `renovate/major-*`.
 - Security lane (OSV, no GitHub alerts available locally): 24 branches `renovate/<ds>-<pkg>-vulnerability`.
 - spaCy pair: `renovate/spacy` carries spacy ==3.8.11 -> ==3.8.16 (patch); the Polish model stays at 3.8.0 (newest release), same branch when it moves.

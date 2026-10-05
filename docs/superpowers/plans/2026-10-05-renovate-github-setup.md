@@ -47,7 +47,9 @@ its config from the default branch, and `schedule` only fires there.
 ## 5. First runs
 
 1. Actions → "Sec :: Renovate" → Run workflow → dry_run = `full`, log_level = `debug`. Read the log:
-   it lists every detected dependency and every branch it would create.
+   it lists every detected dependency and every branch it would create. The local dry run never
+   reaches the branch worker, so this is the first place file replacement is exercised: grep the
+   log for `Error updating branch` and `Digest is not updated` before any real run.
 2. Run again with dry_run = `none`. Expect: a "Dependency Dashboard (Renovate)" issue,
    a PR from branch `renovate/weekly`, zero or more `renovate/major-*` PRs, and
    `security`-labelled PRs if alerts are open.
