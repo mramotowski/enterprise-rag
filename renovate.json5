@@ -95,7 +95,6 @@
   // ---------------------------------------------------------------------------
   // Needs the Dependabot alerts feed (GitHub App permission
   // "vulnerability alerts: read"); OSV covers ecosystems GitHub does not.
-  // PR priority for these lives in packageRules (matchIsVulnerabilityAlert).
   vulnerabilityAlerts: {
     enabled: true,
     labels: ["dependencies", "renovate", "security"],
@@ -104,4 +103,73 @@
     groupName: null,
   },
   osvVulnerabilityAlerts: true,
+
+  // ---------------------------------------------------------------------------
+  // PR lanes. Later rules override earlier ones.
+  // ---------------------------------------------------------------------------
+  packageRules: [
+    // Lane 1: everything non-breaking lands in ONE weekly PR.
+    {
+      description: "Weekly grouped PR for all minor/patch/digest/pin/lockfile updates",
+      matchPackageNames: ["*"],
+      matchUpdateTypes: ["minor", "patch", "pin", "digest", "pinDigest", "lockFileMaintenance"],
+      groupName: "weekly dependencies",
+      groupSlug: "weekly",
+    },
+    // Lane 2: majors are one PR per dependency so a breaking change never
+    // blocks the weekly batch. Branch prefix makes them easy to filter.
+    {
+      description: "Major updates: separate PR per dependency",
+      matchPackageNames: ["*"],
+      matchUpdateTypes: ["major"],
+      additionalBranchPrefix: "major-",
+      prPriority: -1,
+    },
+    // Lane 3 (CVE fixes) is configured in vulnerabilityAlerts above: own
+    // branch per fix, no schedule, no cooldown.
+
+    // Digest-only updates have no release date; cooldown would stall them.
+    {
+      description: "No cooldown for digest pinning",
+      matchUpdateTypes: ["digest", "pinDigest", "pin"],
+      minimumReleaseAge: null,
+    },
+
+    // Helm charts and k8s manifests do not render image@digest; keep tags only.
+    {
+      description: "No digest pinning in Helm values / templates",
+      matchManagers: ["helm-values", "kubernetes", "helmv3"],
+      pinDigests: false,
+    },
+
+    // Debian packages pinned in Dockerfiles (openssl=3.5.7-1~deb13u3 …) are
+    // resolved against trixie main. The security pocket only publishes
+    // Packages.xz, which the deb datasource cannot read, so security-only
+    // builds appear here at the next point release.
+    {
+      description: "Debian trixie registry for apt pins",
+      matchDatasources: ["deb"],
+      registryUrls: ["https://deb.debian.org/debian?suite=trixie&components=main&binaryArch=amd64"],
+    },
+
+    // Base language images: patch and digest only. python 3.12 needs
+    // requires-python changes in 29 pyprojects, node/go toolchain bumps are
+    // coordinated by hand. The go.mod `go` directive follows the same rule so
+    // golang:1.25.x and `go 1.25.x` move together in the weekly PR.
+    {
+      description: "python/node/go: no major or minor bumps",
+      matchDepNames: ["python", "node", "golang", "go"],
+      matchUpdateTypes: ["major", "minor"],
+      enabled: false,
+    },
+
+    // spaCy model releases must match the spacy major.minor; keep the pair in
+    // one dedicated PR so a reviewer sees both lines.
+    {
+      description: "spaCy library and model move together",
+      matchPackageNames: ["spacy", "explosion/spacy-models"],
+      groupName: "spacy",
+      groupSlug: "spacy",
+    },
+  ],
 }
