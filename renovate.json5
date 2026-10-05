@@ -211,5 +211,27 @@
       currentValueTemplate: "{{{pythonVersion}}}-slim-trixie",
       versioningTemplate: "docker",
     },
+
+    // Generic annotation manager. Put this comment on the line above a pin:
+    //   # renovate: datasource=docker depName=redis versioning=docker
+    //   tag: "8.2.2"
+    // Works for YAML keys, shell variables and Dockerfile ARGs; the value may
+    // end in @sha256:<digest>. Optional fields: versioning, extractVersion,
+    // registryUrl. Default versioning is semver-coerced; use versioning=docker
+    // for image tags.
+    {
+      customType: "regex",
+      description: "Pins annotated with a '# renovate:' comment on the previous line",
+      managerFilePatterns: [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/^deployment/.+\\.ya?ml$/",
+        "/\\.sh$/",
+        "/(^|/)Dockerfile$/",
+      ],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>[a-z0-9-]+) depName=(?<depName>[^\\s]+)(?: versioning=(?<versioning>[^\\s]+))?(?: extractVersion=(?<extractVersion>[^\\s]+))?(?: registryUrl=(?<registryUrl>[^\\s]+))?\\s*\\n[^\\n]*?[=:]\\s*[\"']?(?<currentValue>v?\\d[^\"'\\s@]*)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?",
+      ],
+      versioningTemplate: "{{#if versioning}}{{{versioning}}}{{else}}semver-coerced{{/if}}",
+    },
   ],
 }

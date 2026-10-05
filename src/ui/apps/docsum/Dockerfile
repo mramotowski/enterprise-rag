@@ -6,7 +6,9 @@ FROM node:20-alpine AS build
 RUN apk add --no-cache bash
 
 # Install pnpm
-RUN corepack enable && corepack prepare pnpm@10.33.4 --activate
+# renovate: datasource=npm depName=pnpm
+ARG PNPM_VERSION=10.33.4
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 
 WORKDIR /rag-ui
 
