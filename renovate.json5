@@ -172,4 +172,21 @@
       groupSlug: "spacy",
     },
   ],
+
+  // ---------------------------------------------------------------------------
+  // Custom managers (regex). Each one is tested by .github/scripts/renovate-local.sh extract.
+  // ---------------------------------------------------------------------------
+  customManagers: [
+    // src/tox.ini [tox] requires. Must stay equal to UV_VERSION/TOX_VERSION/
+    // TOX_UV_VERSION in .github/workflows/val-unit-tests.yml or tox provisions a
+    // second copy of itself; same depNames there, so Renovate updates both files
+    // in one branch.
+    {
+      customType: "regex",
+      description: "tox/tox-uv/uv pins in src/tox.ini",
+      managerFilePatterns: ["/^src/tox\\.ini$/"],
+      matchStrings: ["\\n\\s+(?<depName>tox|tox-uv|uv)==(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      datasourceTemplate: "pypi",
+    },
+  ],
 }
