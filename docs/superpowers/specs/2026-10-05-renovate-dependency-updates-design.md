@@ -135,9 +135,9 @@ Key settings, with the reason each exists:
 - `ignorePaths`: `**/node_modules/**`, `**/.tox/**`, `**/.venv/**`,
   `src/tests/e2e/**` excluded from `pip_requirements` only if they prove noisy
   (decide after dry run).
-- `python` constraint from `requires-python` is respected automatically; an
-  explicit `allowedVersions: "<3.12"` on the python base image rule keeps the
-  base image aligned with `requires-python = ">=3.11,<3.12"`.
+- `python` constraint from `requires-python` is respected automatically for
+  package resolution; the base-image policy above keeps the image on 3.11 so it
+  stays aligned with `requires-python = ">=3.11,<3.12"`.
 
 ### 3.3 PR lanes (grouping)
 
