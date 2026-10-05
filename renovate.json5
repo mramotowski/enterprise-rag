@@ -188,5 +188,28 @@
       matchStrings: ["\\n\\s+(?<depName>tox|tox-uv|uv)==(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       datasourceTemplate: "pypi",
     },
+
+    // 24 Dockerfiles build the base image reference from three ARGs:
+    //   ARG python_version=3.11
+    //   ARG python_image_version=${python_version}-slim-trixie
+    //   ARG python_image_digest=sha256:…
+    //   FROM python:${python_image_version}@${python_image_digest}
+    // The dockerfile manager skips this (contains-variable). This manager reads
+    // the version and digest ARGs (always in that order, <600 chars apart) and
+    // reconstructs the tag, so Renovate can refresh the digest in all 24 files
+    // in one commit. Only digest updates apply: the version part is not a
+    // capture group, and major/minor python bumps are disabled anyway.
+    {
+      customType: "regex",
+      description: "python base image via ARG python_version + ARG python_image_digest",
+      managerFilePatterns: ["/(^|/)Dockerfile$/"],
+      matchStrings: [
+        "ARG python_version=(?<pythonVersion>\\d+\\.\\d+)\\n[\\s\\S]{0,600}?ARG python_image_digest=(?<currentDigest>sha256:[a-f0-9]{64})",
+      ],
+      depNameTemplate: "python",
+      datasourceTemplate: "docker",
+      currentValueTemplate: "{{{pythonVersion}}}-slim-trixie",
+      versioningTemplate: "docker",
+    },
   ],
 }
