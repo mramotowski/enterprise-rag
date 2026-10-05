@@ -49,9 +49,10 @@ LOG_LEVEL=${LOG_LEVEL:-debug} LOG_FORMAT=json \
 status=$?
 set -e
 
-# Drop non-JSON noise (node warnings) so jq can read the file.
+# jq needs pure JSON lines; the raw stream (node warnings, crash traces) is kept
+# next to it as <mode>.raw.log for post-mortems.
 grep '^{' "$log.raw" >"$log" || true
-rm -f "$log.raw"
+mv -f "$log.raw" "$out/$mode.raw.log"
 
 echo "renovate exit code: $status  log: $log"
 echo "errors/warnings:"
