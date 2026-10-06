@@ -7,8 +7,8 @@ name: "Sec :: Renovate"
 #
 # Authentication is a GitHub App token minted per run. GITHUB_TOKEN would not
 # do: it cannot modify .github/workflows/* and PRs it opens do not trigger CI.
-# App permissions: contents, pull requests, issues, workflows (write);
-# vulnerability alerts, metadata (read).
+# App permissions: contents, pull requests, issues, workflows, commit statuses (write);
+# checks, vulnerability alerts, metadata (read).
 #
 # Run mode comes from repository *variables* (Settings -> Secrets and variables
 # -> Actions -> Variables), not from workflow_dispatch inputs: Checkov
@@ -92,6 +92,12 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
           permission-workflows: write
+          # Renovate reads and sets commit statuses (renovate/artifacts,
+          # renovate/stability-days) and reads check runs. Without these,
+          # GitHub answers 404, which Renovate treats as "repository changed"
+          # and aborts the run (first real run stopped after 12 PRs).
+          permission-statuses: write
+          permission-checks: read
           permission-vulnerability-alerts: read
           permission-metadata: read
 
