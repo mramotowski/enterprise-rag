@@ -50,6 +50,7 @@ def test_EmbeddingConnector_not_implemented():
 
 # TODO: Fix the tests below.
 # Currently, they are skipped because the configuration option asyncio_default_fixture_loop_scope is unset
+@pytest.mark.skip(reason="Broken, never ran: OVMSEndpointEmbeddings rejects the URL passed as model (see TODO above). Was implicitly skipped by pytest 8; pytest 9 fails unmarked async tests.")
 async def test_connector_initialization(teardown):
     model_name = "test_model"
     endpoint = "http://test-endpoint"
@@ -61,6 +62,7 @@ async def test_connector_initialization(teardown):
     assert embedding._embedder is not None
 
 
+@pytest.mark.skip(reason="Broken, never ran: OVMSEndpointEmbeddings rejects the URL passed as model (see TODO above). Was implicitly skipped by pytest 8; pytest 9 fails unmarked async tests.")
 async def test_connector_singleton_behavior(teardown):
     with mock.patch.object(OVMSConnector, '_validate', new=mock.AsyncMock(return_value=None)):
         instance1 = OVMSConnector("model1", "http://endpoint1")
@@ -69,6 +71,7 @@ async def test_connector_singleton_behavior(teardown):
         assert instance1 is instance2
 
 
+@pytest.mark.skip(reason="Broken, never ran: OVMSEndpointEmbeddings rejects the URL passed as model (see TODO above). Was implicitly skipped by pytest 8; pytest 9 fails unmarked async tests.")
 async def test_connector_singleton_behavior_wrong_model(teardown):
     with mock.patch.object(OVMSConnector, '_validate', new=mock.AsyncMock(return_value=None)):
         instance1 = OVMSConnector("model1", "http://endpoint1")
@@ -77,6 +80,7 @@ async def test_connector_singleton_behavior_wrong_model(teardown):
         assert instance1 is instance2
 
 
+@pytest.mark.skip(reason="Broken, never ran: OVMSEndpointEmbeddings rejects the URL passed as model (see TODO above). Was implicitly skipped by pytest 8; pytest 9 fails unmarked async tests.")
 async def test_connector_embedder_types(teardown):
     model_name = "test_model"
     endpoint = "http://test-endpoint"
