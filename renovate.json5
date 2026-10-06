@@ -201,6 +201,20 @@
       enabled: false,
     },
 
+    // pytest and pytest-asyncio are coupled: pytest 9 (CVE fix) needs
+    // pytest-asyncio >= 1.0, and pytest-asyncio 1.x needs pytest >= 8.4. Apart
+    // they deadlock (each PR fails `uv lock`), so both ride in the security PR.
+    {
+      description: "pytest + pytest-asyncio move together in the security PR",
+      matchPackageNames: ["pytest", "pytest-asyncio"],
+      groupName: "security fixes",
+      groupSlug: "security",
+      separateMajorMinor: false,
+      additionalBranchPrefix: "",
+      dependencyDashboardApproval: false,
+      schedule: ["at any time"],
+    },
+
     // spaCy model releases must match the spacy major.minor; keep the pair in
     // one dedicated PR so a reviewer sees both lines.
     {
