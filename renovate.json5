@@ -201,12 +201,15 @@
       enabled: false,
     },
 
-    // pytest and pytest-asyncio are coupled: pytest 9 (CVE fix) needs
-    // pytest-asyncio >= 1.0, and pytest-asyncio 1.x needs pytest >= 8.4. Apart
-    // they deadlock (each PR fails `uv lock`), so both ride in the security PR.
+    // Coupled sets: packages that only resolve when bumped together. A CVE
+    // fix always lands in the security PR (vulnerabilityAlerts is applied
+    // last), so its partners must go there too, or both PRs fail `uv lock`.
+    //  - pytest 9 (CVE) needs pytest-asyncio >= 1.0; pytest-asyncio 1.x needs pytest >= 8.4
+    //  - uv (CVE) / tox-uv 1.36 needs uv >= 0.9.27 and tox >= 4.52 (tox.ini + val-unit-tests.yml)
+    //  - pymongo 4.18 (CVE) removed a private API that motor 3.4 imports; motor 3.7 needs pymongo >= 4.9
     {
-      description: "pytest + pytest-asyncio move together in the security PR",
-      matchPackageNames: ["pytest", "pytest-asyncio"],
+      description: "Coupled sets move together in the security PR",
+      matchPackageNames: ["pytest", "pytest-asyncio", "tox", "tox-uv", "uv", "pymongo", "motor"],
       groupName: "security fixes",
       groupSlug: "security",
       separateMajorMinor: false,
