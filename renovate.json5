@@ -134,15 +134,18 @@
       groupSlug: "weekly",
     },
     // Lane 2: majors are one PR per dependency so a breaking change never
-    // blocks the weekly batch. Branch prefix makes them easy to filter.
+    // blocks the weekly batch. They are opt-in: listed in the Dependency
+    // Dashboard and only become a PR when someone ticks the checkbox there.
+    // Security majors are unaffected (vulnerabilityAlerts resets approval).
     {
-      description: "Major updates: separate PR per dependency",
+      description: "Major updates: separate PR per dependency, on dashboard approval",
       matchUpdateTypes: ["major"],
       additionalBranchPrefix: "major-",
+      dependencyDashboardApproval: true,
       prPriority: -1,
     },
-    // Lane 3 (CVE fixes) is configured in vulnerabilityAlerts above: own
-    // branch per fix, no schedule, no cooldown.
+    // Lane 3 (CVE fixes) is configured in vulnerabilityAlerts above: one
+    // grouped branch, no schedule, no cooldown.
 
     // Images built by this repo (deployment/images.yaml) are versioned by the
     // release, not by a registry lookup. Helm values split them into
