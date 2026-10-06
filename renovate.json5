@@ -100,12 +100,20 @@
   // ---------------------------------------------------------------------------
   // Needs the Dependabot alerts feed (GitHub App permission
   // "vulnerability alerts: read"); OSV covers ecosystems GitHub does not.
+  // All CVE fixes share ONE PR (renovate/security), majors included. Trade-off:
+  // one fix that does not resolve (uv lock error) is reported in that PR and
+  // has to be fixed or excluded before the batch can merge.
   vulnerabilityAlerts: {
     enabled: true,
     labels: ["dependencies", "renovate", "security"],
     schedule: ["at any time"],
     minimumReleaseAge: null,
-    groupName: null,
+    groupName: "security fixes",
+    groupSlug: "security",
+    separateMajorMinor: false,
+    // Undo the "major-" prefix from the major lane so security majors stay
+    // in the same branch.
+    additionalBranchPrefix: "",
   },
   osvVulnerabilityAlerts: true,
 
