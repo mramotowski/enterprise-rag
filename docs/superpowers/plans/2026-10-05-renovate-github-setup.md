@@ -13,6 +13,8 @@ GitHub → Settings → Developer settings → GitHub Apps → New GitHub App
   - Pull requests: Read and write
   - Issues: Read and write
   - Workflows: Read and write
+  - Commit statuses: Read and write
+  - Checks: Read-only
   - Dependabot alerts: Read-only
   - Metadata: Read-only (default)
 - Where can this app be installed: Only on this account

@@ -162,15 +162,18 @@ Three lanes via `packageRules`:
    manager. Lock file maintenance shares the schedule and group but Renovate
    always puts it on its own branch (`renovate/lock-file-maintenance-weekly`),
    so Monday produces two PRs: the dependency batch and the lock refresh.
-2. **Major updates**: `matchUpdateTypes: ["major"]`, not grouped, one PR per
-   dependency, same schedule. A breaking bump must not block the weekly batch.
-   Base images (`python`, `node`, `golang`) are excluded from this lane:
-   `major`/`minor` disabled per section 3.2. Python 3.12 in particular requires
-   changing `requires-python` in 29 `pyproject.toml` files, a manual,
-   coordinated change.
-3. **Security PRs**: produced by `vulnerabilityAlerts`/OSV, `schedule: at any time`,
-   `minimumReleaseAge: null`, not grouped, label `security`. (Renovate 44 has no
-   vulnerability selector for `packageRules`, so no extra priority is set.)
+2. **Major updates**: opt-in. `dependencyDashboardApproval: true`, so each major is
+   listed in the Dependency Dashboard and becomes its own PR only when someone
+   ticks its checkbox. A breaking bump never blocks the weekly batch and never
+   floods the PR list. Base images (`python`, `node`, `golang`) get no majors at
+   all (section 3.2); Python 3.12 needs `requires-python` changes in 29
+   `pyproject.toml` files. Security majors are not gated (lane 3).
+3. **Security PR**: produced by `vulnerabilityAlerts`/OSV, `schedule: at any time`,
+   `minimumReleaseAge: null`, label `security`. All CVE fixes, majors included,
+   are grouped into ONE PR on branch `renovate/security` (`groupName: "security
+   fixes"`, `separateMajorMinor: false`, `additionalBranchPrefix: ""`). A fix that
+   does not resolve (uv lock error) shows up in that PR and must be fixed or
+   excluded before the batch merges.
 
 Dependabot: keep *alerts* on (they feed Renovate's `vulnerabilityAlerts`), turn
 off *security updates* in repo settings once Renovate is on `main`, close the

@@ -140,3 +140,18 @@ The `src/gmc` Go module slice (1 go.mod, 99 deps) extracts fine but its lookups 
 - openssl apt pin: 24x registry=https://deb.debian.org/debian?suite=trixie&components=main&binaryArch=amd64 updates=0
 - setup-uv version expression: skipReason=invalid-value
 - shellcheck.yml: no tool-version update proposed (checksum-bound download left manual).
+
+## First CI dry run (GitHub-hosted, 2026-10-06, Tuesday)
+
+Run `mramotowski/enterprise-rag` actions run 37421416390, attempt 3, `RENOVATE_DRY_RUN=full`, `RENOVATE_LOG_LEVEL=debug`, 7m24s, success.
+
+- No WARN/ERROR lines. No `Error updating branch`, `Digest is not updated` or `Cannot find replaceString`: the review fixes hold in the branch worker, which the local harness never reaches.
+- `Filtered out 60 disabled update(s). 1079 update(s) remaining.` / `Returning 85 branch(es)`. Go lookups work in CI (7 Go security branches), closing the gap left by the local proxy.
+- Tuesday dispatch: the 48 scheduled branches (weekly, lock-file-maintenance-weekly, majors) are `not-scheduled` ("before 6am on monday"). Only the security lane ran: 34 `*-vulnerability` branches would be committed.
+- `vulnerabilityAlerts` defaults to `prConcurrentLimit: 0` (unlimited), so a real run would open all 34 security PRs at once.
+- Lock-file errors (PR still raised, with an artifact warning) show CVE fixes blocked by caps in the dependency tree, not config problems:
+  - pytest 9.0.3 (CVE) vs `pytest-asyncio==0.24.0` requiring `pytest<9`: 25 uv projects.
+  - transformers (CVE) vs `optimum-intel==1.25.2` / `==2.1.0` and `optimum-onnx` caps: embeddings ovms, retrievers ovms, 3 llm_guard guardrails.
+  - torch 2.13 (CVE) vs `torchvision` / `torchaudio` pinned to torch 2.10: text_extractor, tts fastapi.
+  - setuptools (CVE) vs torch 2.11 requiring `setuptools<82`: llm_guard_input_guardrail.
+- Harden-runner egress audit: https://app.stepsecurity.io/github/mramotowski/enterprise-rag/actions/runs/37421416390
