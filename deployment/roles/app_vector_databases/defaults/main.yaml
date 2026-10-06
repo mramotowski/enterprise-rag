@@ -38,6 +38,7 @@ vector_databases_stores:
       replicas: 0
     image:
       repository: "redis"
+      # renovate: datasource=docker depName=redis versioning=docker
       tag: "8.2.2"
       pullPolicy: "IfNotPresent"
     resources:

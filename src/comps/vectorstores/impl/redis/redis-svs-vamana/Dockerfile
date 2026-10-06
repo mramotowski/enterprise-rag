@@ -19,6 +19,7 @@
 #         repository: <registry>/erag/redis
 #         tag: "8.2.2-svs"
 
+# renovate: datasource=github-tags depName=redis/redis
 ARG REDIS_VERSION=8.2.2
 
 FROM ubuntu:24.04 AS builder

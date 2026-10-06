@@ -63,7 +63,10 @@ jobs:
           python-version: '3.12.14'
 
       - name: Install Checkov
-        run: pip install --disable-pip-version-check "checkov==3.3.16"
+        env:
+          # renovate: datasource=pypi depName=checkov
+          CHECKOV_VERSION: "3.3.16"
+        run: pip install --disable-pip-version-check "checkov==${CHECKOV_VERSION}"
 
       # `helm` is deliberately not in --framework: Checkov renders charts into a
       # random temp dir and reports paths relative to it, so every finding points

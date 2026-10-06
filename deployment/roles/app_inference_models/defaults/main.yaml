@@ -124,6 +124,7 @@ inference_topology_ns: "kube-system"
 inference_topology_ds_name: "erag-inference-topology-probe"
 # Minimal (~5 MB) busybox image — matches the nri_cpu_balloons probe pattern,
 # so the layer is already cached on nodes. Uses /sys and /proc only (no lscpu).
+# renovate: datasource=docker depName=busybox versioning=docker
 inference_topology_image: "busybox:1.36"
 inference_topology_wait_retries: 30
 inference_topology_wait_delay: 10

@@ -62,6 +62,7 @@ postgresAdminPassword: ""
 
 seaweedfs:
   namespace: "seaweedfs"
+  # renovate: datasource=helm depName=seaweedfs registryUrl=https://seaweedfs.github.io/seaweedfs/helm
   version: "4.37.0"
   repo: "https://seaweedfs.github.io/seaweedfs/helm"
   persistence:

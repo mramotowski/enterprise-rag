@@ -113,6 +113,7 @@ usage() {
 # and reboots until the developer removes it with --teardown-registry.
 LOCAL_REGISTRY_NAME=local-registry
 REGISTRY_PORT=5000
+# renovate: datasource=docker depName=registry versioning=docker
 REGISTRY_IMAGE=registry:2
 # Dedicated containerd namespace keeps the registry out of the kubelet-managed
 # 'k8s.io' pool so image GC can never evict it (nerdctl runtime only).

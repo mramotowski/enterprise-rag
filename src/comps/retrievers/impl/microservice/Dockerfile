@@ -3,15 +3,22 @@
 
 ARG python_version=3.11
 ARG python_image_version=${python_version}-slim-trixie
+# Pinned by digest so the base (and its OpenSSL) only changes when bumped here,
+# keeping it in step with the openssl pin below.
+ARG python_image_digest=sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b
 
-FROM python:${python_image_version}
+FROM python:${python_image_version}@${python_image_digest}
 COPY --from=ghcr.io/astral-sh/uv:0.8.0 /uv /uvx /bin/
 
 ENV LANG=C.UTF-8
 ARG python_version
+# Polish spaCy model, released on GitHub (not on PyPI). Its major.minor must
+# match spacy in pyproject.toml; Renovate groups the two.
+# renovate: datasource=github-releases depName=explosion/spacy-models extractVersion=^pl_core_news_sm-(?<version>.*)$
+ARG SPACY_PL_MODEL_VERSION=3.8.0
 
 RUN apt-get -y update && \
-    apt-get install -y --only-upgrade openssl=3.5.7-1~deb13u2 libssl3t64=3.5.7-1~deb13u2 openssl-provider-legacy=3.5.7-1~deb13u2 && \
+    apt-get install -y --only-upgrade openssl=3.5.7-1~deb13u3 libssl3t64=3.5.7-1~deb13u3 openssl-provider-legacy=3.5.7-1~deb13u3 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ARG ACCEPT_MSSQL_EULA=Y
@@ -46,7 +53,7 @@ RUN uv sync --locked --no-cache --group security-overrides
 ENV PATH="/home/user/comps/retrievers/impl/microservice/.venv/bin:$PATH"
 
 # spaCy for Polish only, need to install the model via uv from GitHub release (not a standard PyPI package)
-RUN uv pip install --no-cache https://github.com/explosion/spacy-models/releases/download/pl_core_news_sm-3.8.0/pl_core_news_sm-3.8.0.tar.gz
+RUN uv pip install --no-cache "https://github.com/explosion/spacy-models/releases/download/pl_core_news_sm-${SPACY_PL_MODEL_VERSION}/pl_core_news_sm-${SPACY_PL_MODEL_VERSION}.tar.gz"
 
 WORKDIR /home/user
 COPY --chown=user:user ./comps/cores ./comps/cores

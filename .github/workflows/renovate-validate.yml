@@ -1,0 +1,57 @@
+---
+name: "Sec :: Renovate config"
+
+# Validates renovate.json5 (schema, deprecated options, regex syntax) on every
+# change so a broken config is caught in the PR, not on Monday morning.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release-[0-9]+\.[0-9]+'
+    paths:
+      - renovate.json5
+      - .github/workflows/renovate.yml
+      - .github/workflows/renovate-validate.yml
+  push:
+    branches:
+      - main
+    paths:
+      - renovate.json5
+      - .github/workflows/renovate.yml
+      - .github/workflows/renovate-validate.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate renovate.json5
+        env:
+          # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate versioning=docker
+          RENOVATE_IMAGE: ghcr.io/renovatebot/renovate:44.133.0@sha256:05c512c35c764ef6a179e69c3b30567eca254d67f13a0143479fe3c84852c67a
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/repo:ro" -w /repo "${RENOVATE_IMAGE}" \
+            renovate-config-validator --strict renovate.json5

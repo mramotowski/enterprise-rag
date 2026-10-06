@@ -15,6 +15,7 @@
 
 set -euo pipefail
 
+# renovate: datasource=docker depName=redis versioning=docker
 REDIS_IMAGE="redis:8.2.5-alpine"
 CONTAINER_NAME="edp-redis"
 REDIS_PORT="${REDIS_PORT:-6379}"
