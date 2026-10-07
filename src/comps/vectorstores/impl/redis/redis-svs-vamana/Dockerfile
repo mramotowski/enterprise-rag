@@ -20,9 +20,9 @@
 #         tag: "8.2.2-svs"
 
 # renovate: datasource=github-tags depName=redis/redis
-ARG REDIS_VERSION=8.2.2
+ARG REDIS_VERSION=8.10.2
 
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS builder
 
 ARG REDIS_VERSION
 
@@ -42,7 +42,7 @@ RUN export BUILD_TLS=yes BUILD_WITH_MODULES=yes INSTALL_RUST_TOOLCHAIN=yes \
     make -j "$(nproc)" all
 
 # Runtime stage
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 ca-certificates && \

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Using Debian Bookworm (12) - smallest stable Debian with modern glibc 2.36
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 # Install required utilitiesARG HTTP_PROXY
 ARG HTTPS_PROXY

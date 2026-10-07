@@ -13,12 +13,12 @@ image:
 
 boxImage:
   repository: natsio/nats-box
-  tag: "0.14.5"
+  tag: "0.20.0"
   pullPolicy: IfNotPresent
 
 exporterImage:
   repository: natsio/prometheus-nats-exporter
-  tag: "0.15.0"
+  tag: "0.20.2"
   pullPolicy: IfNotPresent
 
 # Clustering. Single-server is the default so the component deploys on

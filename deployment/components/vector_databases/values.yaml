@@ -10,7 +10,7 @@ pgvector:
   enabled: false
   image:
     repository: "pgvector/pgvector"
-    tag: "0.8.1-pg18-trixie"
+    tag: "0.8.7-pg18-trixie"
   persistence:
     enabled: true
     size: "10Gi"
@@ -57,7 +57,7 @@ redis-cluster:
     enabled: true
     image:
       repository: oliver006/redis_exporter
-      tag: v1.80.0
+      tag: v1.93.0
       pullPolicy: IfNotPresent
     resources:
       requests:

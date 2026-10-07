@@ -58,7 +58,7 @@ jobs:
       - name: Install ansible-lint
         env:
           # renovate: datasource=pypi depName=ansible-lint
-          ANSIBLE_LINT_VERSION: "26.8.0"
+          ANSIBLE_LINT_VERSION: "26.9.0"
         run: pip install --disable-pip-version-check "ansible-lint==${ANSIBLE_LINT_VERSION}"
 
       # Style-only rule families are skipped so that what is reported is

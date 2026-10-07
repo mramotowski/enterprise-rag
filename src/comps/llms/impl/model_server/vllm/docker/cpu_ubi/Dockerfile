@@ -20,7 +20,7 @@ ARG VLLM_VERSION="releases/v0.18.0" # Released on 20/03/2026
 # Stage 1 Base Setup
 ###############################
 # UBI9:9.7-1769417801 - released on 26.01.2026 (dd/mm/yyyy)
-FROM redhat/ubi9:9.7-1769417801 AS base
+FROM redhat/ubi9:9.8-1790665138@sha256:094ea2ecfd3225af8f93807b99daa9ff33710fc705ebdf6e8466f46ed605585c AS base
 
 USER 0
 WORKDIR /workspace

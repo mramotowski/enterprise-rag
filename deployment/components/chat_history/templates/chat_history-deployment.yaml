@@ -67,7 +67,7 @@ spec:
         - name: wait-for-ferretdb
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          image: busybox:1.35
+          image: busybox:1.38
           imagePullPolicy: {{ .Values.image.chat_history.pullPolicy }}
           env:
             - name: FERRETDB_HOST

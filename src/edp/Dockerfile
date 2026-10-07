@@ -6,7 +6,7 @@ ARG python_version=3.11
 ARG python_image_version=${python_version}-slim-trixie
 # Pinned by digest so the base (and its OpenSSL) only changes when bumped here,
 # keeping it in step with the openssl pin below.
-ARG python_image_digest=sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b
+ARG python_image_digest=sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
 
 FROM python:${python_image_version}@${python_image_digest}
 COPY --from=ghcr.io/astral-sh/uv:0.8.0 /uv /uvx /bin/

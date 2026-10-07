@@ -29,7 +29,7 @@
     "@intel-enterprise-rag-ui/utils": "workspace:^"
   },
   "devDependencies": {
-    "@react-types/menu": "^3.10.2"
+    "@react-types/menu": "3.10.7"
   },
   "peerDependencies": {
     "react": ">=18.0.0",

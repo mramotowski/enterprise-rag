@@ -24,7 +24,7 @@
     "@intel-enterprise-rag-ui/utils": "workspace:^"
   },
   "devDependencies": {
-    "zod": "^3.23.8"
+    "zod": "3.25.76"
   },
   "peerDependencies": {
     "zod": "^3.23.8"

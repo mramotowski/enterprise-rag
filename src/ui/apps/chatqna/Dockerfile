@@ -1,7 +1,7 @@
 # Copyright (C) 2024-2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-FROM node:20-alpine AS build
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS build
 
 RUN apk add --no-cache bash
 
@@ -28,7 +28,7 @@ RUN pnpm install --frozen-lockfile --filter @intel-enterprise-rag-ui/chatqna...
 # Build the app and all its dependencies in correct order
 RUN pnpm --filter @intel-enterprise-rag-ui/chatqna... build
 
-FROM nginx:alpine
+FROM nginx:alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
 
 # Upgrade packages to fix possible vulnerabilities
 USER root
