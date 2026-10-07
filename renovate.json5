@@ -103,8 +103,10 @@
   // All CVE fixes share ONE PR (renovate/security), majors included. Trade-off:
   // one fix that does not resolve (uv lock error) is reported in that PR and
   // has to be fixed or excluded before the batch can merge.
+  // No `enabled: true` here: Renovate applies this object as `force`, so it
+  // would re-enable updates that packageRules disable (accepted-risk rules).
+  // The lane is on unless enabled is explicitly false.
   vulnerabilityAlerts: {
-    enabled: true,
     labels: ["dependencies", "renovate", "security"],
     schedule: ["at any time"],
     minimumReleaseAge: null,
@@ -216,6 +218,34 @@
       additionalBranchPrefix: "",
       dependencyDashboardApproval: false,
       schedule: ["at any time"],
+    },
+
+    // Accepted risk: CVE fixes that cannot resolve in these projects today.
+    // Re-check when the blocking package releases a compatible version.
+    //  - transformers: optimum-intel (ovms servers) and optimum-onnx (llm_guard)
+    //    cap transformers below the fixed version. Their torch fix still lands.
+    //  - torch family: torchaudio stops at 2.11 (tts); text_extractor needs a
+    //    manual torch 2.13 + torchvision 0.28 bump.
+    {
+      description: "Accepted risk: transformers held back where optimum caps it",
+      matchPackageNames: ["transformers"],
+      matchFileNames: [
+        "src/comps/embeddings/impl/model_server/ovms/docker/pyproject.toml",
+        "src/comps/retrievers/impl/model_server/ovms/docker/pyproject.toml",
+        "src/comps/guardrails/llm_guard_dataprep_guardrail/impl/microservice/pyproject.toml",
+        "src/comps/guardrails/llm_guard_input_guardrail/impl/microservice/pyproject.toml",
+        "src/comps/guardrails/llm_guard_output_guardrail/impl/microservice/pyproject.toml",
+      ],
+      enabled: false,
+    },
+    {
+      description: "Accepted risk: torch family held back in text_extractor and tts",
+      matchPackageNames: ["torch", "torchvision", "torchaudio"],
+      matchFileNames: [
+        "src/comps/text_extractor/impl/microservice/pyproject.toml",
+        "src/comps/tts/impl/model_server/fastapi/docker/pyproject.toml",
+      ],
+      enabled: false,
     },
 
     // spaCy model releases must match the spacy major.minor; keep the pair in
