@@ -146,6 +146,21 @@
       dependencyDashboardApproval: true,
       prPriority: -1,
     },
+    // Python direct pins (~500 `==` specifiers) move only for CVEs (security
+    // PR) or on demand. Bumped one by one they collide in `uv lock` (numpy vs
+    // Python 3.11, opentelemetry family, optimum/nncf), and one red project
+    // would block the whole weekly PR. They gather in ONE opt-in PR that is
+    // created when ticked in the Dependency Dashboard. Transitive deps still
+    // refresh in the weekly lock-file-maintenance PR. Later rules (coupled
+    // sets, accepted risk) and vulnerabilityAlerts still override this.
+    {
+      description: "Python pins: one opt-in PR, not part of the weekly batch",
+      matchManagers: ["pep621", "pip_requirements"],
+      matchUpdateTypes: ["minor", "patch", "pin", "digest"],
+      groupName: "python dependencies",
+      groupSlug: "python",
+      dependencyDashboardApproval: true,
+    },
     // Lane 3 (CVE fixes) is configured in vulnerabilityAlerts above: one
     // grouped branch, no schedule, no cooldown.
 
@@ -212,6 +227,21 @@
     {
       description: "Coupled sets move together in the security PR",
       matchPackageNames: ["pytest", "pytest-asyncio", "tox", "tox-uv", "uv", "pymongo", "motor"],
+      groupName: "security fixes",
+      groupSlug: "security",
+      separateMajorMinor: false,
+      additionalBranchPrefix: "",
+      dependencyDashboardApproval: false,
+      schedule: ["at any time"],
+    },
+
+    // docling (CVE fix) 2.131 needs requests >= 2.34.2; text_extractor pins
+    // requests == 2.33.1. Scoped to that one project so requests elsewhere
+    // stays in the weekly PR.
+    {
+      description: "requests travels with the docling CVE fix in text_extractor",
+      matchPackageNames: ["requests"],
+      matchFileNames: ["src/comps/text_extractor/impl/microservice/pyproject.toml"],
       groupName: "security fixes",
       groupSlug: "security",
       separateMajorMinor: false,
