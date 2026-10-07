@@ -162,6 +162,13 @@ Three lanes via `packageRules`:
    manager. Lock file maintenance shares the schedule and group but Renovate
    always puts it on its own branch (`renovate/lock-file-maintenance-weekly`),
    so Monday produces two PRs: the dependency batch and the lock refresh.
+2a. **Python pins (opt-in)**: non-security `minor`/`patch`/`pin` updates of
+   `pep621` and `pip_requirements` deps go to ONE PR on `renovate/python`,
+   created only when ticked in the Dependency Dashboard. Bumping ~500 `==` pins
+   one by one collides in `uv lock` (first weekly run: numpy vs Python 3.11,
+   opentelemetry family, optimum/nncf, missing direct deps), and one red
+   project would block the whole weekly PR. Transitive deps still refresh in
+   the lock-file-maintenance PR; CVE fixes still go to the security PR.
 2. **Major updates**: opt-in. `dependencyDashboardApproval: true`, so each major is
    listed in the Dependency Dashboard and becomes its own PR only when someone
    ticks its checkbox. A breaking bump never blocks the weekly batch and never
