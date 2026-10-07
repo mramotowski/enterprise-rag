@@ -220,6 +220,21 @@
       schedule: ["at any time"],
     },
 
+    // docling (CVE fix) 2.131 needs requests >= 2.34.2; text_extractor pins
+    // requests == 2.33.1. Scoped to that one project so requests elsewhere
+    // stays in the weekly PR.
+    {
+      description: "requests travels with the docling CVE fix in text_extractor",
+      matchPackageNames: ["requests"],
+      matchFileNames: ["src/comps/text_extractor/impl/microservice/pyproject.toml"],
+      groupName: "security fixes",
+      groupSlug: "security",
+      separateMajorMinor: false,
+      additionalBranchPrefix: "",
+      dependencyDashboardApproval: false,
+      schedule: ["at any time"],
+    },
+
     // Accepted risk: CVE fixes that cannot resolve in these projects today.
     // Re-check when the blocking package releases a compatible version.
     //  - transformers: optimum-intel (ovms servers) and optimum-onnx (llm_guard)
