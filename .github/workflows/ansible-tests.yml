@@ -1,0 +1,203 @@
+---
+name: Ansible playbook tests
+
+# Runs the offline Ansible test playbooks of the deployment roles (no cluster:
+# fake kubernetes.core, a fake Kubernetes API, OpenBao and Postgres in Docker,
+# helm template). One job per entry playbook, so a regression fails only its job.
+# Each job runs the command from the playbook's header comment.
+#
+# Actions are pinned to full commit SHAs (the trailing `# vX.Y.Z` is the tag
+# that SHA corresponded to); helm and the direct pip packages to exact
+# versions (helm checksum-verified). Not pinned: transitive pip
+# dependencies (no hashes), and the Docker images, which are pulled by the tags
+# the playbooks reference (postgresql:17 is a moving major tag).
+# ansible 12.3.0 is the newest release in the installer's range (ansible<13 in
+# enterprise-ai-solutions requirements.txt).
+
+# The triggers are those of the other workflows; the release branch filter
+# writes '.' instead of '\.' ('.' is a literal in the filter syntax, and
+# actionlint rejects the escape).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'release-[0-9]+.[0-9]+'
+  pull_request:
+    branches:
+      - main
+      - 'release-[0-9]+.[0-9]+'
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only supersede PR runs; every push to main/release keeps its own result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  playbook-test:
+    name: "${{ matrix.name }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: app_secrets local adapter
+            playbook: deployment/roles/app_secrets/tests/test_local_adapter.yaml
+            inventory: "localhost,"
+            fake_collections: false
+            helm: false
+            images: ""
+            timeout: 20
+          - name: app_secrets role calls
+            playbook: deployment/roles/app_secrets/tests/test_role_calls.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: false
+            images: ""
+            timeout: 30
+          - name: app_secrets data services
+            playbook: deployment/roles/app_secrets/tests/test_data_services.yaml
+            inventory: deployment/roles/app_secrets/tests/fixtures/data_services_inventory.yaml
+            fake_collections: false
+            helm: true
+            images: ""
+            timeout: 20
+          - name: app_secrets openbao adapter
+            playbook: deployment/roles/app_secrets/tests/test_openbao_adapter.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: true
+            images: quay.io/openbao/openbao:2.7.0
+            timeout: 45
+          - name: app_secrets preflight
+            playbook: deployment/roles/app_secrets/tests/test_preflight.yaml
+            inventory: "localhost,"
+            fake_collections: false
+            helm: false
+            images: ""
+            timeout: 20
+          - name: app_secrets switch-back guard
+            playbook: deployment/roles/app_secrets/tests/test_switch_guard.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: false
+            images: ""
+            timeout: 20
+          - name: app_secrets HF token consumers
+            playbook: deployment/roles/app_secrets/tests/test_hf_token_consumers.yaml
+            inventory: "localhost,"
+            fake_collections: false
+            helm: true
+            images: ""
+            timeout: 20
+          - name: app_secrets migration
+            playbook: deployment/roles/app_secrets/tests/test_migration.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: false
+            images: quay.io/openbao/openbao:2.7.0
+            timeout: 45
+          - name: app_secrets rotation
+            playbook: deployment/roles/app_secrets/tests/test_rotation.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: false
+            images: quay.io/openbao/openbao:2.7.0 ghcr.io/cloudnative-pg/postgresql:17
+            timeout: 45
+          - name: app_keycloak_config configurator
+            playbook: deployment/roles/app_keycloak_config/tests/test_configurator.yaml
+            inventory: "localhost,"
+            fake_collections: false
+            helm: false
+            images: ""
+            timeout: 20
+          - name: app_pre_install vector-dims Job
+            playbook: deployment/roles/app_pre_install/tests/test_vector_dims_job.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: false
+            images: ""
+            timeout: 20
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+
+      # cryptography: the openbao adapter tests sign the fake TokenReview JWTs;
+      # PyYAML and Jinja2: the fake cluster and the rotation harness.
+      - name: Install Ansible
+        run: >-
+          pip install --disable-pip-version-check
+          "ansible==12.3.0" "ansible-core==2.19.13"
+          "cryptography==50.0.2" "PyYAML==6.0.3" "Jinja2==3.1.6"
+
+      # Installed from the pinned upstream release and checksum-verified.
+      - name: Install helm
+        if: matrix.helm
+        env:
+          HELM_VERSION: v3.20.2
+          HELM_SHA256: 258e830a9e613c8a7a302d6059b4bb3b9758f2f3e1bb8ea0d707ce10a9a72fea
+        run: |
+          file="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "https://get.helm.sh/${file}" -o helm.tar.gz
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum --check --strict
+          tar -xzf helm.tar.gz
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          rm -rf helm.tar.gz linux-amd64
+          helm version --short
+
+      # Pulled before the test so that a registry problem fails here, not as a
+      # test assertion.
+      - name: Pull the test images
+        if: matrix.images != ''
+        env:
+          IMAGES: ${{ matrix.images }}
+        run: |
+          for image in ${IMAGES}; do
+            docker pull "${image}"
+          done
+
+      - name: Run the playbook
+        env:
+          PLAYBOOK: ${{ matrix.playbook }}
+          INVENTORY: ${{ matrix.inventory }}
+          FAKE_COLLECTIONS: ${{ matrix.fake_collections }}
+          ANSIBLE_ROLES_PATH: deployment/roles
+          ANSIBLE_FORCE_COLOR: "0"
+          PY_COLORS: "0"
+        run: |
+          if [ "${FAKE_COLLECTIONS}" = "true" ]; then
+            export ANSIBLE_COLLECTIONS_PATH="deployment/roles/app_secrets/tests/fake_collections:${HOME}/.ansible/collections:/usr/share/ansible/collections"
+          fi
+          ansible-playbook -i "${INVENTORY}" -c local "${PLAYBOOK}"
+
+  # Single stable check for branch protection, independent of matrix entries.
+  playbook-tests-result:
+    name: "Ansible playbook tests result"
+    if: always()
+    needs: playbook-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the playbook test results
+        env:
+          RESULT: ${{ needs.playbook-test.result }}
+        run: |
+          echo "playbook-test: ${RESULT}"
+          [[ "${RESULT}" == "success" ]]

@@ -280,6 +280,25 @@
   ansible.builtin.set_fact:
     helm_override_values_path: "{{ rag_log_dir }}/{{ gmc_helm_chart_name }}-override-values.yaml"
 
+# Projected Secrets: the llm-usvc pods read the HF token from hf-token-secret in
+# the pipeline namespace, an ESO projection of erag/user/hf-token; it exists
+# only when the operator wrote the token (app_pre_install checked it).
+- name: "app_pipeline | Project the HF token into the pipeline namespace"
+  when:
+    - app_secrets_projected | default(false)
+    - hugging_token_projected | default(false) | bool
+  block:
+    - name: "app_pipeline | Enable the pipeline HF token projection"
+      ansible.builtin.set_fact:
+        hf_token_secret_pipeline: true
+
+    - name: "app_pipeline | Ensure the HF token projection"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [user/hf-token]
+
 - name: "app_pipeline | Generate override values file from template"
   ansible.builtin.template:
     src: "values.yaml.j2"

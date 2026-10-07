@@ -67,6 +67,16 @@ There is no `sharepoint_enabled` flag. Both SSO and SharePoint are enabled impli
 
 A partial configuration is rejected at install time.
 
+> [!IMPORTANT]
+> With `secrets_backend: openbao`, leave `erag_keycloak_oidc_client_secret` out of `config.erag.yaml`: the install fails at preflight while it is set. Write the Entra client secret to OpenBao instead. With one app registration for SSO and SharePoint, write the same value to both entries:
+>
+> ```bash
+> bao kv put -mount=intel-ai <cluster_id>/erag/user/keycloak-oidc client_secret=-   # SSO (Keycloak identity provider)
+> bao kv put -mount=intel-ai <cluster_id>/erag/user/sharepoint client_secret=-      # SharePoint (EDP)
+> ```
+>
+> The other options above stay in `config.erag.yaml`. Feed each value on stdin without a trailing newline (`printf '%s' "$V" | bao kv put ...`), as shown in [Credentials in OpenBao](../deploy/openbao.md#log-in-to-openbao); the entries are described in [Operator-supplied secrets](../deploy/openbao.md#operator-supplied-secrets-eraguser).
+
 Deploy or redeploy:
 
 ```bash

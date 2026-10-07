@@ -10,6 +10,32 @@
     - "{{ rag_log_dir }}"
     - "{{ rag_tmp_dir }}"
 
+# Before anything is removed: the credential delete (app_pre_install) runs
+# last, so an unusable OpenBao (sealed, unreachable, uninitialized, worker login
+# failing) must stop the teardown here, while every component is still in
+# place. Never writes to OpenBao; in the cluster only the worker namespace,
+# ServiceAccount, CA bundle and a probe Job (the delete removes them). The
+# ClusterSecretStore is not required (the delete does not go through ESO), and
+# with the local backend the probe checks nothing (no remote store).
+# erag_teardown_store_lost=true skips it: the env's OpenBao is gone for good,
+# and the delete then skips the store too (docs/deploy/openbao.md, Teardown).
+- name: "app_post_install | OpenBao is usable for the credential delete"
+  when: not (erag_teardown_store_lost | default(false) | bool)
+  block:
+    - name: "app_post_install | Probe the credential store (teardown gate)"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: probe.yaml
+      vars:
+        app_secrets_probe_teardown: true
+  rescue:
+    - name: "app_post_install | Stop the teardown before anything is removed"
+      ansible.builtin.fail:
+        msg: >-
+          teardown stopped before removing anything: the erag credentials cannot be
+          deleted from OpenBao. {{ ansible_failed_result.msg | default('') }}
+          Unseal (or repair) OpenBao and re-run the teardown.
+
 # First, because teardown runs the components in reverse: this role goes before
 # anything is removed, so the manifest says "deleting" while the removal is in
 # progress and an interrupted teardown is recognisable. app_pre_install deletes

@@ -96,7 +96,7 @@ The gateway binds ports 80 and 443 on the node, so no port forwarding is needed.
 <node-ip> solutions.ai grafana.solutions.ai keycloak.solutions.ai s3.solutions.ai seaweedfs.solutions.ai
 ```
 
-Then open `https://solutions.ai`. First-login credentials are written to `env/local/logs/rag/default_credentials.txt`; you will be asked to change the password immediately.
+Then open `https://solutions.ai`. First-login credentials are written to `env/local/logs/rag/default_credentials.txt` (with `secrets_backend: openbao` they are in OpenBao instead: see [Credentials in OpenBao](docs/deploy/openbao.md#first-login-credentials)); you will be asked to change the password immediately.
 
 > [!IMPORTANT]
 > With the default self-signed certificates, visit `https://s3.solutions.ai` once and accept

@@ -15,11 +15,10 @@
 
 - name: "app_chat_history | Generate password"
   ansible.builtin.include_role:
-    name: app_generate_password
-    tasks_from: generate_password.yaml
-  loop:
-    - name: "CHAT_HISTORY_POSTGRES"
-      user: "{{ chat_history_db_user }}"
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [chat-history/postgres]
 
 - name: "app_chat_history | Ensure namespace exists"
   kubernetes.core.k8s:
@@ -74,6 +73,8 @@
         POSTGRES_USER: >-
           {{ chat_history_db_user | b64encode }}
         POSTGRES_DB: "{{ 'postgres' | b64encode }}"
+  # With projected Secrets the port's ensure above rendered it (ESO).
+  when: not (app_secrets_projected | default(false))
   no_log: "{{ secure_logs }}"
   loop:
     - "{{ chat_history_namespace }}"
@@ -106,10 +107,8 @@
 
 - name: "app_chat_history | Mark secret for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-    namespace: "{{ chat_history_namespace }}"
-    secret_name: "{{ chat_history_db_password_secret_name }}"
-    password_mappings:
-        - {key: POSTGRES_PASSWORD, variable: CHAT_HISTORY_POSTGRES_PASSWORD, user: "{{ chat_history_db_user }}"}
+    secret_ids: [chat-history/postgres]
+    ensure_phase: after_deploy

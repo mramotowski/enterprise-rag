@@ -2,6 +2,11 @@
 Copyright (C) 2024-2026 Intel Corporation
 SPDX-License-Identifier: Apache-2.0
 #}
+{# With projected Secrets (ESO) the chart templates none of its Secrets and no
+   credential value is rendered here. #}
+{% if app_secrets_projected | default(false) %}
+externalSecrets: true
+{% endif %}
 
 proxy:
   http_proxy: "{{ http_proxy | default('') }}"
@@ -50,8 +55,10 @@ s3PathPrefix: "{{ s3_path_prefix }}"
 
 {% set storage = lookup('env', 'edp_storage_type') or edp_storage_type if edp_storage_type is defined else "seaweedfs" %}
 {% if storage == "seaweedfs" %}
+{% if not (app_secrets_projected | default(false)) %}
 edpAccessKey: {{ EDP_MINIO_ACCESS_KEY }}
 edpSecretKey: {{ EDP_MINIO_SECRET_KEY }}
+{% endif %}
 edpExternalUrl: "https://{{ s3_api_domain }}{{ s3_path_prefix }}"
 {% if hpa_enabled is defined %}
 hpa_enabled: {{ hpa_enabled }}
@@ -63,13 +70,17 @@ presignedUrlCredentialsSystemFallback: {{ edp_presigned_url_credentials_system_f
 {% endif %}
 edpExternalCertVerify: false
 edpInternalCertVerify: false
+{% if not (app_secrets_projected | default(false)) %}
 edpOidcClientSecret: {{ edp_client_secret_id }}
+{% endif %}
 minioBrowserDomain: "{{ ui_browser_domain }}"
 bucketNameRegexFilter: {{ edp_bucket_name_regex_filter | default('.*', true) }}
 {% elif storage == "s3" %}
 edpBaseRegion: "{{ lookup('env', 's3_region') or edp_s3_region }}"
+{% if not (app_secrets_projected | default(false)) %}
 edpAccessKey: "{{ lookup('env', 's3_access_key') or edp_s3_access_key_id }}"
 edpSecretKey: "{{ lookup('env', 's3_secret_key') or edp_s3_secret_access_key }}"
+{% endif %}
 edpExternalUrl: "https://s3.amazonaws.com"
 edpInternalUrl: "https://s3.amazonaws.com"
 edpSqsEventQueueUrl: "{{ lookup('env', 's3_sqs_queue') or edp_s3_sqs_event_queue_url }}"
@@ -77,8 +88,10 @@ bucketNameRegexFilter: {{ lookup('env', 's3_bucket_name_regex_filter') or edp_s3
 presignedUrlCredentialsSystemFallback: {{ edp_presigned_url_credentials_system_fallback | bool | string | lower }}
 {% elif storage == "s3compatible" %}
 edpBaseRegion: "{{ lookup('env', 's3_region') or edp_s3_compatible_region }}"
+{% if not (app_secrets_projected | default(false)) %}
 edpAccessKey: "{{ lookup('env', 's3_access_key') or edp_s3_compatible_access_key_id }}"
 edpSecretKey: "{{ lookup('env', 's3_secret_key') or edp_s3_compatible_secret_access_key }}"
+{% endif %}
 edpExternalUrl: "{{ lookup('env', 's3_compatible_endpoint') or edp_s3_compatible_external_url }}"
 edpInternalUrl: "{{ lookup('env', 's3_compatible_endpoint') or edp_s3_compatible_internal_url }}"
 edpExternalCertVerify: "{{ lookup('env', 's3_cert_verify') or edp_s3_compatible_external_cert_verify }}"
@@ -95,15 +108,19 @@ edpOidcConfigUrl: "http://keycloak-service.{{ keycloak_namespace | default('keyc
 redisHost: "edp-redis"
 redisPort: "6379"
 redisUsername: {{ edp_redis_username }}
+{% if not (app_secrets_projected | default(false)) %}
 redisPassword: "{{ EDP_REDIS_PASSWORD }}"
 
 postgresDatabasePassword: {{ EDP_POSTGRESQL_PASSWORD }}
 postgresAdminPassword: {{ EDP_POSTGRESQL_ADMIN_PASSWORD }}
+{% endif %}
 
 {% if erag_keycloak_oidc_tenant_id | default('', true) | string | trim | length > 0 %}
 sharepointTenantId: {{ erag_keycloak_oidc_tenant_id | default('', true) | string | to_json }}
 sharepointClientId: {{ erag_keycloak_oidc_client_id | default('', true) | string | to_json }}
+{% if not (app_secrets_projected | default(false)) %}
 sharepointClientSecret: {{ erag_keycloak_oidc_client_secret | default('', true) | string | to_json }}
+{% endif %}
 keycloakBrokerIdpAlias: {{ erag_keycloak_oidc_alias | default('', true) | string | to_json }}
 {% endif %}
 sharepointSyncLockTtlSeconds: "{{ edp_sp_sync_lock_ttl_seconds }}"

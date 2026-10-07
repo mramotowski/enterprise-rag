@@ -40,6 +40,24 @@
           GF_AUTH_GENERIC_OAUTH_SIGNOUT_REDIRECT_URL: "https://{{ erag_keycloak_domain_name }}{{ erag_keycloak_path_prefix }}/realms/{{ grafana_oauth_realm }}/protocol/openid-connect/logout?post_logout_redirect_uri=https%3A%2F%2F{{ grafana_oauth_domain }}{{ grafana_oauth_path_prefix }}%2Flogin"
       no_log: "{{ secure_logs | default(true) }}"
 
+    # Projected Secrets: grafana-sso-env is an ESO projection (registry), whose
+    # non-secret keys come from this fact; the client secret stays in the store
+    # (grafana_oauth_client_secret is empty in this mode).
+    - name: "app_keycloak_config | grafana-sso | Set the non-secret Grafana OAuth settings"
+      ansible.builtin.set_fact:
+        grafana_sso_config: >-
+          {{ _grafana_sso_env | dict2items
+             | rejectattr('key', 'equalto', 'GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET') | items2dict }}
+      when: app_secrets_projected | default(false)
+
+    - name: "app_keycloak_config | grafana-sso | Project grafana-sso-env"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [keycloak/grafana-oauth]
+      when: app_secrets_projected | default(false)
+
     - name: "app_keycloak_config | grafana-sso | Create/update grafana-sso-env Secret"
       kubernetes.core.k8s:
         state: present
@@ -54,6 +72,7 @@
               app.kubernetes.io/component: grafana-sso
           type: Opaque
           stringData: "{{ _grafana_sso_env }}"
+      when: not (app_secrets_projected | default(false))
       no_log: "{{ secure_logs | default(true) }}"
 
     - name: "app_keycloak_config | grafana-sso | Wire Secret into Grafana + roll"
@@ -69,7 +88,10 @@
             template:
               metadata:
                 annotations:
-                  erag.intel.com/grafana-sso-config-hash: "{{ _grafana_sso_env | to_json | hash('sha1') }}"
+                  # Projected: over the non-secret settings only (the value stays in the store).
+                  erag.intel.com/grafana-sso-config-hash: >-
+                    {{ (grafana_sso_config if app_secrets_projected | default(false) else _grafana_sso_env)
+                       | to_json | hash('sha1') }}
               spec:
                 initContainers:
                   - name: init-chown-data

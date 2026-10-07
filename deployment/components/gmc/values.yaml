@@ -69,6 +69,10 @@ proxy:
 
 tokens:
   hug_token: ""
+  # true: the Secret hf-token-secret (key HF_TOKEN) in .Values.namespace is
+  # managed outside the chart (an ESO projection from OpenBao, set by
+  # app_pipeline with secrets_backend: openbao); the chart only references it.
+  hugTokenSecret: false
 
 namespace: chatqna
 

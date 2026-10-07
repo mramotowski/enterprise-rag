@@ -88,3 +88,59 @@
   until: helm_repo_install_result is succeeded
   retries: "{{ helm_retries }}"
   delay: 15
+
+# kubernetes.core.helm decides by chart, appVersion and values only (with or
+# without helm-diff), not by release status: when an attempt fails (e.g. the
+# wait times out) the release stays "failed", and every later attempt or run
+# returns ok without deploying. Then the secrets migration cannot finalize. So
+# check the status and redeploy a failed release with a plain helm upgrade
+# (no --force: patch, not replace).
+- name: "app_apisix | Read the Helm release status"
+  kubernetes.core.helm_info:
+    release_name: "{{ apisix_helm_release_name }}"
+    release_namespace: "{{ apisix_namespace }}"
+    release_state: [all]
+  register: _apisix_release
+  until: _apisix_release is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+
+- name: "app_apisix | Redeploy a release whose last revision failed"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['helm', 'upgrade', apisix_helm_release_name, apisix_helm_chart_directory,
+          '--namespace', apisix_namespace, '--wait', '--timeout', helm_timeout]
+         + ([apisix_helm_default_values_file] | flatten | map('regex_replace', '^', '--values=') | list) }}
+  register: _apisix_redeploy
+  changed_when: true
+  until: _apisix_redeploy is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+  when: ((_apisix_release.status | default({}, true)).status | default('')) == 'failed'
+
+- name: "app_apisix | Read the Helm release status after the redeploy"
+  kubernetes.core.helm_info:
+    release_name: "{{ apisix_helm_release_name }}"
+    release_namespace: "{{ apisix_namespace }}"
+    release_state: [all]
+  register: _apisix_release_after
+  until: _apisix_release_after is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+  when: _apisix_redeploy is changed
+
+# A skipped task still registers, hence a separate variable for the re-read.
+- name: "app_apisix | Assert the Helm release is deployed"
+  vars:
+    _state: >-
+      {{ ((_apisix_release_after if _apisix_redeploy is changed else _apisix_release).status
+          | default({}, true)).status | default('missing') }}
+  ansible.builtin.assert:
+    that: _state == 'deployed'
+    fail_msg: >-
+      Helm release {{ apisix_namespace }}/{{ apisix_helm_release_name }} is
+      '{{ _state }}'
+      (helm -n {{ apisix_namespace }} history {{ apisix_helm_release_name }}). A pending-*
+      state means an interrupted operation: roll back to the last good revision
+      (helm -n {{ apisix_namespace }} rollback {{ apisix_helm_release_name }}) and re-run.
+    quiet: true

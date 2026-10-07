@@ -126,37 +126,45 @@ The erag-gateway binds ports 80 and 443 directly on the cluster node via `hostPo
 
 > If using self-signed certificates (default), access `https://s3.solutions.ai` in your browser before ingesting data to accept the certificate warning. Not required with custom SSL certificates.
 
+### Where the Credentials Are
+
+With `secrets_backend: openbao` in `env/<name>/global_config.yaml`, no credential file is written: every credential this layer generates or consumes is in OpenBao under `<openbao_kv_mount>/<cluster_id>/erag/`, and External Secrets Operator projects it into the same Kubernetes Secrets. The Keycloak admin and Grafana admin passwords below belong to the platform and stay in platform Kubernetes Secrets (`keycloak/keycloak-admin-secret`, `monitoring/grafana-admin-credentials`). Read the first-login values with `bao kv get` as described in [Credentials in OpenBao](../docs/deploy/openbao.md#first-login-credentials); there is no file to secure or delete.
+
+The rest of this section describes the default, `secrets_backend: local`.
+
 ### UI Credentials
 
-After deployment completes, credentials are written to:
+After deployment completes, the UI users' one-time passwords are written to:
 
 ```
 env/<name>/logs/rag/default_credentials.txt
+```
+
+It holds `KEYCLOAK_ERAG_ADMIN_*`, `KEYCLOAK_ERAG_USER_*` and `KEYCLOAK_ERAG_MAINTAINER_*` (usernames `erag-admin`, `erag-user`, `erag-maintainer`), plus `MCP_CLIENT_ID` and `MCP_CLIENT_SECRET` when MCP is enabled. The same values are in the Kubernetes Secret `keycloak/erag-credentials`. You will be required to change the password after the first login.
+
+The service passwords and the Keycloak admin password are in:
+
+```
 env/<name>/logs/rag/default_credentials.yaml
 ```
 
-These contain one-time passwords for the application admin and user. You will be required to change the password after the first login.
-
-> Remove these files after the first successful login.
+> Both files are written again by every install from the Kubernetes Secrets, so you can remove them after the first successful login. Do not encrypt `default_credentials.yaml` with `ansible-vault`: the next install reads it as plain YAML and writes it again in plaintext.
 
 ### Keycloak and Grafana Credentials
 
-Default credentials for Keycloak and Grafana:
+Keycloak admin console:
 - **username:** admin
-- **password:** stored in `env/<name>/logs/rag/default_credentials.yaml`
+- **password:** `KEYCLOAK_REALM_ADMIN_PASSWORD` in `env/<name>/logs/rag/default_credentials.yaml`, copied from the platform Secret `keycloak/keycloak-admin-secret`
+
+Grafana:
+- **username:** admin
+- **password:** not written by this layer. Read it from the platform Secret: `kubectl get secret -n monitoring grafana-admin-credentials -o jsonpath='{.data.password}' | base64 -d`
 
 Change passwords after first login.
 
-> Secure the password file after first login:
-> ```bash
-> ansible-vault encrypt env/<name>/logs/rag/default_credentials.yaml
-> ```
-> Once encrypted, subsequent installer runs that read it need the vault password passed
-> through to Ansible: `./es_auto_installer.sh install erag --env <name> -- --ask-vault-pass`.
-
 ### Vector Store Credentials
 
-Default credentials for the vector store (if deployed) are stored in `env/<name>/logs/rag/default_credentials.yaml` and generated on first deployment.
+Default credentials for the vector store (if deployed) are generated on first deployment and stored in `env/<name>/logs/rag/default_credentials.yaml`: `REDIS_PASSWORD`, `POSTGRES_PASSWORD` (pgvector) or `MSSQL_PASSWORD`, each with its `*_USERNAME` line.
 
 ### Enhanced Dataprep Pipeline (EDP) Credentials
 
@@ -173,22 +181,28 @@ Default credentials for the vector store (if deployed) are stored in `env/<name>
 
 - Redis:
   - **username:** default
-  - **password:** stored in `env/<name>/logs/rag/default_credentials.yaml`
+  - **password:** `EDP_REDIS_PASSWORD` in `env/<name>/logs/rag/default_credentials.yaml`
 
 - Postgres:
   - **username:** edp
-  - **password:** stored in `env/<name>/logs/rag/default_credentials.yaml`
+  - **password:** `EDP_POSTGRESQL_PASSWORD` in `env/<name>/logs/rag/default_credentials.yaml`
+
+**Chat History:**
+
+- Postgres:
+  - **username:** chat_history
+  - **password:** `CHAT_HISTORY_POSTGRES_PASSWORD` in `env/<name>/logs/rag/default_credentials.yaml`
 
 **System Fingerprint Service:**
 
 - Postgres:
   - **username:** fingerprint
   - **database:** system_fingerprint
-  - **password:** stored in the `fingerprint-postgresql-secret` Kubernetes secret
+  - **password:** `FINGERPRINT_POSTGRES_PASSWORD` in `env/<name>/logs/rag/default_credentials.yaml`, and in the `fingerprint-postgresql-secret` Kubernetes secret
 
 ### NATS Credentials
 
-NATS JetStream authorizes clients with an NKey, which is always required. The `app_nats` role generates the NKey pair once and stores it in the `nats-auth` secret. Client components (GMC controller and router) mount the seed automatically. No manual credential management is required.
+NATS JetStream authorizes clients with an NKey, which is always required. The `app_nats` role generates the NKey pair once and stores it in the `nats-auth` secret. Client components (GMC controller and router) mount the seed automatically. No manual credential management is required. With `secrets_backend: openbao` the pair is generated in OpenBao (`erag/nats/auth`) and projected into the same Secrets.
 
 Transport encryption is provided by the Istio ambient mesh when Istio is enabled; otherwise connections are plaintext.
 

@@ -1,0 +1,439 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Proves that the component roles' switch to app_secrets (local backend) gives
+# the same credential files, k8s Secrets, markup and facts as the legacy
+# helper calls, using a fake kubernetes.core (tests/fake_collections, one JSON
+# state file per host) instead of a cluster.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_role_calls.yaml
+#
+# legacy_role_calls.yaml holds the role tasks as they were before the switch,
+# port_role_calls.yaml the port calls the roles make now (checked against the
+# role files below). Each sequence runs in components.yaml order on its own
+# host:
+#   fresh    one pair per vector store engine (redis-cluster, pgvector, mssql),
+#            empty log dir and cluster (only the platform keycloak-admin-secret):
+#            random values differ, so names, order, formats, markup and the
+#            Secret keys are compared, plus file/Secret consistency per host
+#   rerun    both start from the legacy redis-cluster fresh result (mcp_enabled false):
+#            files, cluster state and facts must be byte-identical
+#   recover  as rerun, with default_credentials.yaml deleted (rebuilt from
+#            the marked Secrets): byte-identical too
+
+---
+- name: "app_secrets | test | role calls | Setup and static checks"
+  hosts: localhost
+  gather_facts: false
+  vars: &role_vars
+    roles_dir: "{{ playbook_dir }}/../.."
+    secure_logs: true
+    ansible_date_time: {iso8601: "2026-10-02T00:00:00Z"}
+    log_dir: "{{ test_dir }}/{{ inventory_hostname }}"
+    rag_log_dir: "{{ log_dir }}/rag"
+    fake_k8s_state: "{{ log_dir }}/cluster.json"
+    # Non-default names, so the registry refs must pick up the role vars.
+    vector_databases_namespace: vdb-t
+    vector_database_connection_username: edp
+    chat_history_namespace: ch-t
+    chat_history_db_password_secret_name: ch-db-secret
+    chat_history_db_user: ch_user
+    fingerprint_namespace: fp-t
+    fingerprint_db_password_secret_name: fp-db-secret
+    fingerprint_db_user: fp_user
+    edp_namespace: edp-t
+    edp_seaweedfs_namespace: sw-t
+    edp_redis_username: redis_user
+    edp_postgresql_user_username: edp_user
+    edp_postgresql_admin_username: edp_admin
+    # Legacy app_edp marks "edp-redis-secret" literally; the registry uses this var.
+    edp_redis_password_secret_name: edp-redis-secret
+    keycloak_namespace: kc-t
+    keycloak_admin_secret_name: kc-admin-secret
+    keycloak_admin_user: kc_admin
+    credentials_secret_name: erag-credentials
+    grafana_oauth_namespace: mon-t
+    grafana_oauth_secret_name: grafana-sso-env
+    nats_namespace: nats-t
+    nats_auth_secret_name: nats-auth
+    nats_auth_required_keys: [user.nk, user.pub]
+    nats_client_namespaces: [gmc-t, pipe-t]
+    # The release of the deployed engine only (vector_databases_vector_store).
+    sim_vdb_secrets: "{{ [sim_vdb_secret_by_engine[vector_databases_vector_store]] }}"
+    sim_vdb_secret_by_engine:
+      redis-cluster: {namespace: vdb-t, name: redis-cluster-secret, data: {REDIS_PASSWORD: "{{ REDIS_PASSWORD | default('') }}"}}
+      pgvector: {namespace: vdb-t, name: pgvector-secret, data: {POSTGRES_USER: edp, POSTGRES_PASSWORD: "{{ POSTGRES_PASSWORD | default('') }}"}}
+      mssql: {namespace: vdb-t, name: mssql-secret, data: {MSSQL_SA_PASSWORD: "{{ MSSQL_PASSWORD | default('') }}", MSSQL_PASSWORD: "{{ MSSQL_PASSWORD | default('') }}"}}
+    sim_chat_history_secrets:
+      - {namespace: ch-t, name: ch-db-secret, data: {POSTGRES_USER: ch_user, POSTGRES_PASSWORD: "{{ CHAT_HISTORY_POSTGRES_PASSWORD }}"}}
+    sim_fingerprint_secrets:
+      - {namespace: fp-t, name: fp-db-secret, data: {password: "{{ FINGERPRINT_POSTGRES_PASSWORD }}"}}
+    sim_edp_secrets:
+      - {namespace: edp-t, name: edp-access-secret, data: {EDP_ACCESS_KEY: "{{ EDP_MINIO_ACCESS_KEY }}", EDP_SECRET_KEY: "{{ EDP_MINIO_SECRET_KEY }}"}}
+      - {namespace: edp-t, name: edp-redis-secret, data: {password: "{{ EDP_REDIS_PASSWORD }}"}}
+      - {namespace: edp-t, name: edp-postgresql-secret, data: {DATABASE_PASSWORD: "{{ EDP_POSTGRESQL_PASSWORD }}", DATABASE_ADMIN_PASSWORD: "{{ EDP_POSTGRESQL_ADMIN_PASSWORD }}"}}
+    # Credential facts compared between the sequences (the NATS pair is a
+    # registered var in legacy and two facts now, so it is checked via the Secret).
+    fact_names:
+      - REDIS_PASSWORD
+      - POSTGRES_PASSWORD
+      - MSSQL_PASSWORD
+      - CHAT_HISTORY_POSTGRES_PASSWORD
+      - FINGERPRINT_POSTGRES_PASSWORD
+      - EDP_MINIO_ACCESS_KEY
+      - EDP_MINIO_SECRET_KEY
+      - EDP_REDIS_PASSWORD
+      - EDP_POSTGRESQL_PASSWORD
+      - EDP_POSTGRESQL_ADMIN_PASSWORD
+      - KEYCLOAK_REALM_ADMIN_PASSWORD
+      - SEAWEEDFS_ADMIN_PASSWORD
+      - EDP_SEAWEEDFS_ACCESS_KEY
+      - grafana_oauth_client_secret
+      - seaweedfs_admin_password
+      - seaweedfs_admin_user
+    # Port calls the roles must make, as "<secret_ids> <phase>[ when: <guard>]"
+    # -> count. Guards of enclosing blocks are role code this change keeps.
+    expected_port_calls:
+      # app_pre_install solution_config and project_hf_token, app_mcp_gateway edge check,
+      # app_keycloak_config client secret drift check.
+      "preflight": 4
+      "probe": 1
+      # app_post_install teardown: OpenBao gate before anything is removed.
+      "probe teardown": 1
+      "status [user/hf-token]": 1
+      "[user/hf-token] before_deploy when: hugging_token_projected | bool": 1
+      "[user/hf-token] before_deploy": 2
+      "[vector-db/redis] before_deploy": 1
+      "[vector-db/pgvector] before_deploy": 1
+      "[vector-db/mssql] before_deploy": 1
+      "[vector-db/redis] after_deploy when: vector_databases_vector_store in ['redis-cluster']": 1
+      "[vector-db/pgvector] after_deploy when: vector_databases_vector_store == 'pgvector'": 1
+      "[vector-db/mssql] after_deploy when: vector_databases_vector_store == 'mssql'": 1
+      "[platform/keycloak-admin] after_deploy": 1
+      "[keycloak/grafana-oauth] before_deploy when: grafana_oauth_client_secret | default('') | length == 0": 1
+      "keycloak-users after_deploy": 1
+      "keycloak-users before_deploy when: app_secrets_projected | default(false)": 1
+      "[keycloak/grafana-oauth] before_deploy when: app_secrets_projected | default(false)": 1
+      "[keycloak/edp-oidc] before_deploy when: app_secrets_projected | default(false)": 1
+      "[chat-history/postgres] before_deploy": 1
+      "[chat-history/postgres] after_deploy": 1
+      "[nats/auth] before_deploy": 1
+      "[fingerprint/postgres] before_deploy": 1
+      "[fingerprint/postgres] after_deploy": 1
+      "[edp/object-store, edp/redis, edp/postgresql] before_deploy": 1
+      "[user/edp-s3] before_deploy when: edp_secret_storage in ['s3', 's3compatible']": 1
+      "[user/sharepoint] before_deploy when: erag_keycloak_oidc_tenant_id | default('', true) | string | trim | length > 0": 1
+      "[edp/object-store, edp/redis, edp/postgresql] after_deploy": 1
+      "[seaweedfs/admin] before_deploy when: (app_secrets_projected | default(false)) or seaweedfs_admin_secret_check.resources | length == 0": 1
+      "[edp/object-store, seaweedfs/admin] after_deploy": 1
+      # app_pre_install teardown (the guard is not part of the key).
+      "delete app_pre_install_teardown_secret_ids": 1
+      # Rotate-only run (erag_rotate): app_pre_install tasks/rotate.yaml.
+      "rotate app_pre_install_rotate_ids": 1
+      # Migration to OpenBao: app_pre_install install, app_post_install install and upgrade.
+      "import app_pre_install_import_secret_ids": 1
+      "import app_post_install_import_secret_ids finalize": 2
+    # Normalized (whitespace-collapsed) port calls -> "<secret_ids> <phase>".
+    count_port_calls: >-
+      {%- set norm = _text | regex_replace('(?m)^\s*#.*$', '') | regex_replace('\s+', ' ') -%}
+      {%- set out = {} -%}
+      {%- set calls = norm.split('name: app_secrets tasks_from: ')[1:] -%}
+      {%- for c in calls -%}
+        {%- set call = c.split(' - name:')[0] -%}
+        {%- if call.startswith('probe.yaml') -%}
+          {%- set k = 'probe' ~ (' teardown' if 'app_secrets_probe_teardown: true' in call else '') -%}
+        {%- elif call.startswith('preflight.yaml') -%}
+          {%- set k = 'preflight' -%}
+        {%- elif call.startswith('delete.yaml') -%}
+          {%- set ids = call | regex_findall('secret_ids: (\\[[^\\]]*\\]|"[{][{] [a-z_]+ [}][}]")') -%}
+          {%- set k = 'delete ' ~ ((ids | first | regex_replace('^"[{][{] ([a-z_]+) [}][}]"$', '\\1')) if ids else 'unparsed') -%}
+        {%- elif call.startswith('import.yaml') -%}
+          {%- set ids = call | regex_findall('secret_ids: "[{][{] ([a-z_]+) [}][}]"') -%}
+          {%- set k = 'import ' ~ ((ids | first) if ids else 'unparsed') ~ (' finalize' if 'import_phase: finalize' in call else '') -%}
+        {%- elif call.startswith('rotate.yaml') -%}
+          {%- set ids = call | regex_findall('secret_ids: "[{][{] ([a-z_]+) [}][}]"') -%}
+          {%- set k = 'rotate ' ~ ((ids | first) if ids else 'unparsed') -%}
+        {%- elif call.startswith('status.yaml') -%}
+          {%- set ids = call | regex_findall('secret_ids: \\[[^\\]]*\\]') -%}
+          {%- set k = 'status ' ~ ((ids | first | replace('secret_ids: ', '')) if ids else 'unparsed') -%}
+        {%- else -%}
+          {%- set ids = call | regex_findall('secret_ids: \\[[^\\]]*\\]') -%}
+          {%- set ids = (ids | first | replace('secret_ids: ', '')) if ids else ('keycloak-users' if "'keycloak/erag-admin'" in call else 'unparsed') -%}
+          {%- set guard = (call.split(' when: ', 1)[1] | trim) if ' when: ' in call else '' -%}
+          {%- set k = ids ~ ' ' ~ ('after_deploy' if 'ensure_phase: after_deploy' in call else 'before_deploy') ~ ((' when: ' ~ guard) if guard else '') -%}
+        {%- endif -%}
+        {%- set _ = out.update({k: out.get(k, 0) + 1}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+  tasks:
+    - name: "app_secrets | test | role calls | Create per-run temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_roles.
+      register: _test_tmp
+
+    - name: "app_secrets | test | role calls | Static checks"
+      block:
+        - name: "app_secrets | test | role calls | The fake kubernetes.core is in use"
+          kubernetes.core.k8s_info:
+            kind: Secret
+          environment:
+            FAKE_K8S_STATE: "{{ _test_tmp.path }}/probe.json"
+          register: _fake_probe
+          failed_when: not (_fake_probe.fake | default(false))
+
+        # e.g. EDP with s3 storage: seaweedfs-s3-secret never exists.
+        - name: "app_secrets | test | role calls | after_deploy on Secrets that do not exist"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: ensure.yaml
+            apply:
+              environment:
+                FAKE_K8S_STATE: "{{ _test_tmp.path }}/missing.json"
+          vars:
+            secret_ids: [edp/object-store, edp/redis, platform/keycloak-admin]
+            ensure_phase: after_deploy
+            log_dir: "{{ _test_tmp.path }}/missing"
+
+        - name: "app_secrets | test | role calls | Read the missing-Secrets cluster state"
+          ansible.builtin.stat:
+            path: "{{ _test_tmp.path }}/missing.json"
+          register: _missing_state
+
+        - name: "app_secrets | test | role calls | Missing Secrets were skipped, not created"
+          ansible.builtin.assert:
+            that: not _missing_state.stat.exists
+            quiet: true
+
+        - name: "app_secrets | test | role calls | No role outside the port references the legacy credential helpers"
+          ansible.builtin.command:
+            argv:
+              - grep
+              - -rnE
+              - "app_generate_password|app_password_mgmt|default_credentials\\.|secrets_backend|lookup\\(['\"](ansible\\.builtin\\.)?password|random_string|gen_nkey"
+              - --exclude-dir=app_secrets
+              - --exclude-dir=app_generate_password
+              - --exclude-dir=app_password_mgmt
+              - "{{ roles_dir }}"
+          register: _ad1_grep
+          changed_when: false
+          failed_when: _ad1_grep.rc != 1
+
+        - name: "app_secrets | test | role calls | Find the role task files"
+          ansible.builtin.find:
+            paths: "{{ roles_dir }}"
+            patterns: "*.yaml"
+            recurse: true
+          register: _role_find
+
+        - name: "app_secrets | test | role calls | Read the role task files"
+          ansible.builtin.set_fact:
+            _role_text: "{{ query('ansible.builtin.file', *_role_files) | join('\n- name: end of file\n') }}"
+            _port_text: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/port_role_calls.yaml') }}"
+          vars:
+            _role_files: >-
+              {{ _role_find.files | map(attribute='path') | select('search', '/app_[a-z_]+/tasks/')
+                 | reject('search', '/app_secrets/') | sort | list }}
+
+        - name: "app_secrets | test | role calls | Count port calls in the roles"
+          ansible.builtin.set_fact:
+            _roles_calls: "{{ count_port_calls }}"
+          vars:
+            _text: "{{ _role_text }}"
+
+        - name: "app_secrets | test | role calls | Count port calls in port_role_calls.yaml"
+          ansible.builtin.set_fact:
+            _port_calls: "{{ count_port_calls }}"
+          vars:
+            _text: "{{ _port_text }}"
+
+        - name: "app_secrets | test | role calls | Roles and port_role_calls.yaml make exactly the expected port calls"
+          ansible.builtin.assert:
+            that:
+              - _roles_calls == expected_port_calls
+              - _port_calls == expected_port_calls
+            fail_msg: "roles: {{ _roles_calls }}; port_role_calls.yaml: {{ _port_calls }}"
+            quiet: true
+
+        # With projected Secrets (openbao) ESO owns every registry Secret: each
+        # Secret write of the data-service and Keycloak roles must be skipped
+        # then. Only the SeaweedFS IAM config is local by design (refused with
+        # projected Secrets).
+        - name: "app_secrets | test | role calls | Role Secret writes are skipped when Secrets are projected"
+          ansible.builtin.command:
+            argv: >-
+              {{ [ansible_playbook_python, playbook_dir ~ '/files/check_projected_guards.py', 'seaweedfs-iam-config']
+                 + (['app_vector_databases/tasks/install.yaml', 'app_chat_history/tasks/install.yaml',
+                     'app_fingerprint/tasks/install.yaml', 'app_nats/tasks/install.yaml',
+                     'app_edp/tasks/install.yaml', 'app_edp/tasks/seaweedfs.yaml',
+                    'app_keycloak_config/tasks/configure_keycloak.yaml',
+                    'app_keycloak_config/tasks/configure_grafana_sso.yaml']
+                    | map('regex_replace', '^', playbook_dir ~ '/../../') | list) }}
+          register: _guards
+          changed_when: false
+          failed_when: _guards.rc != 0 or _guards.stdout_lines[-1] != 'checked 11'
+
+      rescue:
+        - name: "app_secrets | test | role calls | Remove temp dir after a failed static check"
+          ansible.builtin.file:
+            path: "{{ _test_tmp.path }}"
+            state: absent
+
+        - name: "app_secrets | test | role calls | Static check failed"
+          ansible.builtin.fail:
+            msg: "static check failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+
+    - name: "app_secrets | test | role calls | Add the sequence hosts"
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: ["role_calls_{{ item.scenario }}"]
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        test_dir: "{{ _test_tmp.path }}"
+        sequence: "{{ item.sequence }}"
+        mcp_enabled: "{{ item.name is not search('_rerun$') }}"
+        vector_databases_vector_store: "{{ item.engine | default('redis-cluster') }}"
+      loop:
+        - {name: legacy_fresh, sequence: legacy, scenario: fresh}
+        - {name: port_fresh, sequence: port, scenario: fresh}
+        - {name: legacy_fresh_pgvector, sequence: legacy, scenario: fresh, engine: pgvector}
+        - {name: port_fresh_pgvector, sequence: port, scenario: fresh, engine: pgvector}
+        - {name: legacy_fresh_mssql, sequence: legacy, scenario: fresh, engine: mssql}
+        - {name: port_fresh_mssql, sequence: port, scenario: fresh, engine: mssql}
+        - {name: legacy_rerun, sequence: legacy, scenario: seeded}
+        - {name: port_rerun, sequence: port, scenario: seeded}
+        - {name: legacy_recover, sequence: legacy, scenario: seeded}
+        - {name: port_recover, sequence: port, scenario: seeded}
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: "app_secrets | test | role calls | Create the fresh host dirs"
+      ansible.builtin.file:
+        path: "{{ _test_tmp.path }}/{{ item }}/rag"
+        state: directory
+        mode: '0755'
+      loop: [legacy_fresh, port_fresh, legacy_fresh_pgvector, port_fresh_pgvector, legacy_fresh_mssql, port_fresh_mssql]
+
+    - name: "app_secrets | test | role calls | Seed the fresh clusters with the platform Keycloak admin Secret"
+      ansible.builtin.copy:
+        dest: "{{ _test_tmp.path }}/{{ item }}/cluster.json"
+        mode: '0600'
+        content: >-
+          {{ {'Secret/kc-t/kc-admin-secret': {'apiVersion': 'v1', 'kind': 'Secret',
+              'metadata': {'name': 'kc-admin-secret', 'namespace': 'kc-t'},
+              'data': {'username': 'kc_admin' | b64encode, 'password': 'platform-admin-pw' | b64encode}}} | to_json }}
+      loop: [legacy_fresh, port_fresh, legacy_fresh_pgvector, port_fresh_pgvector, legacy_fresh_mssql, port_fresh_mssql]
+
+# --- Fresh install -------------------------------------------------------------------------
+
+- name: "app_secrets | test | role calls | Fresh install"
+  hosts: role_calls_fresh
+  gather_facts: false
+  vars: *role_vars
+  environment:
+    FAKE_K8S_STATE: "{{ fake_k8s_state }}"
+  tasks:
+    - name: "app_secrets | test | role calls | Run the {{ sequence }} sequence"
+      ansible.builtin.include_tasks: "{{ sequence }}_role_calls.yaml"
+
+    - name: "app_secrets | test | role calls | Record"
+      ansible.builtin.include_tasks: record_role_pass.yaml
+
+# --- Seed the re-run and recovery hosts from the legacy fresh result ------------------------
+
+- name: "app_secrets | test | role calls | Seed"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    _src: "{{ _test_tmp.path }}/legacy_fresh"
+  tasks:
+    - name: "app_secrets | test | role calls | Create the seeded host dirs"
+      ansible.builtin.file:
+        path: "{{ _test_tmp.path }}/{{ item }}/rag"
+        state: directory
+        mode: '0755'
+      loop: [legacy_rerun, port_rerun, legacy_recover, port_recover]
+
+    - name: "app_secrets | test | role calls | Copy the legacy fresh files"
+      ansible.builtin.copy:
+        src: "{{ _src }}/{{ item.1 }}"
+        dest: "{{ _test_tmp.path }}/{{ item.0 }}/{{ item.1 }}"
+        mode: preserve
+      loop: >-
+        {{ [['legacy_rerun', 'port_rerun'] | product(['cluster.json', 'rag/default_credentials.yaml', 'rag/default_credentials.txt']) | list,
+            ['legacy_recover', 'port_recover'] | product(['cluster.json', 'rag/default_credentials.txt']) | list] | flatten(1) }}
+
+# --- Re-run and recovery ------------------------------------------------------------------------
+
+- name: "app_secrets | test | role calls | Re-run and recovery"
+  hosts: role_calls_seeded
+  gather_facts: false
+  vars: *role_vars
+  environment:
+    FAKE_K8S_STATE: "{{ fake_k8s_state }}"
+  tasks:
+    - name: "app_secrets | test | role calls | Run the {{ sequence }} sequence"
+      ansible.builtin.include_tasks: "{{ sequence }}_role_calls.yaml"
+
+    - name: "app_secrets | test | role calls | Record"
+      ansible.builtin.include_tasks: record_role_pass.yaml
+
+# --- Compare -------------------------------------------------------------------------------------
+
+- name: "app_secrets | test | role calls | Compare"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "app_secrets | test | role calls | Comparisons"
+      block:
+        - name: "app_secrets | test | role calls | Compare fresh pair {{ pair.legacy }} / {{ pair.port }}"
+          ansible.builtin.include_tasks: compare_fresh.yaml
+          loop:
+            - {legacy: legacy_fresh, port: port_fresh, engine_secret: Secret/vdb-t/redis-cluster-secret}
+            - {legacy: legacy_fresh_pgvector, port: port_fresh_pgvector, engine_secret: Secret/vdb-t/pgvector-secret}
+            - {legacy: legacy_fresh_mssql, port: port_fresh_mssql, engine_secret: Secret/vdb-t/mssql-secret}
+          loop_control:
+            loop_var: pair
+            label: "{{ pair.legacy }} / {{ pair.port }}"
+
+        # --- re-run and recovery: byte-identical ---------------------------------------------
+        - name: "app_secrets | test | role calls | Re-run and recovery: byte-identical files, cluster state and facts"
+          ansible.builtin.assert:
+            that:
+              - _l.yaml == _p.yaml
+              - _l.txt == _p.txt
+              - _l.cluster_raw == _p.cluster_raw
+              - _l.modes == _p.modes
+              - _l.facts == _p.facts
+              - _l.yaml | length > 0
+            fail_msg: "{{ item.0 }} vs {{ item.1 }} differ"
+            quiet: true
+          loop: [[legacy_rerun, port_rerun], [legacy_recover, port_recover]]
+          loop_control:
+            label: "{{ item.0 }} vs {{ item.1 }}"
+          vars:
+            _l: "{{ hostvars[item.0].role_pass }}"
+            _p: "{{ hostvars[item.1].role_pass }}"
+          no_log: true
+
+        - name: "app_secrets | test | role calls | Re-run: no MCP lines with mcp_enabled false; recovery rebuilt the file"
+          ansible.builtin.assert:
+            that:
+              - "'MCP_CLIENT' not in hostvars['port_rerun'].role_pass.txt"
+              - "'MCP_CLIENT_SECRET=' in hostvars['port_recover'].role_pass.txt"
+              - "'CHAT_HISTORY_POSTGRES_PASSWORD' in hostvars['port_recover'].role_pass.yaml"
+              - "'KEYCLOAK_REALM_ADMIN_PASSWORD: platform-admin-pw' in hostvars['port_recover'].role_pass.yaml"
+              - hostvars['port_rerun'].role_pass.cluster == hostvars['legacy_fresh'].role_pass.cluster
+            quiet: true
+          no_log: true
+
+      always:
+        - name: "app_secrets | test | role calls | Remove per-run temp dir"
+          ansible.builtin.file:
+            path: "{{ _test_tmp.path }}"
+            state: absent

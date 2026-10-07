@@ -1,0 +1,157 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: one worker run. Deletes the previous worker Jobs, applies
+# the ConfigMap (script + plan) and Job of templates/worker-job.yaml.j2, waits
+# for the Job and parses its result lines (ERAG_SECRETS_RESULT <json>; the
+# worker never prints a value).
+# Expects: app_secrets_op, app_secrets_worker_op (probe | ensure | status |
+# delete | import), app_secrets_worker_plan (list of plan lines, see
+# files/secrets_worker.sh). The importer (import.yaml) sets
+# app_secrets_job_template: importer-job.yaml.j2 and app_secrets_job_component:
+# importer, and passes its plan as app_secrets_importer_plan.
+# Sets: app_secrets_worker_result = {probe: {...}, done: {...},
+#       credentials: {<id>: {action, result, version, error}},
+#       purge: {prefix, state, removed, error} (delete with a purge line, else none),
+#       legacy: {found} (importer, else none),
+#       stage: {id, stage, version, previous_version} (rotator, after its write),
+#       secrets: [{namespace, name, action, result, error}] (importer),
+#       finished: bool}
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Name the worker run"
+  ansible.builtin.set_fact:
+    _app_secrets_job_name: >-
+      erag-secrets-{{ app_secrets_worker_op }}-{{ (app_secrets_worker_op ~ (app_secrets_worker_plan | join('\n'))
+      ~ now(utc=true).isoformat()) | hash('sha1') | truncate(10, true, '') }}
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Find previous worker runs"
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ app_secrets_worker_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/part-of=erag-secrets"
+      - "app.kubernetes.io/component={{ app_secrets_job_component | default('worker') }}"
+  loop:
+    - {api_version: batch/v1, kind: Job}
+    - {api_version: v1, kind: ConfigMap}
+  loop_control:
+    label: "{{ item.kind }}"
+  register: _app_secrets_old_runs
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Delete previous worker runs"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: "{{ item.apiVersion | default('v1') }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ app_secrets_worker_namespace }}"
+    delete_options:
+      propagationPolicy: Background
+  loop: "{{ _app_secrets_old_runs.results | map(attribute='resources') | map('default', []) | flatten }}"
+  loop_control:
+    label: "{{ item.kind }} {{ item.metadata.name }}"
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Run the worker Job"
+  block:
+    - name: "app_secrets | {{ app_secrets_op }} | openbao | Create a private render directory"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_worker_
+      register: _app_secrets_worker_dir
+      no_log: true
+
+    # Rendered to a file and applied with src: the worker script is applied
+    # verbatim, never re-read as a template (the file holds no value).
+    - name: "app_secrets | {{ app_secrets_op }} | openbao | Render the worker Job"
+      ansible.builtin.template:
+        src: "{{ app_secrets_job_template | default('worker-job.yaml.j2') }}"
+        dest: "{{ _app_secrets_worker_dir.path }}/worker-job.yaml"
+        mode: "0600"
+      no_log: true
+
+    - name: "app_secrets | {{ app_secrets_op }} | openbao | Apply the worker Job"
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ _app_secrets_worker_dir.path }}/worker-job.yaml"
+        wait: false
+      no_log: true
+
+  always:
+    - name: "app_secrets | {{ app_secrets_op }} | openbao | Remove the render directory"
+      ansible.builtin.file:
+        path: "{{ _app_secrets_worker_dir.path }}"
+        state: absent
+      when: _app_secrets_worker_dir.path is defined
+      no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Wait for the worker Job"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: "{{ _app_secrets_job_name }}"
+    namespace: "{{ app_secrets_worker_namespace }}"
+  register: _app_secrets_job
+  until: >-
+    (_app_secrets_job.resources | default([]) | length > 0) and
+    ((_app_secrets_job.resources[0].status.succeeded | default(0) | int) >= 1 or
+     (_app_secrets_job.resources[0].status.failed | default(0) | int) >= 1)
+  retries: "{{ ((app_secrets_worker_timeout | int) / (app_secrets_worker_poll_delay | int)) | round(0, 'ceil') | int + 2 }}"
+  delay: "{{ app_secrets_worker_poll_delay | int }}"
+  failed_when: false
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Read the worker log"
+  kubernetes.core.k8s_log:
+    api_version: batch/v1
+    kind: Job
+    name: "{{ _app_secrets_job_name }}"
+    namespace: "{{ app_secrets_worker_namespace }}"
+  register: _app_secrets_job_log
+  failed_when: false
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Parse the worker results"
+  ansible.builtin.set_fact:
+    app_secrets_worker_result: "{{ _parsed }}"
+  vars:
+    _completed: >-
+      {{ (_app_secrets_job.resources | default([]) | length > 0) and
+         ((_app_secrets_job.resources[0].status.succeeded | default(0) | int) >= 1 or
+          (_app_secrets_job.resources[0].status.failed | default(0) | int) >= 1) }}
+    _prefix: "ERAG_SECRETS_RESULT "
+    _lines: >-
+      {{ _app_secrets_job_log.log_lines | default([]) | select('string')
+         | select('match', '^' ~ _prefix) | map('regex_replace', '^' ~ _prefix, '') | list }}
+    _parsed: >-
+      {%- set out = {'probe': none, 'done': none, 'purge': none, 'legacy': none, 'stage': none, 'credentials': {}, 'secrets': []} -%}
+      {%- for l in _lines -%}
+        {%- set r = l | from_json -%}
+        {%- if r.kind == 'credential' -%}
+          {%- set _ = out.credentials.update({r.id: r}) -%}
+        {%- elif r.kind == 'secret' -%}
+          {%- set _ = out.secrets.append(r) -%}
+        {%- elif r.kind in ['probe', 'done', 'purge', 'legacy', 'stage'] -%}
+          {%- set _ = out.update({r.kind: r}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {#- Finished = the Job reached a terminal state and the worker printed its last line. -#}
+      {%- set _ = out.update({'job_completed': _completed | bool, 'finished': (_completed | bool) and out.done is not none}) -%}
+      {{ out }}
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Fail when the worker did not finish"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | the worker Job
+      {{ app_secrets_worker_namespace }}/{{ _app_secrets_job_name }} did not report a result
+      ({{ 'not finished after ' ~ app_secrets_worker_timeout ~ 's'
+          if not app_secrets_worker_result.job_completed
+          else 'no result line in its log' }}).
+      Check: kubectl -n {{ app_secrets_worker_namespace }} describe job {{ _app_secrets_job_name }};
+      kubectl -n {{ app_secrets_worker_namespace }} logs job/{{ _app_secrets_job_name }}
+      (the worker never logs a value).
+  when: not app_secrets_worker_result.finished

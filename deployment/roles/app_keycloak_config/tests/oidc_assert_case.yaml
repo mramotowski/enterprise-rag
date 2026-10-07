@@ -1,0 +1,28 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_configurator.yaml: runs tasks/assert_oidc_config.yaml with
+# OIDC and SharePoint configured but no client secret in config, with local
+# (oidc_mode local) or projected Secrets, and records the outcome in
+# _oidc_assert[oidc_mode] ('passed' or the failure message).
+
+---
+- name: "app_keycloak_config | test | assert_oidc_config.yaml ({{ oidc_mode }})"
+  vars:
+    erag_keycloak_oidc_endpoint: https://idp.test/.well-known/openid-configuration
+    erag_keycloak_oidc_alias: enterprise-sso
+    erag_keycloak_oidc_client_id: oidc-client
+    erag_keycloak_oidc_client_secret: ""
+    erag_keycloak_oidc_tenant_id: tenant-1
+    app_secrets_projected: "{{ oidc_mode == 'projected' }}"
+  block:
+    - name: "app_keycloak_config | test | Run assert_oidc_config.yaml ({{ oidc_mode }})"
+      ansible.builtin.include_tasks: "{{ role_dir }}/tasks/assert_oidc_config.yaml"
+
+    - name: "app_keycloak_config | test | Record the result ({{ oidc_mode }})"
+      ansible.builtin.set_fact:
+        _oidc_assert: "{{ _oidc_assert | default({}) | combine({oidc_mode: 'passed'}) }}"
+  rescue:
+    - name: "app_keycloak_config | test | Record the failure ({{ oidc_mode }})"
+      ansible.builtin.set_fact:
+        _oidc_assert: "{{ _oidc_assert | default({}) | combine({oidc_mode: ansible_failed_result.msg | default('failed')}) }}"

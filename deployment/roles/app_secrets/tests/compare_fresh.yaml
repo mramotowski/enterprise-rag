@@ -1,0 +1,126 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_role_calls.yaml: compare one fresh legacy/port pair
+# (pair = {legacy, port, engine_secret}). Random values differ between the
+# hosts, so names, order, formats, markup and Secret keys are compared, plus
+# file/Secret/fact consistency within each host.
+
+---
+- name: "app_secrets | test | role calls | Select the fresh pair"
+  ansible.builtin.set_fact:
+    lf: "{{ hostvars[pair.legacy].role_pass }}"
+    pf: "{{ hostvars[pair.port].role_pass }}"
+  no_log: true
+
+- name: "app_secrets | test | role calls | Parse the fresh files"
+  ansible.builtin.set_fact:
+    _lf_yaml: "{{ lf.yaml.splitlines() | reject('match', '^#') | select | map('regex_findall', '^([^:]+): (.*)$') | map('first') | map('list') | list }}"
+    _pf_yaml: "{{ pf.yaml.splitlines() | reject('match', '^#') | select | map('regex_findall', '^([^:]+): (.*)$') | map('first') | map('list') | list }}"
+  no_log: true
+
+- name: "app_secrets | test | role calls | Fresh: same file lines in the same order, same usernames, same modes"
+  ansible.builtin.assert:
+    that:
+      - _lf_yaml | map('first') | list == _pf_yaml | map('first') | list
+      - _lf_yaml | length > 14
+      - (_lf_yaml | selectattr('0', 'search', '_USERNAME$|_USER$') | list) == (_pf_yaml | selectattr('0', 'search', '_USERNAME$|_USER$') | list)
+      - lf.yaml.splitlines() | select('match', '^#') | list == pf.yaml.splitlines() | select('match', '^#') | list
+      - lf.modes == pf.modes
+      - lf.modes == ['0600', '0600']
+      - (lf.txt | regex_findall('(?m)^([A-Z_]+)=')) == (pf.txt | regex_findall('(?m)^([A-Z_]+)='))
+      - (lf.txt | regex_findall('(?m)^([A-Z_]+)=')) | length == 8
+    fail_msg: "legacy: {{ _lf_yaml | map('first') | list }} / port: {{ _pf_yaml | map('first') | list }}"
+    quiet: true
+
+- name: "app_secrets | test | role calls | Fresh: values have the legacy formats"
+  ansible.builtin.assert:
+    that: >-
+      (item.1 is match('^[A-Za-z0-9]{16}$')) if item.0 in ['EDP_MINIO_ACCESS_KEY', 'EDP_MINIO_SECRET_KEY', 'EDP_SEAWEEDFS_ACCESS_KEY', 'EDP_SEAWEEDFS_SECRET_KEY', 'SEAWEEDFS_ADMIN_PASSWORD']
+      else ((item.1 is match('^[A-Za-z0-9_()]{12}$')) if item.0 is search('_PASSWORD$') and item.0 != 'KEYCLOAK_REALM_ADMIN_PASSWORD'
+      else true)
+    quiet: true
+  loop: "{{ _lf_yaml + _pf_yaml }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  no_log: true
+
+- name: "app_secrets | test | role calls | Fresh: same Secrets, same metadata (labels, annotations), same data keys"
+  ansible.builtin.assert:
+    that:
+      - lf.cluster.keys() | sort == pf.cluster.keys() | sort
+      - lf.cluster | length == 14
+      - _bad | length == 0
+    fail_msg: "differences: {{ _bad }}"
+    quiet: true
+  vars:
+    _bad: >-
+      {%- set bad = [] -%}
+      {%- for k in lf.cluster -%}
+        {%- if k in pf.cluster -%}
+          {%- if lf.cluster[k].metadata != pf.cluster[k].metadata -%}
+            {%- set _ = bad.append(k ~ ' metadata: ' ~ (lf.cluster[k].metadata | to_json) ~ ' vs ' ~ (pf.cluster[k].metadata | to_json)) -%}
+          {%- endif -%}
+          {%- if (lf.cluster[k].data | default({})).keys() | sort != (pf.cluster[k].data | default({})).keys() | sort -%}
+            {%- set _ = bad.append(k ~ ' data keys') -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ bad }}
+
+- name: "app_secrets | test | role calls | Fresh: marked Secrets cover the expected set"
+  ansible.builtin.assert:
+    that: >-
+      pf.cluster | dict2items | selectattr('value.metadata.labels', 'defined')
+      | map(attribute='key') | sort | list ==
+      (['Secret/ch-t/ch-db-secret', 'Secret/edp-t/edp-access-secret', 'Secret/edp-t/edp-postgresql-secret',
+        'Secret/edp-t/edp-redis-secret', 'Secret/fp-t/fp-db-secret', 'Secret/kc-t/kc-admin-secret',
+        'Secret/sw-t/seaweedfs-admin-secret', 'Secret/sw-t/seaweedfs-s3-secret', pair.engine_secret] | sort)
+    quiet: true
+
+- name: "app_secrets | test | role calls | Fresh: per host, file values equal the marked Secret values and the facts"
+  ansible.builtin.assert:
+    that: _bad | length == 0
+    fail_msg: "{{ _bad }}"
+    quiet: true
+  loop: "{{ [pair.legacy, pair.port] }}"
+  vars:
+    _p: "{{ hostvars[item].role_pass }}"
+    _file: "{{ _p.yaml.splitlines() | reject('match', '^#') | select | map('regex_findall', '^([^:]+): (.*)$') | map('first') | items2dict(key_name=0, value_name=1) }}"
+    _bad: >-
+      {%- set bad = [] -%}
+      {%- for k, o in _p.cluster.items() if (o.metadata.annotations | default({}))['meta.erag/password-mappings'] is defined -%}
+        {%- for m in o.metadata.annotations['meta.erag/password-mappings'] | from_yaml -%}
+          {%- set var, key = m.split('=') -%}
+          {%- if not var.endswith('_USERNAME') and var in _file and _file[var] != (o.data[key] | b64decode) -%}
+            {%- set _ = bad.append(item ~ ' ' ~ k ~ ' ' ~ var) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {%- for n, v in _p.facts.items() if n in _file and v != '<undefined>' and v != _file[n] -%}
+        {%- set _ = bad.append(item ~ ' fact ' ~ n) -%}
+      {%- endfor -%}
+      {{ bad }}
+  no_log: true
+
+- name: "app_secrets | test | role calls | Fresh: the same credential facts are defined"
+  ansible.builtin.assert:
+    that: >-
+      lf.facts | dict2items | rejectattr('value', 'equalto', '<undefined>') | map(attribute='key') | list ==
+      pf.facts | dict2items | rejectattr('value', 'equalto', '<undefined>') | map(attribute='key') | list
+    quiet: true
+
+- name: "app_secrets | test | role calls | Fresh: the NATS pair is complete and mirrored"
+  ansible.builtin.assert:
+    that:
+      - (_c['Secret/nats-t/nats-auth'].data['user.nk'] | b64decode) is match('^SU[A-Z2-7]{56}$')
+      - (_c['Secret/nats-t/nats-auth'].data['user.pub'] | b64decode) is match('^U[A-Z2-7]{55}$')
+      - "_c['Secret/gmc-t/nats-auth'].data == {'user.nk': _c['Secret/nats-t/nats-auth'].data['user.nk']}"
+      - "_c['Secret/pipe-t/nats-auth'].data == {'user.nk': _c['Secret/nats-t/nats-auth'].data['user.nk']}"
+      - (_c['Secret/mon-t/grafana-sso-env'].data['GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET'] | b64decode) is match('^[A-Za-z0-9]{32}$')
+      - (_c['Secret/sw-t/seaweedfs-admin-secret'].data['adminPassword'] | b64decode) is match('^[A-Za-z0-9]{16}$')
+    quiet: true
+  loop: "{{ [pair.legacy, pair.port] }}"
+  vars:
+    _c: "{{ hostvars[item].role_pass.cluster }}"
+  no_log: true

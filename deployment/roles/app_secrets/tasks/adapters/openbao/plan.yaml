@@ -1,0 +1,79 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: plan lines for the worker from the registry (no values).
+#   write <id> <cid>/<path> <kv_key>=<spec> ...   (app_secrets_plan_write_ids)
+#   check <id> <cid>/<path> [<kv_key>=<spec> ...] (app_secrets_plan_check_ids;
+#         the keys only with app_secrets_plan_check_keys: the worker then also
+#         checks that an existing entry has every registry key)
+# Specs (generator types): password:<length>:<special 0|1>, hex:<bytes>,
+# nkey_user:<seed_key>:<public_key_key>, static. Keys with generated_by are
+# filled by another key's generator and get no spec.
+# Expects: app_secrets_op, app_secrets_plan_write_ids, app_secrets_plan_check_ids,
+# app_secrets_plan_check_keys (optional, default false).
+# Sets: app_secrets_worker_plan.
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Fail on unknown generator types"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | unsupported generator in the registry:
+      {{ _bad | join('; ') }}. Valid types: password (length, special), hex (bytes),
+      nkey_user (writes [seed, public_key]), static.
+  vars:
+    _bad: >-
+      {%- set bad = [] -%}
+      {%- for cid in app_secrets_plan_write_ids -%}
+        {%- for k, spec in app_secrets_catalog[cid]['keys'].items() if spec.generated_by is not defined -%}
+          {%- set g = spec.generate | default({}) -%}
+          {%- set t = g.type | default('') -%}
+          {%- if t not in ['password', 'hex', 'nkey_user', 'static']
+                 or (t == 'password' and not ((g.length | default('') | string) is match('^[0-9]+$')))
+                 or (t == 'hex' and not ((g.bytes | default('') | string) is match('^[0-9]+$')))
+                 or (t == 'nkey_user' and (g.writes | default([]) | length) != 2) -%}
+            {%- set _ = bad.append(cid ~ '.' ~ k ~ ' (' ~ (t or 'no generate.type') ~ ')') -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ bad }}
+  when: _bad | length > 0
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Build the worker plan"
+  ansible.builtin.set_fact:
+    app_secrets_worker_plan: "{{ _write + _check }}"
+  vars:
+    _cid: "{{ app_secrets_openbao_cluster_id }}"
+    # {<id>: "<kv_key>=<spec> ..."} for every planned credential.
+    _specs: >-
+      {%- set out = {} -%}
+      {%- for cid in (app_secrets_plan_write_ids + app_secrets_plan_check_ids) | unique -%}
+        {%- set specs = [] -%}
+        {%- for k, spec in app_secrets_catalog[cid]['keys'].items() if spec.generated_by is not defined -%}
+          {%- set g = spec.generate | default({}) -%}
+          {%- if g.type | default('') == 'password' -%}
+            {%- set _ = specs.append(k ~ '=password:' ~ (g.length | int) ~ ':' ~ (1 if g.special | default(false) | bool else 0)) -%}
+          {%- elif g.type | default('') == 'hex' -%}
+            {%- set _ = specs.append(k ~ '=hex:' ~ (g.bytes | int)) -%}
+          {%- elif g.type | default('') == 'nkey_user' -%}
+            {%- set _ = specs.append(k ~ '=nkey_user:' ~ g.writes[0] ~ ':' ~ g.writes[1]) -%}
+          {%- else -%}
+            {%- set _ = specs.append(k ~ '=static') -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set _ = out.update({cid: specs | join(' ')}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _write: >-
+      {%- set out = [] -%}
+      {%- for cid in app_secrets_plan_write_ids -%}
+        {%- set _ = out.append(['write', cid, _cid ~ '/' ~ app_secrets_catalog[cid].path] | join(' ') ~ ' ' ~ _specs[cid]) -%}
+      {%- endfor -%}
+      {{ out }}
+    _check: >-
+      {%- set out = [] -%}
+      {%- for cid in app_secrets_plan_check_ids -%}
+        {%- set _ = out.append((['check', cid, _cid ~ '/' ~ app_secrets_catalog[cid].path]
+                                + ([_specs[cid]] if app_secrets_plan_check_keys | default(false) | bool else [])) | join(' ')) -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true

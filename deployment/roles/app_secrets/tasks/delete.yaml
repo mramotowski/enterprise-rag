@@ -1,0 +1,27 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Port operation 'delete'. Usage:
+#   - ansible.builtin.include_role:
+#       name: app_secrets
+#       tasks_from: delete.yaml
+#     vars:
+#       secret_ids: [<component>/<credential>, ...]   # required, explicit
+#
+# Removes the credentials from the store with every version and their
+# metadata, and the ExternalSecrets (with the Secrets they own) that read them.
+# Run only once nothing consumes them any more (app_pre_install teardown).
+# secret_ids naming every registry credential is a layer teardown: the openbao
+# adapter then also deletes whatever else is stored under <cluster_id>/<layer>/,
+# and removes the namespace label and paths annotation and the worker
+# namespace (adapters/openbao/delete.yaml). The local adapter does nothing
+# (the teardown removes the local files).
+
+---
+- name: "app_secrets | delete | Validate request"
+  ansible.builtin.include_tasks: common/validate.yaml
+  vars:
+    app_secrets_op: delete
+
+- name: "app_secrets | delete | Run {{ secrets_backend }} adapter"
+  ansible.builtin.include_tasks: "adapters/{{ secrets_backend }}/delete.yaml"

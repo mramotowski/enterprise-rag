@@ -3,9 +3,21 @@
   ansible.builtin.set_fact:
     configuration_issues: []
 
+# Before the HF_TOKEN fallback below, so that an exported HF_TOKEN is reported
+# as the environment variable, not as hugging_token. With projected Secrets
+# (OpenBao) every operator secret also set in the configuration or its
+# environment variable becomes a configuration issue (the store is the only
+# source); it also tells the following tasks how Secrets are delivered
+# (app_secrets_projected).
+- name: "app_pre_install | Check where the operator-supplied secrets come from"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+
 - name: "app_pre_install | Load hugging_token from HF_TOKEN environment variable if not set in config"
   ansible.builtin.set_fact:
     hugging_token: "{{ lookup('env', 'HF_TOKEN') }}"
+  no_log: "{{ secure_logs }}"
 
 # Subdomain routing: each service lives at <prefix>.<base_domain_name>.
 - name: "app_pre_install | Set flat domain-name facts (subdomain routing)"
@@ -66,4 +78,6 @@
       environment variable or provide hugging_token in your configuration file.
 
       If you're only using publicly available models, you can ignore this warning.
-  when: hugging_token is not defined or hugging_token | length == 0
+  when:
+    - not (app_secrets_projected | default(false))
+    - hugging_token is not defined or hugging_token | length == 0

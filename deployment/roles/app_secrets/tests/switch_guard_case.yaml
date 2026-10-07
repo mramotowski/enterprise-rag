@@ -1,0 +1,57 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One case of test_switch_guard.yaml (item: name, state, confirmed, expect_fail).
+# A case passes when the guard refused exactly when expected. Steps after the
+# guard may fail in this cluster-less test (test_local_adapter covers them).
+
+---
+- name: "app_secrets | test | switch-back guard | {{ item.name }} | Write the cluster state"
+  ansible.builtin.copy:
+    dest: "{{ _tmp.path }}/{{ item.name }}.json"
+    content: "{{ item.state | to_json }}"
+    mode: "0600"
+
+- name: "app_secrets | test | switch-back guard | {{ item.name }} | Probe"
+  block:
+    - name: "app_secrets | test | switch-back guard | {{ item.name }} | Run the local probe"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: probe.yaml
+        apply:
+          environment:
+            # Empty: the fake k8s_info fails, as on an unreadable cluster.
+            FAKE_K8S_STATE: "{{ '' if item.unreadable | default(false) else _tmp.path ~ '/' ~ item.name ~ '.json' }}"
+      vars:
+        log_dir: "{{ _tmp.path }}/{{ item.name }}"
+        erag_secrets_switch_to_local_confirmed: "{{ item.confirmed }}"
+
+    - name: "app_secrets | test | switch-back guard | {{ item.name }} | Record a pass"
+      ansible.builtin.set_fact:
+        _switch_results: "{{ _switch_results | default([]) + [{'name': item.name, 'failed': false, 'ok': not item.expect_fail}] }}"
+  rescue:
+    - name: "app_secrets | test | switch-back guard | {{ item.name }} | Record a failure"
+      ansible.builtin.set_fact:
+        _switch_results: >-
+          {{ _switch_results | default([]) + [{'name': item.name, 'failed': true,
+             'msg': ansible_failed_result.msg | default('') | truncate(160),
+             'guard': _guard,
+             'ok': (_guard and item.expect_fail) or (not _guard and not item.expect_fail)}] }}
+      vars:
+        # The guard's message is not under no_log; later probe steps (a
+        # cluster-less test cannot satisfy) are, and do not count here.
+        _guard: >-
+          {{ (ansible_failed_result.msg | default('')) is search('secrets_backend is local')
+             and (ansible_failed_result.msg | default('')) is search('erag_secrets_switch_to_local_confirmed') }}
+
+- name: "app_secrets | test | switch-back guard | {{ item.name }} | Nothing was generated when refused"
+  ansible.builtin.stat:
+    path: "{{ _tmp.path }}/{{ item.name }}/rag/default_credentials.yaml"
+  register: _gen
+  when: item.expect_fail
+
+- name: "app_secrets | test | switch-back guard | {{ item.name }} | Mark a refused case that generated files"
+  ansible.builtin.set_fact:
+    _switch_results: >-
+      {{ _switch_results[:-1] + [_switch_results[-1] | combine({'ok': false, 'generated': true})] }}
+  when: item.expect_fail and _gen.stat.exists | default(false)

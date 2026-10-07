@@ -1,0 +1,29 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_local_adapter.yaml: record record_file (content, checksum,
+# mode) and the credential facts as test_pass[pass_no].
+
+---
+- name: "app_secrets | test | Stat {{ record_file | basename }}"
+  ansible.builtin.stat:
+    path: "{{ record_file }}"
+  register: _rec_stat
+
+- name: "app_secrets | test | Read {{ record_file | basename }}"
+  ansible.builtin.slurp:
+    src: "{{ record_file }}"
+  register: _rec_read
+  no_log: true
+
+- name: "app_secrets | test | Record pass {{ pass_no }}"
+  ansible.builtin.set_fact:
+    test_pass: >-
+      {{ test_pass | default({}) | combine({pass_no: {
+           'content': _rec_read.content | b64decode,
+           'checksum': _rec_stat.stat.checksum,
+           'mode': _rec_stat.stat.mode,
+           'facts': dict(_names | zip(query('ansible.builtin.vars', *_names)))}}) }}
+  vars:
+    _names: "{{ password_vars + key_vars }}"
+  no_log: true

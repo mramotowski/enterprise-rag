@@ -1,0 +1,34 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter helper: map the selected file_password / file_key credentials
+# to the loop items app_generate_password takes, in request order and, within
+# a credential, in registry `legacy` order (= today's order of writes).
+# For ensure, a legacy item with skip_if_defined goes to
+# app_secrets_local_skipped_items instead when that fact is already defined
+# (legacy app_vector_databases: `when: REDIS_PASSWORD is not defined`); ensure
+# prints a debug line for it. status keeps every item, as it only checks the file.
+#   file_password: {name: <file_var without _PASSWORD>, user}
+#   file_key:      {name: <file_var>}
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | Map file credentials to legacy items"
+  ansible.builtin.set_fact:
+    app_secrets_local_file_items: "{{ _all | rejectattr('skipped') | list }}"
+    app_secrets_local_skipped_items: "{{ _all | selectattr('skipped') | list }}"
+    app_secrets_local_password_file_path: "{{ app_secrets_local_password_file | trim }}"
+  vars:
+    _all: >-
+      {%- set out = [] -%}
+      {%- for cid in app_secrets_selected_ids -%}
+        {%- set e = app_secrets_catalog[cid] -%}
+        {%- if e.local.mechanism in ['file_password', 'file_key'] -%}
+          {%- for l in e.legacy if l.file_var -%}
+            {%- set skipped = app_secrets_op == 'ensure' and l.skip_if_defined is defined
+                  and (lookup('ansible.builtin.varnames', '^' ~ l.skip_if_defined ~ '$', wantlist=True) | length) > 0 -%}
+            {%- set name = (l.file_var | regex_replace('_PASSWORD$', '')) if e.local.mechanism == 'file_password' else l.file_var -%}
+            {%- set _ = out.append({'id': cid, 'mechanism': e.local.mechanism, 'name': name, 'user': l.user, 'file_var': l.file_var, 'skipped': skipped, 'skip_if_defined': l.skip_if_defined | default(none)}) -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}

@@ -1,0 +1,95 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter: probe opens the local store, as app_pre_install did:
+#   1. app_password_mgmt lookup.yaml: re-render default_credentials.yaml from
+#      the existing file merged with the values of the marked Secrets;
+#   2. app_generate_password main: create the file (0600) if it is missing,
+#      then load every line of it as a fact.
+# The local store has no remote backend; probe fails fast only on a switch back
+# from openbao (below), before step 1 generates anything.
+
+---
+# Switch-back guard (story 16): an env whose erag credentials are projected from
+# OpenBao still has their ExternalSecrets, or namespaces with the layer label.
+# Switching it to local would generate new values for every service while the
+# databases and Keycloak keep the OpenBao ones. No ESO CRD returns no resources
+# (no projection). Fail closed on any read error but "no kubeconfig at all"
+# (only a cluster-less test run): a wrong context, timeout or forbidden list
+# must not pass as "no projection".
+- name: "app_secrets | probe | Look for erag credentials projected from OpenBao"
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    label_selectors: ["{{ app_secrets_namespace_label }}=true"]
+  loop:
+    - {api_version: external-secrets.io/v1, kind: ExternalSecret}
+    - {api_version: v1, kind: Namespace}
+  loop_control:
+    label: "{{ item.kind }}"
+  register: _app_secrets_switch_probe
+  failed_when: false
+  no_log: true
+
+- name: "app_secrets | probe | Refuse when the cluster cannot be checked for OpenBao projections"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | probe | secrets_backend is local, but the cluster could not be checked for erag
+      credentials projected from OpenBao ({{ _errors | join('; ') | truncate(300) }}). Switching an env
+      back from openbao would generate new values for every service. Fix cluster access and re-run, or
+      proceed anyway with -e erag_secrets_switch_to_local_confirmed=true.
+  vars:
+    _errors: >-
+      {{ _app_secrets_switch_probe.results | default([]) | rejectattr('resources', 'defined')
+         | map(attribute='msg', default='no result') | reject('search', 'Invalid kube-config|No configuration found|current-context')
+         | list }}
+  when:
+    - _errors | length > 0
+    - not (erag_secrets_switch_to_local_confirmed | default(false) | bool)
+
+- name: "app_secrets | probe | Refuse to switch back from openbao to local"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | probe | secrets_backend is local, but this cluster still has erag
+      credentials projected from OpenBao ({{ _es | length }} ExternalSecret(s), namespaces
+      labelled {{ app_secrets_namespace_label }}: {{ _ns | join(', ') or 'none' }}). Switching
+      back would generate new values for every service while the databases and Keycloak keep
+      the OpenBao ones. Either set secrets_backend: openbao again, or tear erag down first
+      (./es_auto_installer.sh teardown erag with secrets_backend: openbao; if that OpenBao is gone
+      for good, add -- -e erag_teardown_store_lost=true). To proceed anyway
+      (you will re-enter every credential): -e erag_secrets_switch_to_local_confirmed=true.
+  vars:
+    _found: >-
+      {{ _app_secrets_switch_probe.results | default([])
+         | selectattr('resources', 'defined') | list }}
+    _es: >-
+      {{ _found | selectattr('item.kind', 'equalto', 'ExternalSecret')
+         | map(attribute='resources') | flatten }}
+    _ns: >-
+      {{ _found | selectattr('item.kind', 'equalto', 'Namespace')
+         | map(attribute='resources') | flatten | map(attribute='metadata.name') | list }}
+  when:
+    - (_es | length > 0) or (_ns | length > 0)
+    - not (erag_secrets_switch_to_local_confirmed | default(false) | bool)
+
+- name: "app_secrets | probe | Resolve the local credential file paths"
+  ansible.builtin.set_fact:
+    app_secrets_local_password_file_path: "{{ app_secrets_local_password_file | trim }}"
+    app_secrets_local_txt_file_path: "{{ app_secrets_local_txt_file | trim }}"
+
+- name: "app_secrets | probe | Refresh the password file from the marked Secrets"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: lookup.yaml
+    apply:
+      no_log: true
+  vars:
+    password_file: "{{ app_secrets_local_password_file_path }}"
+
+- name: "app_secrets | probe | Create and load the password file"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    apply:
+      no_log: true
+  vars:
+    password_file: "{{ app_secrets_local_password_file_path }}"

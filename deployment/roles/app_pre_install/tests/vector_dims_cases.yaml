@@ -1,0 +1,72 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Inner playbook of test_vector_dims_job.yaml (run by it, never alone): one
+# inventory host per case, each with its own fake cluster state (seeded by the
+# outer playbook, which alone knows the test token). Runs the real
+# tasks/resolve_vector_dims_job.yaml against the fake kubernetes.core, whose
+# Job hook (files/fake_vector_dims_job.py) runs the Job's container on this
+# host. Writes <out_dir>/<host>.result: {ok, msg, dims, source, run, jobs}.
+# Never prints a value.
+
+---
+- name: "app_pre_install | test | vector_dims Job cases"
+  hosts: all
+  gather_facts: false
+  vars:
+    state_file: "{{ out_dir }}/{{ inventory_hostname }}.json"
+    cases:
+      token-api: {model: org/gated-embed, dims: {org/gated-embed: 1536}, projected: true}
+      no-token: {model: org/public-embed, dims: {org/public-embed: 384}, projected: false}
+      known: {model: BAAI/bge-m3, dims: {}, projected: true}
+      fallback: {model: org/unknown, dims: {}, projected: false, offline: true}
+      proxy: {model: BAAI/bge-m3, dims: {}, projected: false, proxy: "http://proxy.test:3128"}
+      fail: {model: BAAI/bge-m3, dims: {}, projected: false, fail: true}
+      deadline: {model: BAAI/bge-m3, dims: {}, projected: false, deadline: true}
+      # Token in the store but its projection missing: the required ref keeps
+      # the pod from starting (no anonymous fallback); the run times out.
+      missing-projection: {model: org/gated-embed, dims: {org/gated-embed: 1536}, projected: true}
+    case: "{{ cases[inventory_hostname] }}"
+  tasks:
+    - name: "app_pre_install | test | vector_dims | Run the Job tasks"
+      block:
+        - name: "app_pre_install | test | vector_dims | Resolve vector_dims in the cluster"
+          ansible.builtin.include_role:
+            name: app_pre_install
+            tasks_from: resolve_vector_dims_job.yaml
+            apply:
+              environment:
+                FAKE_K8S_STATE: "{{ state_file }}"
+                FAKE_K8S_ON_APPLY: "{{ ansible_playbook_python }} {{ playbook_dir }}/files/fake_vector_dims_job.py"
+                FAKE_HF_DIMS: "{{ case.dims | to_json }}"
+                FAKE_JOB_FAIL: "{{ '1' if case.fail | default(false) else '' }}"
+                FAKE_JOB_DEADLINE: "{{ '1' if case.deadline | default(false) else '' }}"
+          vars:
+            embedding_model_id: "{{ case.model }}"
+            offline_model: "{{ case.offline | default(false) }}"
+            http_proxy: "{{ case.proxy | default('') }}"
+            hugging_token_projected: "{{ case.projected }}"
+            vector_dims_job_poll_delay: 1
+            vector_dims_job_timeout: 3
+
+        - name: "app_pre_install | test | vector_dims | Succeeded"
+          ansible.builtin.set_fact:
+            _case: {ok: true, msg: ""}
+      rescue:
+        - name: "app_pre_install | test | vector_dims | Failed"
+          ansible.builtin.set_fact:
+            _case: {ok: false, msg: "{{ ansible_failed_result.msg | default('') }}"}
+
+    - name: "app_pre_install | test | vector_dims | Record the result"
+      ansible.builtin.copy:
+        dest: "{{ out_dir }}/{{ inventory_hostname }}.result"
+        mode: "0600"
+        content: >-
+          {{ _case | combine({
+               'dims': vector_databases_vector_dims | default(none),
+               'source': vector_databases_vector_dims_source | default(none),
+               'run': (_st | dict2items | selectattr('key', 'match', '^FakeVectorDimsRun/') | map(attribute='value') | list),
+               'jobs': (_st.keys() | select('match', '^(Job|ConfigMap)/erag-secrets/') | sort | list)}) | to_json }}
+      vars:
+        _st: "{{ lookup('ansible.builtin.file', state_file) | from_json }}"
+      no_log: true

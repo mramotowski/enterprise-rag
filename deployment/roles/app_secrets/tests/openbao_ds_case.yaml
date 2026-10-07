@@ -1,0 +1,35 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for openbao_cases.yaml: one data service scenario. Loads the config
+# the registry expressions read (registry-vars.yaml), ensures the scenario's
+# credential IDs with the role registry, then compares every expected Secret
+# with the ESO-made one (harness secret-matches: key names only).
+# Expects: scenario (host name in fixtures/data_services_inventory.yaml),
+# ds_out (output dir of test_data_services.yaml), the play vars of openbao_cases.yaml.
+
+---
+- name: "app_secrets | test | openbao | ds {{ scenario }} config"
+  ansible.builtin.include_vars:
+    file: "{{ ds_out }}/{{ scenario }}/registry-vars.yaml"
+
+- name: "app_secrets | test | openbao | ds {{ scenario }} ensure"
+  ansible.builtin.include_tasks: openbao_case.yaml
+  vars:
+    case:
+      name: "ds-{{ scenario }}"
+      op: ensure
+      ids: "{{ (lookup('ansible.builtin.file', ds_out ~ '/' ~ scenario ~ '/expected.json') | from_json).secret_ids }}"
+
+- name: "app_secrets | test | openbao | ds {{ scenario }} compare"
+  ansible.builtin.command:
+    argv: "{{ harness.split(' ') + ['secret-matches', obdir, state_file, ds_out ~ '/' ~ scenario ~ '/expected.json'] }}"
+  register: _ds_match
+  changed_when: false
+
+- name: "app_secrets | test | openbao | ds {{ scenario }} record"
+  ansible.builtin.set_fact:
+    ds_results: "{{ ds_results | default({}) | combine({scenario: _ds_match.stdout_lines}) }}"
+    ds_expected: >-
+      {{ ds_expected | default({}) | combine({scenario: (lookup('ansible.builtin.file', ds_out ~ '/' ~ scenario ~ '/expected.json')
+                                                          | from_json).secrets | length}) }}

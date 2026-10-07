@@ -1,0 +1,106 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: force-sync the ExternalSecrets that read one credential
+# (rotate_one.yaml). Expects: _app_secrets_rotate_id. The ExternalSecrets are
+# those app_secrets rendered (labels) whose erag-secrets/credential-ids
+# annotation lists the id. Each gets external-secrets.io/force-sync=<time>;
+# ESO then refreshes it at once. The wait ends when its status.refreshTime is
+# at or after the cluster time of that patch (managedFields; the host clock
+# when the API reports none) and it is Ready=True, so a restart after it sees
+# the new Secret. Sets: _app_secrets_synced = [<ns>/<name>].
+
+---
+- name: "app_secrets | rotate | openbao | Find the ExternalSecrets of {{ _app_secrets_rotate_id }}"
+  kubernetes.core.k8s_info:
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+    label_selectors:
+      - "app.kubernetes.io/part-of=erag-secrets"
+      - "app.kubernetes.io/managed-by=app_secrets"
+  register: _app_secrets_rotate_es_found
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Select the ExternalSecrets of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_rotate_es: >-
+      {%- set out = [] -%}
+      {%- for es in _app_secrets_rotate_es_found.resources | default([]) -%}
+        {%- set ids = ((es.metadata.annotations | default({}, true))['erag-secrets/credential-ids'] | default('')).split(',') -%}
+        {%- if _app_secrets_rotate_id in ids -%}
+          {%- set _ = out.append({'name': es.metadata.name, 'namespace': es.metadata.namespace}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    _app_secrets_rotate_stamp: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Force-sync the ExternalSecrets of {{ _app_secrets_rotate_id }}"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    definition:
+      metadata:
+        annotations:
+          external-secrets.io/force-sync: "{{ _app_secrets_rotate_stamp }}"
+  loop: "{{ _app_secrets_rotate_es }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  register: _app_secrets_rotate_patched
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Wait for the ExternalSecrets of {{ _app_secrets_rotate_id }}"
+  kubernetes.core.k8s_info:
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+    name: "{{ item.item.name }}"
+    namespace: "{{ item.item.namespace }}"
+  vars:
+    _since: >-
+      {{ ((item.result | default({})).metadata | default({})).managedFields | default([], true)
+         | map(attribute='time') | select('string') | max | default(_app_secrets_rotate_stamp, true) }}
+  register: _app_secrets_rotate_wait
+  until: >-
+    (_app_secrets_rotate_wait.resources | default([]) | length > 0) and
+    ((_app_secrets_rotate_wait.resources[0].status | default({})).refreshTime | default('') >= _since) and
+    ((_app_secrets_rotate_wait.resources[0].status | default({})).conditions | default([])
+      | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0)
+  retries: "{{ app_secrets_rotate_sync_retries | int }}"
+  delay: "{{ app_secrets_rotate_sync_delay | int }}"
+  loop: "{{ _app_secrets_rotate_patched.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.namespace }}/{{ item.item.name }}"
+  failed_when: false
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Fail when an ExternalSecret of {{ _app_secrets_rotate_id }} did not sync"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | rotate | {{ _app_secrets_rotate_id }}: the new OpenBao version is in place, but
+      these ExternalSecrets did not refresh (Ready after the force-sync):
+      {{ _late | join('; ') }}. Nothing was restarted. Check: kubectl -n <ns> describe externalsecret <name>
+      (ESO condition message). Once ESO syncs, finish by hand (a new erag_rotate run would rotate again):
+      kubectl -n <ns> annotate externalsecret <name> --overwrite external-secrets.io/force-sync=$(date +%s), then
+      kubectl -n <ns> rollout restart <kind>/<name> for the workloads of rotate.restart in the registry.
+  vars:
+    _late: >-
+      {%- set out = [] -%}
+      {%- for r in _app_secrets_rotate_wait.results | default([]) -%}
+        {%- set since = ((r.item.result | default({})).metadata | default({})).managedFields | default([], true)
+                        | map(attribute='time') | select('string') | max | default(_app_secrets_rotate_stamp, true) -%}
+        {%- set st = (r.resources | default([]) | first | default({})).status | default({}) -%}
+        {%- set c = st.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | list | first | default({}) -%}
+        {%- if not (st.refreshTime | default('') >= since and c.status | default('') == 'True') -%}
+          {%- set _ = out.append(r.item.item.namespace ~ '/' ~ r.item.item.name ~ ' (' ~ (c.reason | default('no status')) ~ ': '
+                                 ~ (c.message | default('') | truncate(160)) ~ ')') -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  when: _late | length > 0
+
+- name: "app_secrets | rotate | openbao | Note the synced ExternalSecrets of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_synced: "{{ _app_secrets_rotate_es | map(attribute='namespace') | zip(_app_secrets_rotate_es | map(attribute='name')) | map('join', '/') | list }}"

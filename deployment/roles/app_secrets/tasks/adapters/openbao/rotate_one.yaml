@@ -1,0 +1,111 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: the rotation of one credential (rotate.yaml loops over the
+# ids). Expects: _app_secrets_rotate_id. Runs the rotator Job
+# (templates/rotator-job.yaml.j2, files/secrets_rotator.py), then, when it
+# rotated (or found the operator's version), force-syncs the credential's
+# ExternalSecrets and restarts its registry workloads. When the hook failed
+# and the previous version was restored, the ExternalSecrets are force-synced
+# too (a periodic refresh may have picked up the new value meanwhile), then the
+# run fails.
+
+---
+- name: "app_secrets | rotate | openbao | Plan the rotation of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    app_secrets_rotator_plan: "{{ _plan }}"
+    # Names the Job (run_worker.yaml); no value.
+    app_secrets_worker_plan: ["rotate {{ _app_secrets_rotate_id }}"]
+  vars:
+    _entry: "{{ app_secrets_catalog[_app_secrets_rotate_id] }}"
+    _hook: "{{ _entry.rotate.hook }}"
+    _plan: >-
+      {%- set rot = {} -%}
+      {%- for k in _entry.rotate.get('keys', []) -%}
+        {%- set g = _entry['keys'][k].generate -%}
+        {%- set _ = rot.update({k: ({'type': 'hex', 'bytes': g.bytes | int} if g.type == 'hex'
+                                    else {'type': 'password', 'length': g.length | int,
+                                          'special': g.special | default(false) | bool})}) -%}
+      {%- endfor -%}
+      {%- set target = {} -%}
+      {%- for k, v in (_entry.rotate.target | default({})).items() -%}
+        {%- set _ = target.update({k: (v | int) if k == 'port' else (v | string)}) -%}
+      {%- endfor -%}
+      {%- set plan = {'mount': app_secrets_openbao_kv_mount, 'id': _app_secrets_rotate_id,
+                      'path': app_secrets_openbao_cluster_id ~ '/' ~ _entry.path, 'hook': _hook,
+                      'keys': _entry['keys'].keys() | list, 'rotate': rot, 'target': target,
+                      'timeout': app_secrets_rotate_hook_timeout | int} -%}
+      {%- if _hook == 'keycloak-client-secret-set' -%}
+        {%- set _ = plan.update({'keycloak': {'url': app_secrets_rotate_keycloak_url | trim,
+                                              'admin_user': app_secrets_rotate_keycloak_admin_user,
+                                              'admin_secret': app_secrets_rotate_keycloak_admin_secret}}) -%}
+      {%- endif -%}
+      {{ plan }}
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Run the rotator for {{ _app_secrets_rotate_id }}"
+  ansible.builtin.include_tasks: run_worker.yaml
+  vars:
+    app_secrets_op: rotate
+    app_secrets_worker_op: rotate
+    app_secrets_job_template: rotator-job.yaml.j2
+    app_secrets_job_component: rotator
+
+- name: "app_secrets | rotate | openbao | Read the result for {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_rotated: >-
+      {{ app_secrets_worker_result.credentials[_app_secrets_rotate_id]
+         | default({'result': 'error', 'version': _stage.version | default(0),
+                    'previous_version': _stage.previous_version | default(0), 'server': 'unknown',
+                    'error': (_unapplied if _stage else '')
+                             ~ ((app_secrets_worker_result.probe.error | default('', true))
+                                or (app_secrets_worker_result.done.error | default('no result from the rotator', true)))}) }}
+  vars:
+    _stage: "{{ app_secrets_worker_result.stage | default(none) or {} }}"
+    # The Job wrote the new version, then stopped without a result (killed,
+    # deadline): the server may or may not hold the new value.
+    _unapplied: >-
+      the rotator stopped after it wrote version {{ _stage.version | default('?') }} (the new value) and before
+      it reported the hook result: the server may still hold the value of version
+      {{ _stage.previous_version | default('?') }}. Check a login with each, then keep the one that works
+      (back to the old one: bao kv rollback -mount={{ app_secrets_openbao_kv_mount }}
+      -version={{ _stage.previous_version | default('?') }} {{ app_secrets_openbao_cluster_id }}/{{ app_secrets_catalog[_app_secrets_rotate_id].path }}).
+      Rotator: 
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Resync after the rollback of {{ _app_secrets_rotate_id }}"
+  when: _app_secrets_rotated.result == 'rolled_back'
+  block:
+    - name: "app_secrets | rotate | openbao | Force-sync the restored version"
+      ansible.builtin.include_tasks: force_sync.yaml
+  rescue:
+    - name: "app_secrets | rotate | openbao | The resync after the rollback failed"
+      ansible.builtin.set_fact:
+        _app_secrets_rotated: "{{ _app_secrets_rotated | combine({'error': _app_secrets_rotated.error ~ '. The force-sync of the restored version failed too; the ExternalSecrets refresh within eso_refresh_interval'}) }}"
+
+- name: "app_secrets | rotate | openbao | Fail when {{ _app_secrets_rotate_id }} was not rotated"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | rotate | {{ _app_secrets_rotate_id }}
+      ({{ app_secrets_catalog[_app_secrets_rotate_id].rotate.hook }}): {{ _app_secrets_rotated.result }}
+      (KV version {{ _app_secrets_rotated.version }}, before {{ _app_secrets_rotated.previous_version }};
+      server {{ _app_secrets_rotated.server }}): {{ _app_secrets_rotated.error }}.
+      {{ 'Credentials rotated before it stay rotated: ' ~ (app_secrets_rotate_results.keys() | join(', ')) ~ '. '
+         if app_secrets_rotate_results else '' }}Rotator log (never a value):
+      kubectl -n {{ app_secrets_worker_namespace }} logs job/{{ _app_secrets_job_name }}
+  when: _app_secrets_rotated.result not in ['rotated', 'operator']
+
+- name: "app_secrets | rotate | openbao | Force-sync the ExternalSecrets of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.include_tasks: force_sync.yaml
+
+- name: "app_secrets | rotate | openbao | Restart the consumers of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.include_tasks: restart.yaml
+
+- name: "app_secrets | rotate | openbao | Record {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    app_secrets_rotate_results: >-
+      {{ app_secrets_rotate_results | combine({_app_secrets_rotate_id: {
+           'result': _app_secrets_rotated.result, 'version': _app_secrets_rotated.version,
+           'previous_version': _app_secrets_rotated.previous_version,
+           'external_secrets': _app_secrets_synced, 'restarted': _app_secrets_restarted,
+           'skipped': _app_secrets_restart_skipped}}) }}

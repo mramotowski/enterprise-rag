@@ -1,0 +1,66 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: probe. Fails fast, before any erag role generates
+# anything, unless (in this order):
+#   1. the worker namespace, ServiceAccount and CA bundle are in place (setup);
+#   2. a worker Job reaches OpenBao, finds it initialized and unsealed, and
+#      logs in as the worker role (Kubernetes auth, projected token);
+#   3. ClusterSecretStore openbao-<layer> is Ready (ESO can read); skipped with
+#      app_secrets_probe_teardown: true (the delete does not need ESO).
+# Never writes to OpenBao. secret_ids are not used (the probe covers the store).
+
+---
+- name: "app_secrets | probe | openbao | Set up the worker namespace"
+  ansible.builtin.include_tasks: setup.yaml
+  vars:
+    app_secrets_op: probe
+
+- name: "app_secrets | probe | openbao | Run the worker probe"
+  ansible.builtin.include_tasks: run_worker.yaml
+  vars:
+    app_secrets_op: probe
+    app_secrets_worker_op: probe
+    app_secrets_worker_plan: []
+
+- name: "app_secrets | probe | openbao | Fail when OpenBao is not usable"
+  ansible.builtin.include_tasks: probe_fail.yaml
+  vars:
+    app_secrets_op: probe
+
+- name: "app_secrets | probe | openbao | Read ClusterSecretStore {{ app_secrets_openbao_store }}"
+  kubernetes.core.k8s_info:
+    api_version: external-secrets.io/v1
+    kind: ClusterSecretStore
+    name: "{{ app_secrets_openbao_store }}"
+  register: _app_secrets_store
+  failed_when: false
+  no_log: true
+  when: not (app_secrets_probe_teardown | default(false) | bool)
+
+- name: "app_secrets | probe | openbao | Fail when ClusterSecretStore {{ app_secrets_openbao_store }} is not Ready"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | probe | ClusterSecretStore {{ app_secrets_openbao_store }}
+      {{ ('is not Ready (' ~ (_ready.reason | default('no Ready condition')) ~ ': '
+          ~ (_ready.message | default('')) ~ ')') if _found
+         else ('cannot be read (' ~ (_app_secrets_store.msg | default('') | truncate(300)) ~ '; is External Secrets Operator installed?)'
+               if _app_secrets_store is failed else 'does not exist') }}.
+      The platform external_secrets component creates it; ESO must be able to log in
+      as role eso-{{ app_secrets_openbao_layer }}. Check:
+      kubectl get clustersecretstore {{ app_secrets_openbao_store }} -o yaml
+  vars:
+    _found: "{{ _app_secrets_store.resources | default([]) | length > 0 }}"
+    _ready: >-
+      {{ ((_app_secrets_store.resources | default([]) | first | default({})).status | default({})).conditions
+         | default([]) | selectattr('type', 'equalto', 'Ready') | first | default({}) }}
+  when:
+    - not (app_secrets_probe_teardown | default(false) | bool)
+    - not (_found | bool) or (_ready.status | default('') | string) != 'True'
+
+- name: "app_secrets | probe | openbao | Report"
+  ansible.builtin.debug:
+    msg: >-
+      OpenBao at {{ app_secrets_openbao_address | trim }} is unsealed and the worker role
+      {{ app_secrets_openbao_worker_role }} logs in{{ (' and ClusterSecretStore '
+      ~ app_secrets_openbao_store ~ ' is Ready') if not (app_secrets_probe_teardown | default(false) | bool) else '' }}.

@@ -56,12 +56,37 @@ version_key: "solution_version"
 #   configuration and its database credentials, which have to match the ones inside
 #   the restored volume.
 #
-# One namespace is deliberately absent:
+# The first namespace holds no erag object. With `secrets_backend: openbao` and
+# the in-cluster OpenBao, the erag credentials live there and not in the
+# namespaces below. The platform's snapshot hook (Hooks, below) writes a Raft
+# snapshot to a volume in that namespace before every backup, and a restore
+# applies it before anything restarts, so the restored databases get the
+# credentials that match them. It must come first: the restore replays it
+# before the namespaces that read those credentials. It is listed only with the
+# in-cluster OpenBao; otherwise the hooks do nothing. An external OpenBao is
+# not in this backup at all: whoever runs it must back up <cluster_id>/erag/
+# (its Raft snapshots) at the same time, or a restore brings back databases
+# whose passwords no longer match the store.
+#
+# The snapshot covers the whole OpenBao, not only erag's paths: a restore rolls
+# back the credentials of every layer stored there to the time of the backup.
+# It is encrypted, and only the unseal keys of the OpenBao that took it open it;
+# they are in no backup. The platform's docs/deploy/openbao.md, "Backup and
+# restore", has the details.
+#
+# Two namespaces are deliberately absent:
 #
 #   llm-inference — model serving. Weights are not user data and are re-pulled
 #     by the model catalogue; backing up tens of gigabytes of them per backup is
 #     not a trade anyone wants.
+#
+#   openbao — the OpenBao servers themselves. A restore deletes every volume it
+#     captured and replays the objects over the running ones, which would wipe
+#     the live store; the snapshot namespace above is how OpenBao is backed up.
 namespace_order:
+{% if (secrets_backend | default('local')) == 'openbao' and (openbao_mode | default('internal')) == 'internal' %}
+  - "{{ openbao_backup_namespace | default('openbao-backup') }}"  # the OpenBao Raft snapshot (platform openbao role)
+{% endif %}
   - default                                   # deployment manifest
   - postgresql                                # postgresql_namespace — the shared database, realm included
   - keycloak                                  # keycloak_namespace — identity service config and db credentials
@@ -151,12 +176,31 @@ cleanup:
 # -----------------------------------------------------------------------------
 # Hooks
 # -----------------------------------------------------------------------------
-# None. Every store in this profile is captured as the volume it sits on, and a
-# snapshot of a single volume is a crash-consistent copy the database recovers from
-# by replaying its own write-ahead log when it starts.
-pre_backup: []
+# The databases need no hook. Every store in this profile is captured as the
+# volume it sits on, and a snapshot of a single volume is a crash-consistent copy
+# the database recovers from by replaying its own write-ahead log when it starts.
+#
+# The credential store does: OpenBao keeps its data in its own volumes, which this
+# profile must not capture (see Namespaces). The platform's openbao role provides a
+# hook pair. Each is a no-op, with a message, unless `secrets_backend: openbao` and
+# `openbao_mode: internal`, so it is listed unconditionally.
+pre_backup:
+  # A Job in the snapshot namespace writes `bao operator raft snapshot save` to the
+  # volume the backup then captures. The snapshot never passes through this host.
+  - kind: role
+    name: "OpenBao raft snapshot"
+    role: openbao
+    tasks_from: snapshot_backup.yaml
 
 post_restore:
+  # First: the credentials have to be back before the hooks below restart the
+  # services that read them. Restores the snapshot the replayed volume holds and
+  # makes ESO re-sync the projected Secrets straight away.
+  - kind: role
+    name: "OpenBao raft snapshot restore"
+    role: openbao
+    tasks_from: snapshot_restore.yaml
+
   # The identity service holds the realm it serves in a local cache. The replay
   # changes the database underneath it without telling it, so it would keep
   # answering from accounts that no longer exist. Restarting it is what makes it

@@ -17,6 +17,81 @@ reranking_model_name: ""                           # app_inference_models
 # vector_databases_vector_dims is deliberately NOT declared here: unset means
 # "auto-detect", and load_settings.yaml keys the detection gate off that.
 
+# --- vector_dims lookup as an in-cluster Job (projected Secrets, i.e. the
+#     OpenBao backend; tasks/resolve_vector_dims_job.yaml). Runs files/resolve_vector_dims.py
+#     in the credential-store namespace, where the HF token is projected. ---
+vector_dims_job_image: "docker.io/library/python:3.12-slim"
+# The namespace of the registry projection <erag_secrets_namespace>/hf-token
+# (app_secrets files/registry.yaml); not a separate setting.
+vector_dims_job_namespace: "{{ erag_secrets_namespace | default('erag-secrets') }}"
+vector_dims_job_timeout: 300                       # seconds the Job may run
+vector_dims_job_poll_delay: 5
+
+# --- Teardown: every credential of the app_secrets registry (files/registry.yaml),
+#     one ID per variant. Deleting all of them is the layer teardown: with the
+#     OpenBao backend it also removes what else is stored under <cluster_id>/erag/,
+#     the ExternalSecrets and the namespace labels (tasks/teardown.yaml).
+#     app_secrets tests/openbao_cases.yaml fails when this list and the registry differ. ---
+app_pre_install_teardown_secret_ids:
+  - keycloak/erag-admin
+  - keycloak/erag-user
+  - keycloak/erag-maintainer
+  - keycloak/mcp-client
+  - keycloak/grafana-oauth
+  - keycloak/edp-oidc
+  - nats/auth
+  - vector-db/redis
+  - vector-db/pgvector
+  - vector-db/mssql
+  - chat-history/postgres
+  - fingerprint/postgres
+  - edp/postgresql
+  - edp/redis
+  - edp/object-store
+  - seaweedfs/admin
+  - user/edp-s3
+  - user/sharepoint
+  - user/keycloak-oidc
+  - user/ldap-bind
+  - user/hf-token
+
+# --- Rotation (AD-9): es_auto_installer.sh install erag --env <env> --only --
+#     -e erag_rotate=[<id>,...] is a rotate-only run. erag_rotate is a list of app_secrets credential ids
+#     (-e '{"erag_rotate": [...]}') or the string "[<id>,<id>]" that
+#     -e erag_rotate=[...] passes. When it is set, deployment/components.yaml
+#     disables every erag component but this one, and tasks/install.yaml runs
+#     only app_secrets rotate (tasks/rotate.yaml). Install action only: a
+#     teardown, upgrade or validate ignores erag_rotate. ---
+erag_rotate: []
+app_pre_install_rotate_run: "{{ erag_rotate | default([]) | length > 0 and (component_action | default('install')) == 'install' }}"
+app_pre_install_rotate_ids: >-
+  {{ (erag_rotate if (erag_rotate is sequence and erag_rotate is not string)
+      else (erag_rotate | string | regex_replace('[][ ]', '') | replace('"', '') | replace("'", '')).split(','))
+     | map('string') | map('trim') | reject('equalto', '') | list }}
+
+# --- Migration of a local-mode env to the OpenBao backend (tasks/install.yaml):
+#     every credential of the app_secrets registry that has a legacy Secret
+#     (operator entries under erag/user/ have none). app_post_install finalizes
+#     with the same list (app_post_install_import_secret_ids);
+#     app_secrets tests/test_migration.yaml fails when either list and the registry differ. ---
+app_pre_install_import_secret_ids:
+  - keycloak/erag-admin
+  - keycloak/erag-user
+  - keycloak/erag-maintainer
+  - keycloak/mcp-client
+  - keycloak/grafana-oauth
+  - keycloak/edp-oidc
+  - nats/auth
+  - vector-db/redis
+  - vector-db/pgvector
+  - vector-db/mssql
+  - chat-history/postgres
+  - fingerprint/postgres
+  - edp/postgresql
+  - edp/redis
+  - edp/object-store
+  - seaweedfs/admin
+
 # --- Cross-role shared defaults - derived from base_domain_name in tasks/solution_config.yaml; declared here for standalone runs. ---
 ui_domain_name: "solutions.ai"                                                       # app_ui
 erag_keycloak_domain_name: "auth.solutions.ai"                                        # app_keycloak_config

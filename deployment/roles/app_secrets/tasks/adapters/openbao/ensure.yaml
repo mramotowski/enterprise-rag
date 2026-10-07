@@ -1,0 +1,155 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: ensure.
+#   before_deploy (default), in this order:
+#     1. setup (worker namespace, ServiceAccount, CA bundle);
+#     2. find the registry secrets: entries ("projections") that read a KV key
+#        of a selected credential; for an entry with variants, the variant that
+#        does (only one may);
+#     3. one worker Job: create each selected credential with cas=0 (exists =
+#        skip; static = operator-supplied, must exist), and check the other
+#        credentials those projections read;
+#     4. render one ExternalSecret per projection whose credentials all exist
+#        now (render_externalsecrets.yaml); the others stay pending until the
+#        ensure of their last credential, and are reported.
+#   after_deploy: nothing to do (ESO owns the Secrets; local markup and files
+#     do not exist in openbao mode). Platform IDs are only valid here.
+# No value reaches Ansible: the worker reports results and versions only.
+
+---
+- name: "app_secrets | ensure | openbao | after_deploy needs no work"
+  ansible.builtin.debug:
+    msg: >-
+      {{ app_secrets_selected_ids | join(', ') }}: ensure_phase after_deploy is a
+      no-op with secrets_backend: openbao (ESO-managed Secrets, no local files or markup)
+  when: ensure_phase | default('before_deploy') == 'after_deploy'
+
+- name: "app_secrets | ensure | openbao | before_deploy"
+  when: ensure_phase | default('before_deploy') == 'before_deploy'
+  block:
+    - name: "app_secrets | ensure | openbao | Set up the worker namespace"
+      ansible.builtin.include_tasks: setup.yaml
+      vars:
+        app_secrets_op: ensure
+
+    - name: "app_secrets | ensure | openbao | List the registry projections"
+      ansible.builtin.include_tasks: projections.yaml
+      vars:
+        app_secrets_op: ensure
+
+    - name: "app_secrets | ensure | openbao | Select the projections of the requested credentials"
+      ansible.builtin.set_fact:
+        _app_secrets_touched: "{{ _touched }}"
+        _app_secrets_dep_ids: >-
+          {{ _touched | map(attribute='cids') | flatten | unique
+             | reject('in', app_secrets_selected_ids) | list }}
+      vars:
+        _touched: >-
+          {%- set out = [] -%}
+          {%- for p in app_secrets_projections -%}
+            {%- if p.cids | select('in', app_secrets_selected_ids) | list | length > 0 -%}
+              {%- set _ = out.append(p) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      no_log: true
+
+    - name: "app_secrets | ensure | openbao | Fail when several variants of one Secret apply"
+      ansible.builtin.fail:
+        msg: >-
+          app_secrets | ensure | {{ _dups | join(', ') }}: more than one variant of the
+          same Secret selected (secret_ids {{ app_secrets_selected_ids | join(', ') }});
+          ensure one variant (vector store engine) at a time
+      vars:
+        _keys: "{{ _app_secrets_touched | map(attribute='key') | list }}"
+        _dups: >-
+          {%- set out = [] -%}
+          {%- for k in _keys | unique if (_keys | select('equalto', k) | list | length) > 1 -%}
+            {%- set _ = out.append(k) -%}
+          {%- endfor -%}
+          {{ out }}
+      when: _dups | length > 0
+
+    - name: "app_secrets | ensure | openbao | Build the worker plan"
+      ansible.builtin.include_tasks: plan.yaml
+      vars:
+        app_secrets_op: ensure
+        app_secrets_plan_write_ids: "{{ app_secrets_selected_ids }}"
+        app_secrets_plan_check_ids: "{{ _app_secrets_dep_ids }}"
+        app_secrets_plan_check_keys: true
+
+    - name: "app_secrets | ensure | openbao | Run the worker"
+      ansible.builtin.include_tasks: run_worker.yaml
+      vars:
+        app_secrets_op: ensure
+        app_secrets_worker_op: ensure
+
+    - name: "app_secrets | ensure | openbao | Fail when OpenBao is not usable"
+      ansible.builtin.include_tasks: probe_fail.yaml
+      vars:
+        app_secrets_op: ensure
+
+    - name: "app_secrets | ensure | openbao | Fail on credentials that could not be ensured"
+      ansible.builtin.fail:
+        msg: >-
+          app_secrets | ensure | {{ _bad | join('; ') if _bad | length > 0
+          else 'the worker failed: ' ~ (app_secrets_worker_result.done.error | default('no result')) }}
+      vars:
+        _results: "{{ app_secrets_worker_result.credentials }}"
+        _bad: >-
+          {%- set bad = [] -%}
+          {%- for cid in app_secrets_selected_ids + _app_secrets_dep_ids -%}
+            {#- A deleted dependency is an error: its projections could never sync. -#}
+            {%- set ok = ['created', 'exists'] if cid in app_secrets_selected_ids else ['exists', 'missing'] -%}
+            {%- if cid not in _results -%}
+              {%- set _ = bad.append(cid ~ ': no result from the worker') -%}
+            {%- elif _results[cid].result not in ok -%}
+              {%- set _ = bad.append(cid ~ ' (' ~ app_secrets_openbao_kv_mount ~ '/' ~ app_secrets_openbao_cluster_id
+                                     ~ '/' ~ app_secrets_catalog[cid].path ~ '): ' ~ _results[cid].result
+                                     ~ ((' - ' ~ _results[cid].error) if _results[cid].error
+                                        else (' - read by a Secret of this ensure; restore it (bao kv undelete) or remove its metadata'
+                                              if _results[cid].result == 'deleted' else ''))) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ bad }}
+      when: _bad | length > 0 or (app_secrets_worker_result.done.state | default('')) != 'ok'
+
+    - name: "app_secrets | ensure | openbao | Report the credentials"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}: {{ app_secrets_worker_result.credentials[item].result }}
+          (version {{ app_secrets_worker_result.credentials[item].version }})
+      loop: "{{ app_secrets_selected_ids }}"
+
+    - name: "app_secrets | ensure | openbao | Split ready and pending projections"
+      ansible.builtin.set_fact:
+        _app_secrets_available: "{{ _available }}"
+        _app_secrets_ready: "{{ _app_secrets_touched | selectattr('cids', 'subset', _available) | list }}"
+        _app_secrets_pending: "{{ _app_secrets_touched | rejectattr('cids', 'subset', _available) | list }}"
+      vars:
+        _available: >-
+          {%- set out = app_secrets_selected_ids | list -%}
+          {%- for cid in _app_secrets_dep_ids
+                if (app_secrets_worker_result.credentials[cid] | default({})).result | default('') == 'exists' -%}
+            {%- set _ = out.append(cid) -%}
+          {%- endfor -%}
+          {{ out }}
+      no_log: true
+
+    - name: "app_secrets | ensure | openbao | Report pending projections"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.namespace }}/{{ item.name }}: ExternalSecret not rendered yet, it waits for
+          {{ item.cids | reject('in', _app_secrets_available) | join(', ') }}
+          (rendered by the ensure that creates the last of them)
+      loop: "{{ _app_secrets_pending }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }}"
+
+    - name: "app_secrets | ensure | openbao | Render the ExternalSecrets"
+      ansible.builtin.include_tasks: render_externalsecrets.yaml
+      vars:
+        app_secrets_op: ensure
+        app_secrets_render_projections: "{{ _app_secrets_ready }}"
+      when: _app_secrets_ready | length > 0

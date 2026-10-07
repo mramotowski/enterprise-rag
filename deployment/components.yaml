@@ -18,17 +18,26 @@
 # `templates/apisix-routes.yaml`; auth wiring is rendered by each role's
 # `templates/values.yaml.j2` so no shared values file is used.
 # =============================================================================
+# Rotate-only run: with erag_rotate set (es_auto_installer.sh install erag
+# --env <env> --only -- -e erag_rotate=[<id>,...]) the erag layer drops its
+# layer dependencies, every erag component but app_pre_install is disabled,
+# and app_pre_install runs only app_secrets rotate (AD-9). Only for the install action: a teardown, upgrade or validate
+# ignores erag_rotate.
+# =============================================================================
 
 layers:
+  # A rotate-only install has no layer dependencies: the platform and inference
+  # layers do not run first, even without --only. The installer renders this
+  # (lookup template) to a list literal; resolve_components parses it.
   - name: erag
     enabled: true
-    depends_on: [platform, inference]
+    depends_on: "{{ [] if (erag_rotate | default([]) | length > 0 and (component_action | default('install')) == 'install') else ['platform', 'inference'] }}"
 
 components:
   # --- Inference models (deploy via model-manager.sh, wait for readiness) ---
   - name: app_inference_models
     layer: erag
-    enabled: "{{ inference_models_enabled | default(true) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (inference_models_enabled | default(true) | bool) }}"
     depends_on: []
 
   # --- Bootstrap ---
@@ -40,66 +49,71 @@ components:
   # --- Data plane ---
   - name: app_vector_databases
     layer: erag
-    enabled: "{{ vector_databases_enabled | default(false) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (vector_databases_enabled | default(false) | bool) }}"
     depends_on: [app_pre_install]
 
   - name: app_keycloak_config
     layer: erag
-    enabled: "{{ keycloak_enabled | default(true) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (keycloak_enabled | default(true) | bool) }}"
     depends_on: [app_pre_install]
 
   # --- Edge / API surface ---
   - name: app_apisix
     layer: erag
-    enabled: "{{ apisix_enabled | default(true) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (apisix_enabled | default(true) | bool) }}"
     depends_on: [app_pre_install]
 
   - name: app_chat_history
     layer: erag
-    enabled: "{{ chat_history_enabled | default(false) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (chat_history_enabled | default(false) | bool) }}"
     depends_on: [app_pre_install, app_apisix]
 
   - name: app_nats
     layer: erag
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') }}"
     depends_on: [app_pre_install]
 
   - name: app_fingerprint
     layer: erag
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') }}"
     depends_on: [app_pre_install, app_apisix, app_nats]
 
   - name: app_hpa
     layer: erag
-    enabled: "{{ hpa_enabled | default(true) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (hpa_enabled | default(true) | bool) }}"
     depends_on: [app_pre_install]
 
   - name: app_pipeline
     layer: erag
-    enabled: true
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') }}"
     depends_on: [app_pre_install, app_hpa, app_nats, app_fingerprint]
 
   - name: app_edp
     layer: erag
-    enabled: "{{ edp_enabled | default(false) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (edp_enabled | default(false) | bool) }}"
     depends_on: [app_vector_databases, app_apisix, app_hpa]
 
   - name: app_mcp_gateway
     layer: erag
-    enabled: "{{ mcp_enabled | default(false) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (mcp_enabled | default(false) | bool) }}"
     depends_on: [app_edp, app_keycloak_config]
 
   - name: app_ui
     layer: erag
-    enabled: "{{ ui_enabled | default(false) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (ui_enabled | default(false) | bool) }}"
     depends_on: [app_pipeline, app_apisix]
 
   # --- Reboot recovery ---
   - name: app_watcher
     layer: erag
-    enabled: "{{ watcher_enabled | default(true) | bool }}"
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') and (watcher_enabled | default(true) | bool) }}"
     depends_on: [app_pre_install]
 
   #--- Finalization ---
+  # Depends on app_pre_install so that every teardown that reaches the
+  # credential delete (app_pre_install, last) also runs app_post_install, first:
+  # its teardown stops on an unusable OpenBao before anything is removed.
   - name: app_post_install
     layer: erag
-    enabled: true
-    depends_on: []
+    enabled: "{{ (erag_rotate | default([]) | length == 0 or (component_action | default('install')) != 'install') }}"
+    depends_on: [app_pre_install]

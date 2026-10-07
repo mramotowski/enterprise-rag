@@ -28,16 +28,56 @@
     - "{{ rag_log_dir }}"
     - "{{ rag_tmp_dir }}"
 
-- name: "app_pre_install | Load credentials from password management"
+- name: "app_pre_install | Open the credential store"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: lookup.yaml
+    name: app_secrets
+    tasks_from: probe.yaml
 
-- name: "app_pre_install | Load init passwords"
+# Rotate-only run (erag_rotate set): rotate, and nothing below.
+- name: "app_pre_install | Rotate credentials (erag_rotate)"
+  ansible.builtin.include_tasks:
+    file: rotate.yaml
+  when: app_pre_install_rotate_run | bool
+
+# Projected Secrets on an env that ran with local credentials: their current
+# values go into the store before any role ensures (and so generates) one,
+# and the Helm-owned Secrets are handed to ESO (AD-12). Once per env; a fresh
+# install only records that there was nothing to import. app_post_install
+# scrubs the local copies at the end of the run (import_phase finalize).
+- name: "app_pre_install | Import the running credentials into the credential store"
   ansible.builtin.include_role:
-    name: app_generate_password
+    name: app_secrets
+    tasks_from: import.yaml
+  vars:
+    secret_ids: "{{ app_pre_install_import_secret_ids }}"
+  when:
+    - not (app_pre_install_rotate_run | bool)
+    - app_secrets_projected | default(false)
+
+# Projected Secrets: the operator HF token (tasks/project_hf_token.yaml; already
+# done when app_inference_models ran first), then the vector_dims lookup as an
+# in-cluster Job that reads its projection.
+- name: "app_pre_install | Projected HF token and vector_dims"
+  when:
+    - not (app_pre_install_rotate_run | bool)
+    - app_secrets_projected | default(false)
+  block:
+    - name: "app_pre_install | Project the operator HF token"
+      ansible.builtin.include_tasks:
+        file: project_hf_token.yaml
+
+    - name: "app_pre_install | Resolve vector_dims in the cluster"
+      ansible.builtin.include_tasks:
+        file: resolve_vector_dims_job.yaml
+      when: not (_vector_dims_explicit | bool)
+
+    - name: "app_pre_install | Verify vector_dims"
+      ansible.builtin.include_tasks:
+        file: verify_vector_dims.yaml
+      when: not (_vector_dims_explicit | bool)
 
 - name: "app_pre_install | Create deployment manifest stub"
   ansible.builtin.include_role:
     name: app_deployment_manifest
     tasks_from: create_stub.yaml
+  when: not (app_pre_install_rotate_run | bool)

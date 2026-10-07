@@ -48,6 +48,19 @@ class K8sHelper:
                 encoded_password = secret.data.get("password") or secret.data.get("admin-password")
                 return base64.b64decode(encoded_password).decode().strip()
 
+    def read_secret_data(self, secret_name, namespace):
+        """Return the decoded data of a Secret as {key: value}, or None when it does not exist.
+
+        Used for the credentials that ESO projects from OpenBao (secrets_backend: openbao),
+        where no credentials file is written. Values are never logged.
+        """
+        logger.debug(f"Reading Secret '{namespace}/{secret_name}'")
+        for secret in kr8s.get("secrets", namespace=namespace, field_selector=f"metadata.name={secret_name}"):
+            if secret.name == secret_name:
+                return {key: base64.b64decode(value).decode()
+                        for key, value in (secret.raw.get("data") or {}).items()}
+        return None
+
     def list_namespaces(self):
         """List all namespaces in the Kubernetes cluster"""
         namespaces = kr8s.get("namespaces")

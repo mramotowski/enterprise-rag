@@ -38,6 +38,7 @@ jobs:
           - chat_history_unit_tests
           - deployment_scripts_unit_tests
           - docsum_unit_tests
+          - e2e_helpers_unit_tests
           - edp_unit_tests
           - embeddings_unit_tests
           - fingerprint_invariants_unit_tests

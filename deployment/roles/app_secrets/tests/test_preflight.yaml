@@ -1,0 +1,175 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests the preflight port op (SPEC CAP-5) through the real
+# app_pre_install solution_config.yaml: with secrets_backend: openbao every
+# operator secret (registry user_supplied config vars and user_supplied_env
+# environment variables) that is also set outside OpenBao is one
+# configuration issue naming the var, the KV path and key; local mode reports
+# nothing and keeps the HF_TOKEN fallback. Each case runs in a nested
+# ansible-playbook (preflight_case.yaml) with its own environment and its
+# config as an extra-vars file; the output of every case is then searched for
+# the test values, which must not appear.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_preflight.yaml
+
+---
+- name: "app_secrets | test | preflight"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Every env var preflight or solution_config reads: unset ("") unless a case sets it.
+    clean_env: {HF_TOKEN: "", s3_access_key: "", s3_secret_key: ""}
+    marker: "preflight-test-value-7f3c9a"
+    path: "intel-ai/t1/erag/user"
+    cases:
+      - name: local-all-set
+        backend: local
+        vars: {hugging_token: "{{ marker }}-hf", edp_s3_secret_access_key: "{{ marker }}-s3", erag_keycloak_oidc_client_secret: "{{ marker }}-oidc"}
+        env: {s3_access_key: "{{ marker }}-env"}
+      - {name: local-env-token, backend: local, vars: {}, env: {HF_TOKEN: "{{ marker }}-hfenv"}}
+      - {name: openbao-clean, backend: openbao, vars: {}, env: {}}
+      - {name: openbao-empty-values, backend: openbao, vars: {hugging_token: "", edp_s3_access_key_id: " "}, env: {}}
+      - name: openbao-s3-config
+        backend: openbao
+        vars: {edp_s3_secret_access_key: "{{ marker }}-a", edp_s3_compatible_access_key_id: "{{ marker }}-b"}
+        env: {}
+      - {name: openbao-s3-env, backend: openbao, vars: {}, env: {s3_access_key: "{{ marker }}-c", s3_secret_key: "{{ marker }}-d"}}
+      - {name: openbao-hf-env, backend: openbao, vars: {}, env: {HF_TOKEN: "{{ marker }}-e"}}
+      - {name: openbao-hf-config, backend: openbao, vars: {hugging_token: "{{ marker }}-f"}, env: {}}
+      - name: openbao-oidc-ldap
+        backend: openbao
+        vars: {erag_keycloak_oidc_client_secret: "{{ marker }}-g", erag_keycloak_federation_bind_password: "{{ marker }}-h"}
+        env: {}
+  tasks:
+    - name: "app_secrets | test | preflight | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_preflight_test_
+      register: _tmp
+
+    - name: "app_secrets | test | preflight | Run"
+      block:
+        # The config goes in an extra-vars file, as config.erag.yaml does (no value in argv).
+        - name: "app_secrets | test | preflight | Write the case configs"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/{{ item.name }}.vars.json"
+            mode: "0600"
+            content: "{{ item.vars | combine({'secrets_backend': item.backend, 'out': _tmp.path ~ '/' ~ item.name ~ '.result'}) | to_json }}"
+          loop: "{{ cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: "app_secrets | test | preflight | Run the cases (nested playbooks, output captured)"
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ansible_playbook_python | dirname }}/ansible-playbook -v -i localhost, -c local
+              {{ playbook_dir }}/preflight_case.yaml -e @{{ _tmp.path }}/{{ item.name }}.vars.json
+              > {{ _tmp.path }}/{{ item.name }}.log 2>&1
+          environment: "{{ clean_env | combine(item.env) | combine({'ANSIBLE_ROLES_PATH': playbook_dir | dirname | dirname}) }}"
+          loop: "{{ cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: _runs
+          changed_when: true
+          failed_when: _runs.rc != 0
+          no_log: true
+
+        - name: "app_secrets | test | preflight | Read the results"
+          ansible.builtin.set_fact:
+            _r: "{{ _r | default({}) | combine({item.name: lookup('ansible.builtin.file', _tmp.path ~ '/' ~ item.name ~ '.result') | from_json}) }}"
+          loop: "{{ cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "app_secrets | test | preflight | Results"
+          ansible.builtin.assert:
+            that:
+              # Local: the config and environment are the sources; nothing reported.
+              - _r['local-all-set'].issues == []
+              - _r['local-all-set'].projected == false
+              - _r['local-env-token'].issues == []
+              - _r['local-env-token'].hugging_token_set
+              - _r['openbao-clean'].issues == []
+              - _r['openbao-clean'].projected == true
+              - _r['openbao-empty-values'].issues == []
+              # One issue per set var, naming var, path and key.
+              - _r['openbao-s3-config'].issues | length == 2
+              - _r['openbao-s3-config'].issues | select('search', '^edp_s3_compatible_access_key_id is set in the configuration') | select('search', path ~ '/edp-s3 key access_key_id') | list | length == 1
+              - _r['openbao-s3-config'].issues | select('search', '^edp_s3_secret_access_key is set in the configuration') | select('search', path ~ '/edp-s3 key secret_access_key') | list | length == 1
+              - _r['openbao-s3-env'].issues | length == 2
+              - _r['openbao-s3-env'].issues | select('search', '^The environment variable s3_access_key is set') | select('search', path ~ '/edp-s3 key access_key_id') | list | length == 1
+              - _r['openbao-s3-env'].issues | select('search', '^The environment variable s3_secret_key is set') | select('search', path ~ '/edp-s3 key secret_access_key') | list | length == 1
+              # HF_TOKEN is reported as the environment variable, not as hugging_token
+              # (preflight runs before the fallback).
+              - _r['openbao-hf-env'].issues | length == 1
+              - _r['openbao-hf-env'].issues[0] is search('^The environment variable HF_TOKEN is set')
+              - _r['openbao-hf-env'].issues[0] is search(path ~ '/hf-token key token')
+              - _r['openbao-hf-config'].issues | length == 1
+              - _r['openbao-hf-config'].issues[0] is search('^hugging_token is set in the configuration')
+              - _r['openbao-hf-config'].issues[0] is search('bao kv patch -mount=intel-ai t1/erag/user/hf-token token=-')
+              # erag_keycloak_oidc_client_secret supplies two entries (registry user/sharepoint, user/keycloak-oidc).
+              - _r['openbao-oidc-ldap'].issues | length == 3
+              - _r['openbao-oidc-ldap'].issues | select('search', path ~ '/sharepoint key client_secret') | list | length == 1
+              - _r['openbao-oidc-ldap'].issues | select('search', path ~ '/keycloak-oidc key client_secret') | list | length == 1
+              - _r['openbao-oidc-ldap'].issues | select('search', '^erag_keycloak_federation_bind_password ') | select('search', path ~ '/ldap-bind key password') | list | length == 1
+            fail_msg: "{{ _r | to_json }}"
+            quiet: true
+
+        - name: "app_secrets | test | preflight | No test value appears in the case outputs or results"
+          ansible.builtin.shell:
+            cmd: "set -o pipefail; cat {{ _tmp.path }}/*.log {{ _tmp.path }}/*.result | grep -c -F {{ marker | quote }}"
+            executable: /bin/bash
+          register: _leaks
+          changed_when: false
+          # grep -c: rc 1 and count 0 when nothing matches.
+          failed_when: _leaks.rc != 1 or _leaks.stdout | int != 0
+
+        # app_edp's SharePoint assert: with projected Secrets the client secret
+        # comes from erag/user/sharepoint, so config may (must) leave it empty.
+        # The task's real _sp_missing expression is rendered in both modes.
+        - name: "app_secrets | test | preflight | Write the SharePoint assert expression of app_edp"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/sp_missing.j2"
+            mode: "0600"
+            content: "{{ _sp_task.vars._sp_missing | trim }}"
+          vars:
+            _sp_task: >-
+              {{ lookup('ansible.builtin.file', playbook_dir ~ '/../../app_edp/tasks/install.yaml') | from_yaml
+                 | selectattr('name', 'equalto', 'app_edp | Assert SharePoint configuration is complete') | first }}
+
+        - name: "app_secrets | test | preflight | Render the SharePoint assert expression"
+          ansible.builtin.set_fact:
+            _sp: "{{ _sp | default({}) | combine({item.name: _rendered | from_yaml}) }}"
+          vars:
+            _tvars:
+              _sp_store_vars: "{{ ['erag_keycloak_oidc_client_secret'] if item.projected else [] }}"
+              erag_keycloak_oidc_endpoint: https://idp.test
+              erag_keycloak_oidc_client_id: cid
+              erag_keycloak_oidc_client_secret: ""
+            _rendered: "{{ lookup('ansible.builtin.template', _tmp.path ~ '/sp_missing.j2', template_vars=_tvars) }}"
+          loop:
+            - {name: local, projected: false}
+            - {name: projected, projected: true}
+
+        - name: "app_secrets | test | preflight | SharePoint assert results"
+          ansible.builtin.assert:
+            that:
+              - _sp.local == ['erag_keycloak_oidc_client_secret']
+              - _sp.projected == []
+              - _sp_task.vars._sp_store_vars is search("\\['erag_keycloak_oidc_client_secret'\\] if app_secrets_projected")
+            fail_msg: "{{ _sp | to_json }}"
+            quiet: true
+          vars:
+            _sp_task: >-
+              {{ lookup('ansible.builtin.file', playbook_dir ~ '/../../app_edp/tasks/install.yaml') | from_yaml
+                 | selectattr('name', 'equalto', 'app_edp | Assert SharePoint configuration is complete') | first }}
+
+      always:
+        - name: "app_secrets | test | preflight | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

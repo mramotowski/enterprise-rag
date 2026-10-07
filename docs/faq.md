@@ -94,7 +94,7 @@ Yes. Each `--env <name>` has its own configuration, credentials, and kubeconfig.
 
 ### Where are the credentials after installing?
 
-In `env/<name>/logs/rag/default_credentials.yaml`. They are one-time passwords; change them after first login. A few service credentials live in Kubernetes secrets instead, listed in [Install](deploy/install_rag.md#credentials).
+With the default `secrets_backend: local`, the UI users' one-time passwords are in `env/<name>/logs/rag/default_credentials.txt`, and the service passwords and the Keycloak admin password in `env/<name>/logs/rag/default_credentials.yaml`. Change the UI passwords after first login. The Grafana admin password is in a platform Kubernetes secret. With `secrets_backend: openbao` no file is written: read the values with `bao kv get` ([Credentials in OpenBao](deploy/openbao.md#first-login-credentials)). The full table is in [Install](deploy/install_rag.md#credentials).
 
 ### How do I open the UI?
 

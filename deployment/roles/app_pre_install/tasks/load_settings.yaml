@@ -10,10 +10,14 @@
   ansible.builtin.set_fact:
     _vector_dims_explicit: "{{ vector_databases_vector_dims | default('', true) | string | length > 0 }}"
 
+# With projected Secrets the lookup needs the HF token, which only an in-cluster
+# Job may read: install.yaml runs it after the credential store is opened.
 - name: "app_pre_install | Resolve vector_dims from embedding model"
   ansible.builtin.include_tasks:
     file: resolve_vector_dims.yaml
-  when: not (_vector_dims_explicit | bool)
+  when:
+    - not (_vector_dims_explicit | bool)
+    - not (app_secrets_projected | default(false))
 
 # Detection never ran, so record why rather than leaving the summary at 'pending'.
 - name: "app_pre_install | Record explicitly configured vector_dims"
@@ -21,20 +25,10 @@
     vector_databases_vector_dims_source: "explicit_config"
   when: _vector_dims_explicit | bool
 
-# An empty vector_databases_vector_dims in config.yaml arrives as an extra var,
-# which outranks the set_fact above — detection runs but its result can never be
-# applied, and the empty string would render into the Helm values. Only an assert
-# catches that, so fail here rather than build an unusable index.
-- name: "app_pre_install | Verify vector_dims is a positive integer"
-  ansible.builtin.assert:
-    that:
-      - vector_databases_vector_dims | default(0, true) | int > 0
-    fail_msg: >-
-      vector_databases_vector_dims is '{{ vector_databases_vector_dims | default('<unset>') }}',
-      which is not a usable vector dimension. Either remove the key from
-      config.yaml entirely to auto-detect it from the embedding model, or set it
-      to a positive integer. Leaving it blank does not mean "auto".
-    success_msg: "vector_databases_vector_dims={{ vector_databases_vector_dims }} (source: {{ vector_databases_vector_dims_source | default('pending', true) }})"
+- name: "app_pre_install | Verify vector_dims"
+  ansible.builtin.include_tasks:
+    file: verify_vector_dims.yaml
+  when: (_vector_dims_explicit | bool) or not (app_secrets_projected | default(false))
 
 - name: "app_pre_install | Validate mcp_enabled"
   ansible.builtin.include_tasks:
@@ -59,7 +53,11 @@
         • Variant: {{ pipeline_variant | default('base') }}{{ ' (upload mode: embedding only, no chat)' if (pipeline_variant | default('base')) == 'upload' else '' }}
 
       Environment Configuration:
+      {% if app_secrets_projected | default(false) %}
+        • hugging_token: read from OpenBao erag/user/hf-token (checked once the store is opened)
+      {% else %}
         • hugging_token: {{ 'SET' if hugging_token is defined and hugging_token != '' else 'NOT SET (ensure models are publicly available)' }}
+      {% endif %}
 
       Proxy Configuration:
       {% if http_proxy is defined and http_proxy != '' %}

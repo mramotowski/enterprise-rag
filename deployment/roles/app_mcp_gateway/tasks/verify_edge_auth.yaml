@@ -7,105 +7,130 @@
 # route can reject valid tokens while the JWT filter still holds a JWKS fetched before the
 # realm's current signing keys existed - the pod, route and policies all look healthy
 # meanwhile, so nothing else catches it. The wait outlasts one JWKS cache cycle.
-# The check runs from the installer host, which is where an agent sits. A host that cannot
-# resolve the deployment domain reports that and moves on instead of failing the install,
-# since the deployment itself is fine in that case.
+# Two modes, by where the agent client credentials may go:
+# - Local Secrets (app_secrets_projected false): the check runs from the installer host,
+#   which is where an agent sits. A host that cannot resolve the deployment domain reports
+#   that and moves on instead of failing the install, since the deployment itself is fine
+#   in that case.
+# - Projected Secrets (app_secrets_projected true): secret values must not transit the
+#   installer host or Ansible facts (ARCHITECTURE-SPINE AD-3, AD-11), so reading the
+#   Secret here is not allowed. verify_edge_auth_job.yaml runs the same check as a Job
+#   next to the Secret, sending the edge hostnames to the Envoy gateway Service so the
+#   requests still take the agent's path; the verdict and messages are the same.
+# app_secrets_projected is set by any app_secrets port op earlier in the run; a run
+# that had none (validate, install app_mcp_gateway --only) gets it from the
+# configuration-only preflight, so it never falls back to the host path by default.
 
-- name: "app_mcp_gateway | Read the agent client credentials"
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: Secret
-    name: "{{ credentials_secret_name }}"
-    namespace: "{{ keycloak_namespace }}"
-  register: _mcp_credentials
-  no_log: "{{ secure_logs }}"
+- name: "app_mcp_gateway | Determine the credential delivery mode"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+  vars:
+    configuration_issues: []
+  when: app_secrets_projected is not defined
 
-- name: "app_mcp_gateway | Assert the agent client credentials exist"
-  ansible.builtin.assert:
-    that:
-      - _mcp_credentials.resources | default([]) | length > 0
-      - "'MCP_CLIENT_ID' in _mcp_credentials.resources[0].data"
-      - "'MCP_CLIENT_SECRET' in _mcp_credentials.resources[0].data"
-    fail_msg: >-
-      Secret '{{ keycloak_namespace }}/{{ credentials_secret_name }}' carries no
-      MCP_CLIENT_ID / MCP_CLIENT_SECRET, so no agent can obtain a token for the MCP
-      gateway. Re-run app_keycloak_config with mcp_enabled: true.
-    success_msg: "app_mcp_gateway agent client: OK"
-    quiet: true
+- name: "app_mcp_gateway | Verify edge auth from the cluster (projected Secrets)"
+  ansible.builtin.include_tasks: verify_edge_auth_job.yaml
+  when: app_secrets_projected | default(false) | bool
 
-- name: "app_mcp_gateway | Obtain an agent access token"
-  ansible.builtin.uri:
-    url: "{{ mcp_jwt_issuer }}/protocol/openid-connect/token"
-    method: POST
-    body_format: form-urlencoded
-    body:
-      grant_type: client_credentials
-      client_id: "{{ _mcp_credentials.resources[0].data['MCP_CLIENT_ID'] | b64decode }}"
-      client_secret: "{{ _mcp_credentials.resources[0].data['MCP_CLIENT_SECRET'] | b64decode }}"
-    # The edge serves a self-signed certificate by default, and the token never leaves
-    # the local network: what is under test is the JWT verdict, not the chain.
-    validate_certs: false
-    use_proxy: false
-    timeout: 15
-  register: _mcp_token
-  failed_when: false
-  no_log: "{{ secure_logs }}"
-
-- name: "app_mcp_gateway | Report a token endpoint that is not reachable from this host"
-  ansible.builtin.debug:
-    msg: >-
-      Skipping the MCP edge auth check: no token from {{ mcp_jwt_issuer }}
-      (HTTP {{ _mcp_token.status | default('no response') }}). Resolve
-      '{{ erag_keycloak_domain_name }}' from this host to enable it.
-  when: _mcp_token.json.access_token is not defined
-
-- name: "app_mcp_gateway | Verify the edge accepts the agent token"
-  when: _mcp_token.json.access_token is defined
+- name: "app_mcp_gateway | Verify edge auth from this host"
+  when: not (app_secrets_projected | default(false) | bool)
   block:
-    - name: "app_mcp_gateway | Note that early 401s are expected"
-      ansible.builtin.debug:
-        msg: >-
-          Probing {{ mcp_resource_url }} with an agent token. 401 retries below are
-          expected until the gateway picks up the realm's signing keys (up to
-          {{ mcp_jwks_cache_duration }} after the route is programmed).
+    - name: "app_mcp_gateway | Read the agent client credentials"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ credentials_secret_name }}"
+        namespace: "{{ keycloak_namespace }}"
+      register: _mcp_credentials
+      no_log: "{{ secure_logs }}"
 
-    - name: "app_mcp_gateway | Wait until the edge accepts an agent token"
+    - name: "app_mcp_gateway | Assert the agent client credentials exist"
+      ansible.builtin.assert:
+        that:
+          - _mcp_credentials.resources | default([]) | length > 0
+          - "'MCP_CLIENT_ID' in _mcp_credentials.resources[0].data"
+          - "'MCP_CLIENT_SECRET' in _mcp_credentials.resources[0].data"
+        fail_msg: >-
+          Secret '{{ keycloak_namespace }}/{{ credentials_secret_name }}' carries no
+          MCP_CLIENT_ID / MCP_CLIENT_SECRET, so no agent can obtain a token for the MCP
+          gateway. Re-run app_keycloak_config with mcp_enabled: true.
+        success_msg: "app_mcp_gateway agent client: OK"
+        quiet: true
+
+    - name: "app_mcp_gateway | Obtain an agent access token"
       ansible.builtin.uri:
-        url: "{{ mcp_resource_url }}/"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ _mcp_token.json.access_token }}"
-        # 404 is the success signal: the JWT filter admitted the request and the service
-        # has no handler on the bare prefix. 401/403 is Envoy rejecting the token.
-        status_code: [200, 401, 403, 404]
+        url: "{{ mcp_jwt_issuer }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: client_credentials
+          client_id: "{{ _mcp_credentials.resources[0].data['MCP_CLIENT_ID'] | b64decode }}"
+          client_secret: "{{ _mcp_credentials.resources[0].data['MCP_CLIENT_SECRET'] | b64decode }}"
+        # The edge serves a self-signed certificate by default, and the token never leaves
+        # the local network: what is under test is the JWT verdict, not the chain.
         validate_certs: false
         use_proxy: false
-        timeout: 10
-      register: _mcp_edge_auth
-      until: _mcp_edge_auth.status | default(-1) | int not in [401, 403]
-      retries: "{{ mcp_edge_auth_retries }}"
-      delay: "{{ mcp_edge_auth_delay }}"
+        timeout: 15
+      register: _mcp_token
       failed_when: false
       no_log: "{{ secure_logs }}"
 
-    - name: "app_mcp_gateway | Report an edge that is not reachable from this host"
+    - name: "app_mcp_gateway | Report a token endpoint that is not reachable from this host"
       ansible.builtin.debug:
         msg: >-
-          Skipping the MCP edge auth check: {{ mcp_resource_url }} is not reachable from
-          this host. Resolve '{{ ui_domain_name }}' from this host to enable it.
-      when: _mcp_edge_auth.status | default(-1) | int < 0
+          Skipping the MCP edge auth check: no token from {{ mcp_jwt_issuer }}
+          (HTTP {{ _mcp_token.status | default('no response') }}). Resolve
+          '{{ erag_keycloak_domain_name }}' from this host to enable it.
+      when: _mcp_token.json.access_token is not defined
 
-    - name: "app_mcp_gateway | Assert the edge accepts an agent token"
-      ansible.builtin.assert:
-        that: _mcp_edge_auth.status | int not in [401, 403]
-        fail_msg: >-
-          The edge rejected a freshly issued agent token with
-          HTTP {{ _mcp_edge_auth.status }} for
-          {{ mcp_edge_auth_retries | int * mcp_edge_auth_delay | int }}s, which is longer
-          than the JWKS cache. Check
-          'kubectl -n {{ envoy_gateway_namespace }} logs -l
-          gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }} -c envoy
-          | grep -i jwks'; deleting those pods forces a refetch.
-        success_msg: "app_mcp_gateway edge auth: agent token accepted"
-        quiet: true
-      when: _mcp_edge_auth.status | default(-1) | int > 0
+    - name: "app_mcp_gateway | Verify the edge accepts the agent token"
+      when: _mcp_token.json.access_token is defined
+      block:
+        - name: "app_mcp_gateway | Note that early 401s are expected"
+          ansible.builtin.debug:
+            msg: >-
+              Probing {{ mcp_resource_url }} with an agent token. 401 retries below are
+              expected until the gateway picks up the realm's signing keys (up to
+              {{ mcp_jwks_cache_duration }} after the route is programmed).
+
+        - name: "app_mcp_gateway | Wait until the edge accepts an agent token"
+          ansible.builtin.uri:
+            url: "{{ mcp_resource_url }}/"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ _mcp_token.json.access_token }}"
+            # 404 is the success signal: the JWT filter admitted the request and the service
+            # has no handler on the bare prefix. 401/403 is Envoy rejecting the token.
+            status_code: [200, 401, 403, 404]
+            validate_certs: false
+            use_proxy: false
+            timeout: 10
+          register: _mcp_edge_auth
+          until: _mcp_edge_auth.status | default(-1) | int not in [401, 403]
+          retries: "{{ mcp_edge_auth_retries }}"
+          delay: "{{ mcp_edge_auth_delay }}"
+          failed_when: false
+          no_log: "{{ secure_logs }}"
+
+        - name: "app_mcp_gateway | Report an edge that is not reachable from this host"
+          ansible.builtin.debug:
+            msg: >-
+              Skipping the MCP edge auth check: {{ mcp_resource_url }} is not reachable from
+              this host. Resolve '{{ ui_domain_name }}' from this host to enable it.
+          when: _mcp_edge_auth.status | default(-1) | int < 0
+
+        - name: "app_mcp_gateway | Assert the edge accepts an agent token"
+          ansible.builtin.assert:
+            that: _mcp_edge_auth.status | int not in [401, 403]
+            fail_msg: >-
+              The edge rejected a freshly issued agent token with
+              HTTP {{ _mcp_edge_auth.status }} for
+              {{ mcp_edge_auth_retries | int * mcp_edge_auth_delay | int }}s, which is longer
+              than the JWKS cache. Check
+              'kubectl -n {{ envoy_gateway_namespace }} logs -l
+              gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }} -c envoy
+              | grep -i jwks'; deleting those pods forces a refetch.
+            success_msg: "app_mcp_gateway edge auth: agent token accepted"
+            quiet: true
+          when: _mcp_edge_auth.status | default(-1) | int > 0

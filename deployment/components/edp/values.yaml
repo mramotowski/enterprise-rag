@@ -13,6 +13,14 @@ global:
 
 pipelineNamespace: "chatqna"
 
+# true: the Secrets of this chart (edp-access-secret, edp-postgresql-secret,
+# edp-redis-secret, edp-celery-secrets, edp-aws-access-secrets) are managed
+# outside Helm with the same names and keys (ESO projections,
+# secrets_backend: openbao); the chart then templates none of them and the
+# credential values below stay empty. Consumers reference them by these
+# fixed names.
+externalSecrets: false
+
 # Replica count of the embedding model served by Enterprise Inference. Supplied
 # by the app_edp role; drives MAX_NEW_WORKERS and CELERY_BATCH_SIZE.
 embeddingReplicas: 1

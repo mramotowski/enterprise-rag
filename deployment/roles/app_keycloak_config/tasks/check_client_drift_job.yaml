@@ -1,0 +1,212 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Client secret drift check with projected Secrets (ARCHITECTURE-SPINE AD-3, AD-11):
+# files/check_client_drift.py runs as a Job in the Keycloak namespace
+# (templates/client-drift-job.yaml.j2), reads the Keycloak admin credentials and the
+# projected client secrets from env (secretKeyRef), compares in the pod and prints one
+# verdict per client. The values never reach this host.
+# Included from check_client_drift.yaml when app_secrets_projected is true.
+
+- name: "app_keycloak_config | Drift Job | Set the clients to compare"
+  ansible.builtin.set_fact:
+    # env: the Job variable that carries the projected value; id: the OpenBao entry.
+    _kc_drift_clients: >-
+      {{ ([{'client_id': mcp_keycloak_client_id, 'realm': erag_keycloak_realm, 'env': 'PROJECTED_MCP_CLIENT',
+            'secret': credentials_secret_name | default('erag-credentials'), 'key': 'MCP_CLIENT_SECRET', 'id': 'keycloak/mcp-client'}]
+          if mcp_enabled | default(false) | bool else [])
+         + [{'client_id': 'grafana-oauth', 'realm': grafana_oauth_realm | default(erag_keycloak_realm),
+             'env': 'PROJECTED_GRAFANA_OAUTH', 'secret': 'keycloak-configurator-sensitive',
+             'key': 'grafana-oauth-client-secret', 'id': 'keycloak/grafana-oauth'},
+            {'client_id': edp_client_id | default('EnterpriseRAG-oidc-minio'), 'realm': erag_keycloak_realm,
+             'env': 'PROJECTED_EDP_OIDC', 'secret': 'keycloak-configurator-sensitive',
+             'key': 'edp-oidc-client-secret', 'id': 'keycloak/edp-oidc'}] }}
+    _kc_drift_job_name: >-
+      keycloak-client-drift-{{ (erag_keycloak_realm ~ now(utc=true).isoformat()) | hash('sha1') | truncate(10, true, '') }}
+    _kc_drift_poll_delay: 5
+
+- name: "app_keycloak_config | Drift Job | Run the check"
+  block:
+    - name: "app_keycloak_config | Drift Job | Find previous runs"
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        namespace: "{{ keycloak_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/part-of=erag-keycloak-config"
+          - "app.kubernetes.io/component=client-drift-check"
+      loop:
+        - {api_version: batch/v1, kind: Job}
+        - {api_version: v1, kind: ConfigMap}
+      loop_control:
+        label: "{{ item.kind }}"
+      register: _kc_drift_old_runs
+
+    - name: "app_keycloak_config | Drift Job | Delete previous runs"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.apiVersion | default('v1') }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ keycloak_namespace }}"
+        delete_options:
+          propagationPolicy: Background
+      loop: "{{ _kc_drift_old_runs.results | map(attribute='resources') | map('default', []) | flatten }}"
+      loop_control:
+        label: "{{ item.kind }} {{ item.metadata.name }}"
+
+    - name: "app_keycloak_config | Drift Job | Start the Job"
+      block:
+        - name: "app_keycloak_config | Drift Job | Create a private render directory"
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: kc_client_drift_job_
+          register: _kc_drift_dir
+
+        # Rendered to a file and applied with src: the script is applied verbatim,
+        # never re-read as a template.
+        - name: "app_keycloak_config | Drift Job | Render the Job"
+          ansible.builtin.template:
+            src: client-drift-job.yaml.j2
+            dest: "{{ _kc_drift_dir.path }}/client-drift-job.yaml"
+            mode: "0600"
+
+        - name: "app_keycloak_config | Drift Job | Apply the Job"
+          kubernetes.core.k8s:
+            state: present
+            src: "{{ _kc_drift_dir.path }}/client-drift-job.yaml"
+            wait: false
+
+      always:
+        - name: "app_keycloak_config | Drift Job | Remove the render directory"
+          ansible.builtin.file:
+            path: "{{ _kc_drift_dir.path }}"
+            state: absent
+          when: _kc_drift_dir.path is defined
+
+    - name: "app_keycloak_config | Drift Job | Wait for the Job"
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ _kc_drift_job_name }}"
+        namespace: "{{ keycloak_namespace }}"
+      register: _kc_drift_job
+      # Done: a pod succeeded or failed, or the Job has a Failed condition (e.g.
+      # DeadlineExceeded with no pod ever started).
+      until: >-
+        (_kc_drift_job.resources | default([]) | length > 0) and
+        ((_kc_drift_job.resources[0].status.succeeded | default(0) | int) >= 1 or
+         (_kc_drift_job.resources[0].status.failed | default(0) | int) >= 1 or
+         (_kc_drift_job.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Failed') | selectattr('status', 'equalto', 'True') | list | length > 0))
+      retries: "{{ ((keycloak_drift_job_timeout | int) / (_kc_drift_poll_delay | int)) | round(0, 'ceil') | int + 2 }}"
+      delay: "{{ _kc_drift_poll_delay | int }}"
+      failed_when: false
+
+    - name: "app_keycloak_config | Drift Job | Read the Job log"
+      kubernetes.core.k8s_log:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ _kc_drift_job_name }}"
+        namespace: "{{ keycloak_namespace }}"
+      register: _kc_drift_log
+      failed_when: false
+      no_log: true
+
+    # The script prints exactly one JSON object; nothing else is expected in the log.
+    - name: "app_keycloak_config | Drift Job | Parse the result"
+      ansible.builtin.set_fact:
+        _kc_drift_result: "{{ (_lines | last | default('{}')) | from_json }}"
+      vars:
+        _lines: >-
+          {{ _kc_drift_log.log_lines | default([]) | select('string')
+             | select('match', '^[{].*\"admin_login\": *(true|false)') | list }}
+
+  always:
+    - name: "app_keycloak_config | Drift Job | Delete the Job"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ _kc_drift_job_name }}"
+        namespace: "{{ keycloak_namespace }}"
+        delete_options:
+          propagationPolicy: Background
+      loop:
+        - {api_version: batch/v1, kind: Job}
+        - {api_version: v1, kind: ConfigMap}
+      loop_control:
+        label: "{{ item.kind }}"
+
+- name: "app_keycloak_config | Drift Job | Report the result"
+  vars:
+    _res: "{{ _kc_drift_result | default({}) }}"
+    _states: "{{ _res.clients | default({}) }}"
+    _by_client: "{{ _kc_drift_clients | items2dict(key_name='client_id', value_name='key') }}"
+    _ids: "{{ _kc_drift_clients | items2dict(key_name='client_id', value_name='id') }}"
+    _drifted: "{{ _states | dict2items | selectattr('value', 'equalto', 'drift') | map(attribute='key') | list }}"
+  block:
+    - name: "app_keycloak_config | Report a drift Job that gave no result"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Keycloak client secret drift check NOT done: Job
+          {{ keycloak_namespace }}/{{ _kc_drift_job_name }} {{ _what }}
+          (image {{ keycloak_drift_job_image }}). The image must be pullable in the
+          cluster; the Job never logs a secret.
+      vars:
+        _status: "{{ (_kc_drift_job.resources | default([]) | first | default({})).status | default({}) }}"
+        _failed: >-
+          {{ _status.conditions | default([]) | selectattr('type', 'equalto', 'Failed')
+             | selectattr('status', 'equalto', 'True') | first | default({}) }}
+        _what: >-
+          {{ ('failed (' ~ _failed.reason | default('') ~ ': ' ~ _failed.message | default('') ~ ')')
+             if _failed.reason is defined
+             else ('did not finish within ' ~ keycloak_drift_job_timeout ~ 's'
+                   if (_status.succeeded | default(0) | int) == 0 and (_status.failed | default(0) | int) == 0
+                   else 'printed no result line') }}
+      when: _res.admin_login is not defined or _res.error | default(false) | bool
+
+    - name: "app_keycloak_config | Report a failed Keycloak admin login"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Keycloak client secret drift check NOT done: the admin login at
+          {{ keycloak_drift_keycloak_url }} (realm master, admin-cli) with Secret
+          '{{ keycloak_namespace }}/{{ keycloak_admin_secret_name }}' failed, so the
+          client secrets in Keycloak could not be read.
+      when:
+        - _res.admin_login is defined
+        - not (_res.admin_login | bool)
+        - not (_res.error | default(false) | bool)
+
+    - name: "app_keycloak_config | Report clients the drift check could not compare"
+      ansible.builtin.debug:
+        msg: >-
+          Keycloak client '{{ item.key }}' not compared: {{ _why[item.value] | default(item.value) }}
+      vars:
+        _why:
+          no_projection: >-
+            no projected value (key '{{ _by_client[item.key] | default('?') }}' absent from its
+            Secret in {{ keycloak_namespace }}; expected when that feature is off).
+          not_in_keycloak: "the client does not exist in its realm."
+          error: "the Keycloak admin API call failed."
+      loop: "{{ _states | dict2items | rejectattr('value', 'in', ['match', 'drift']) | list }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "app_keycloak_config | Assert Keycloak client secrets match OpenBao"
+      ansible.builtin.assert:
+        that: _drifted | length == 0
+        fail_msg: >-
+          Keycloak holds another client secret than OpenBao for: {{ _drifted | join(', ') }}
+          (e.g. regenerated in the Keycloak admin console). Services using these clients
+          fail to authenticate although the projections are SecretSynced. Run install erag
+          (or rotate the id: {{ _drifted | map('extract', _ids) | join(', ') }}) to re-apply
+          the OpenBao value.
+        success_msg: >-
+          app_keycloak_config client secrets: {{ _states | dict2items | selectattr('value', 'equalto', 'match')
+          | map(attribute='key') | join(', ') or 'none compared' }} match OpenBao
+        quiet: true
+      when:
+        - _res.admin_login | default(false) | bool
+        - not (_res.error | default(false) | bool)

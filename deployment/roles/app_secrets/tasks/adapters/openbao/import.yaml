@@ -1,0 +1,392 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: import (AD-12 migration of a local-mode env). app_pre_install
+# runs it after probe and before any ensure, on every openbao run; the work is
+# done once per env:
+#   1. setup (worker namespace, ServiceAccount, CA bundle);
+#   2. the migration state (ConfigMap app_secrets_migration_configmap in the
+#      worker namespace): native (nothing was local) or done (finalized) ->
+#      nothing to do;
+#   3. the importer plan from the registry: for each selected credential the
+#      legacy Secret keys of each KV key (legacy[].secret, import_enabled),
+#      whether it must import (import_required), the Secrets to hand over to
+#      ESO (every registry projection target and legacy Secret) and the
+#      Secrets to unmark (legacy markup: true, and the platform: entries);
+#   4. the importer's ServiceAccount, and a Role + RoleBinding in each existing
+#      namespace of the plan, limited by resourceNames to the planned Secrets
+#      (get + patch; platform Secrets: patch only);
+#   5. one importer Job (templates/importer-job.yaml.j2, files/secrets_importer.py):
+#      it reads the legacy Secrets in-cluster, writes each credential with
+#      cas=0 (an existing other value is a conflict), then annotates the
+#      Helm-managed Secrets helm.sh/resource-policy: keep (the upgrade that
+#      stops templating them keeps them, and their ExternalSecret adopts them
+#      with the same values) and removes the local markup;
+#   6. always: the Roles, RoleBindings and the ServiceAccount are deleted;
+#   7. the migration state: imported when the env had legacy Secrets or local
+#      credential files (finalize scrubs them), else native.
+# No value reaches Ansible: neither the Secrets nor the files are read here.
+
+---
+- name: "app_secrets | import | openbao | Set up the worker namespace"
+  ansible.builtin.include_tasks: setup.yaml
+  vars:
+    app_secrets_op: import
+
+- name: "app_secrets | import | openbao | Read the migration state"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ app_secrets_migration_configmap }}"
+    namespace: "{{ app_secrets_worker_namespace }}"
+  register: _app_secrets_migration
+  no_log: true
+
+- name: "app_secrets | import | openbao | Note the migration state"
+  ansible.builtin.set_fact:
+    _app_secrets_migration_state: "{{ _data.state | default('') }}"
+    _app_secrets_migration_started: "{{ _data.started | default('') }}"
+    _app_secrets_migration_helm: "{{ _data.helm_revisions | default('') }}"
+  vars:
+    _data: "{{ (_app_secrets_migration.resources | default([]) | first | default({})).data | default({}, true) }}"
+
+- name: "app_secrets | import | openbao | Nothing to import"
+  ansible.builtin.debug:
+    msg: >-
+      app_secrets | import | migration state '{{ _app_secrets_migration_state }}'
+      ({{ app_secrets_worker_namespace }}/{{ app_secrets_migration_configmap }}):
+      {{ 'the env never held local credentials' if _app_secrets_migration_state == 'native'
+         else 'the local credentials were imported and scrubbed' }}; nothing to do
+  when: _app_secrets_migration_state in ['native', 'done']
+
+- name: "app_secrets | import | openbao | Import"
+  when: _app_secrets_migration_state not in ['native', 'done']
+  block:
+    - name: "app_secrets | import | openbao | Look for the local credential files"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      loop:
+        - "{{ app_secrets_local_password_file | trim }}"
+        - "{{ app_secrets_local_txt_file | trim }}"
+      register: _app_secrets_local_files
+
+    # Its own task: Jinja config refs in the secrets: keys are resolved by this
+    # top-level dict2items (as in projections.yaml).
+    - name: "app_secrets | import | openbao | Resolve the registry Secret keys"
+      ansible.builtin.set_fact:
+        _app_secrets_secret_entries: "{{ app_secrets_registry.secrets | dict2items }}"
+      no_log: true
+
+    - name: "app_secrets | import | openbao | Build the importer plan"
+      ansible.builtin.set_fact:
+        _app_secrets_import_entries: "{{ _entries }}"
+        _app_secrets_import_handover: "{{ _handover }}"
+        _app_secrets_import_unmark: "{{ _unmark }}"
+        _app_secrets_import_platform: "{{ _platform }}"
+      vars:
+        _cid: "{{ app_secrets_openbao_cluster_id }}"
+        # Selected credentials with at least one legacy Secret item.
+        _entries: >-
+          {%- set out = [] -%}
+          {%- for cid in app_secrets_selected_ids -%}
+            {%- set e = app_secrets_catalog[cid] -%}
+            {%- set items = e.legacy | default([], true) | selectattr('secret', 'mapping') | selectattr('kv_key', 'string')
+                            | list -%}
+            {%- if items | length > 0 -%}
+              {%- set keys = {} -%}
+              {%- for k in e['keys'] -%}
+                {%- set refs = [] -%}
+                {%- for i in items if i.kv_key == k and (i.import_enabled | default(true) | bool) -%}
+                  {%- set _ = refs.append({'namespace': i.secret.namespace | string, 'name': i.secret.name | string,
+                                           'key': i.secret.key | string}) -%}
+                {%- endfor -%}
+                {%- set _ = keys.update({k: refs}) -%}
+              {%- endfor -%}
+              {%- set _ = out.append({'id': cid, 'path': _cid ~ '/' ~ e.path,
+                                      'required': e.import_required | default(false) | bool, 'keys': keys}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        _legacy_secrets: >-
+          {%- set out = [] -%}
+          {%- for e in _entries -%}
+            {%- for refs in e['keys'].values() -%}
+              {%- for r in refs -%}
+                {%- set _ = out.append({'namespace': r.namespace, 'name': r.name}) -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+        # Every registry projection target (whatever its `enabled`) and every
+        # legacy Secret: the importer adds keep only to those Helm manages.
+        _handover: >-
+          {%- set out = _legacy_secrets | list -%}
+          {%- for s in _app_secrets_secret_entries -%}
+            {%- set ns_name = s.key.split('/', 1) -%}
+            {%- set _ = out.append({'namespace': ns_name[0], 'name': ns_name[1]}) -%}
+          {%- endfor -%}
+          {{ out | unique | sort(attribute='namespace,name') }}
+        _platform: >-
+          {%- set out = [] -%}
+          {%- for p in app_secrets_platform_catalog.values() -%}
+            {%- for i in p.legacy | default([], true) if i.secret is mapping and i.secret.markup | default(false) | bool -%}
+              {%- set _ = out.append({'namespace': i.secret.namespace | string, 'name': i.secret.name | string}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique | list }}
+        _unmark: >-
+          {%- set out = _platform | list -%}
+          {%- for cid in app_secrets_selected_ids -%}
+            {%- for i in app_secrets_catalog[cid].legacy | default([], true)
+                  if i.secret is mapping and i.secret.markup | default(false) | bool -%}
+              {%- set _ = out.append({'namespace': i.secret.namespace | string, 'name': i.secret.name | string}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique | sort(attribute='namespace,name') }}
+      no_log: true
+
+    - name: "app_secrets | import | openbao | Look up the namespaces of the plan"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+      loop: "{{ (_app_secrets_import_handover + _app_secrets_import_unmark) | map(attribute='namespace') | unique | sort }}"
+      register: _app_secrets_import_ns
+      no_log: true
+
+    # Secrets in a namespace that does not exist are simply not there: they
+    # leave the plan (and the Role of a missing namespace is never created).
+    - name: "app_secrets | import | openbao | Keep the existing namespaces"
+      ansible.builtin.set_fact:
+        app_secrets_importer_plan:
+          mount: "{{ app_secrets_openbao_kv_mount }}"
+          entries: >-
+            {%- set out = [] -%}
+            {%- for e in _app_secrets_import_entries -%}
+              {%- set keys = {} -%}
+              {%- for k, refs in e['keys'].items() -%}
+                {%- set _ = keys.update({k: refs | selectattr('namespace', 'in', _existing) | list}) -%}
+              {%- endfor -%}
+              {%- set _ = out.append(e | combine({'keys': keys})) -%}
+            {%- endfor -%}
+            {{ out }}
+          handover: "{{ _app_secrets_import_handover | selectattr('namespace', 'in', _existing) | list }}"
+          unmark: "{{ _app_secrets_import_unmark | selectattr('namespace', 'in', _existing) | list }}"
+          markup_label: "{{ app_secrets_markup_label }}"
+          markup_annotation: "{{ app_secrets_markup_annotation }}"
+        _app_secrets_import_rbac: >-
+          {%- set out = [] -%}
+          {%- for ns in _existing -%}
+            {%- set pnames = _app_secrets_import_platform | selectattr('namespace', 'equalto', ns) | map(attribute='name') | list -%}
+            {%- set erag = (_app_secrets_import_handover | selectattr('namespace', 'equalto', ns) | map(attribute='name') | list
+                            + _app_secrets_import_unmark | selectattr('namespace', 'equalto', ns)
+                              | map(attribute='name') | reject('in', pnames) | list) | unique | sort -%}
+            {%- set platform = pnames | reject('in', erag) | unique | sort -%}
+            {%- set rules = [] -%}
+            {%- if erag | length > 0 -%}
+              {%- set _ = rules.append({'apiGroups': [''], 'resources': ['secrets'], 'verbs': ['get', 'patch'], 'resourceNames': erag}) -%}
+            {%- endif -%}
+            {%- if platform | length > 0 -%}
+              {%- set _ = rules.append({'apiGroups': [''], 'resources': ['secrets'], 'verbs': ['patch'], 'resourceNames': platform}) -%}
+            {%- endif -%}
+            {%- if rules | length > 0 -%}
+              {%- set _ = out.append({'namespace': ns, 'rules': rules}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      vars:
+        _existing: >-
+          {{ _app_secrets_import_ns.results | selectattr('resources', 'defined')
+             | selectattr('resources') | map(attribute='item') | list }}
+      no_log: true
+
+    - name: "app_secrets | import | openbao | Run the importer"
+      block:
+        - name: "app_secrets | import | openbao | Create the importer ServiceAccount"
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: "{{ app_secrets_importer_sa }}"
+                namespace: "{{ app_secrets_worker_namespace }}"
+                labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/component: importer}
+              automountServiceAccountToken: false
+          no_log: true
+
+        - name: "app_secrets | import | openbao | Grant the importer the planned Secrets"
+          kubernetes.core.k8s:
+            state: present
+            apply: true
+            definition:
+              - apiVersion: rbac.authorization.k8s.io/v1
+                kind: Role
+                metadata:
+                  name: "{{ app_secrets_importer_rbac_name }}"
+                  namespace: "{{ item.namespace }}"
+                  labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/component: importer}
+                rules: "{{ item.rules }}"
+              - apiVersion: rbac.authorization.k8s.io/v1
+                kind: RoleBinding
+                metadata:
+                  name: "{{ app_secrets_importer_rbac_name }}"
+                  namespace: "{{ item.namespace }}"
+                  labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/component: importer}
+                roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: "{{ app_secrets_importer_rbac_name }}"}
+                subjects:
+                  - {kind: ServiceAccount, name: "{{ app_secrets_importer_sa }}", namespace: "{{ app_secrets_worker_namespace }}"}
+          loop: "{{ _app_secrets_import_rbac }}"
+          loop_control:
+            label: "{{ item.namespace }}"
+          no_log: true
+
+        - name: "app_secrets | import | openbao | Run the importer Job"
+          ansible.builtin.include_tasks: run_worker.yaml
+          vars:
+            app_secrets_op: import
+            app_secrets_worker_op: import
+            app_secrets_worker_plan: "{{ _app_secrets_import_entries | map(attribute='id') | list }}"
+            app_secrets_job_template: importer-job.yaml.j2
+            app_secrets_job_component: importer
+
+      always:
+        - name: "app_secrets | import | openbao | Remove the importer's RoleBindings and Roles"
+          kubernetes.core.k8s:
+            state: absent
+            api_version: rbac.authorization.k8s.io/v1
+            kind: "{{ item.1 }}"
+            name: "{{ app_secrets_importer_rbac_name }}"
+            namespace: "{{ item.0.namespace }}"
+          loop: "{{ _app_secrets_import_rbac | product(['RoleBinding', 'Role']) | list }}"
+          loop_control:
+            label: "{{ item.1 }} {{ item.0.namespace }}"
+          no_log: true
+
+        - name: "app_secrets | import | openbao | Remove the importer ServiceAccount"
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: ServiceAccount
+            name: "{{ app_secrets_importer_sa }}"
+            namespace: "{{ app_secrets_worker_namespace }}"
+          no_log: true
+
+    - name: "app_secrets | import | openbao | Fail when OpenBao is not usable"
+      ansible.builtin.include_tasks: probe_fail.yaml
+      vars:
+        app_secrets_op: import
+        app_secrets_openbao_worker_role: "{{ app_secrets_openbao_importer_role }}"
+        app_secrets_worker_sa: "{{ app_secrets_importer_sa }}"
+
+    - name: "app_secrets | import | openbao | Fail on credentials or Secrets that could not be imported"
+      ansible.builtin.fail:
+        msg: >-
+          app_secrets | import | {{ _bad | join('; ') if _bad | length > 0
+          else 'the importer failed: ' ~ (app_secrets_worker_result.done.error | default('no result')) }}.
+          {{ 'Nothing was written to OpenBao'
+             if (app_secrets_worker_result.credentials.values() | selectattr('result', 'in', ['created']) | list | length == 0)
+             else 'Entries reported created hold the running values' }};
+          {{ ('Secrets already patched: ' ~ (_patched | join(', '))) if _patched | length > 0 else 'no Secret was changed' }}:
+          the local deployment keeps working. Fix the cause and re-run.
+      vars:
+        _results: "{{ app_secrets_worker_result.credentials }}"
+        _bad: >-
+          {%- set bad = [] -%}
+          {%- for e in _app_secrets_import_entries -%}
+            {%- set r = _results[e.id] | default(none) -%}
+            {%- if r is none -%}
+              {%- set _ = bad.append(e.id ~ ': no result from the importer') -%}
+            {%- elif r.result not in ['created', 'exists', 'absent']
+                     and not (r.error | default('')).startswith('not written:') -%}
+              {%- set _ = bad.append(e.id ~ ' (' ~ app_secrets_openbao_kv_mount ~ '/' ~ e.path ~ '): '
+                                     ~ r.result ~ ((' - ' ~ r.error) if r.error else '')) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for s in app_secrets_worker_result.secrets | default([]) if s.result == 'error' -%}
+            {%- set _ = bad.append('Secret ' ~ s.namespace ~ '/' ~ s.name ~ ' (' ~ s.action ~ '): ' ~ s.error) -%}
+          {%- endfor -%}
+          {{ bad }}
+        _patched: >-
+          {%- set out = [] -%}
+          {%- for s in app_secrets_worker_result.secrets | default([]) if s.result == 'patched' -%}
+            {%- set _ = out.append(s.namespace ~ '/' ~ s.name ~ ' (' ~ s.action ~ ')') -%}
+          {%- endfor -%}
+          {{ out }}
+      when: _bad | length > 0 or (app_secrets_worker_result.done.state | default('')) != 'ok'
+
+    - name: "app_secrets | import | openbao | Report the import"
+      ansible.builtin.debug:
+        msg: >-
+          {{ app_secrets_worker_result.legacy.found | default(0) }} legacy Secret(s) found.
+          Credentials: {{ _creds | join(', ') or 'none' }}.
+          Handed over to ESO (helm.sh/resource-policy: keep): {{ _kept | join(', ') or 'none' }}.
+          Unmarked: {{ _unmarked | join(', ') or 'none' }}.
+      vars:
+        _secrets: "{{ app_secrets_worker_result.secrets | default([]) }}"
+        _creds: >-
+          {%- set out = [] -%}
+          {%- for e in _app_secrets_import_entries -%}
+            {%- set _ = out.append(e.id ~ ' ' ~ (app_secrets_worker_result.credentials[e.id] | default({})).result | default('none')) -%}
+          {%- endfor -%}
+          {{ out }}
+        _kept: >-
+          {%- set out = [] -%}
+          {%- for s in _secrets if s.action == 'keep' and s.result in ['patched', 'unchanged'] -%}
+            {%- set _ = out.append(s.namespace ~ '/' ~ s.name) -%}
+          {%- endfor -%}
+          {{ out }}
+        _unmarked: >-
+          {%- set out = [] -%}
+          {%- for s in _secrets if s.action == 'unmark' and s.result == 'patched' -%}
+            {%- set _ = out.append(s.namespace ~ '/' ~ s.name) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "app_secrets | import | openbao | Note whether the env held local credentials"
+      ansible.builtin.set_fact:
+        _app_secrets_had_local: >-
+          {{ (app_secrets_worker_result.legacy.found | default(0) | int) > 0
+             or (_app_secrets_local_files.results | map(attribute='stat.exists') | select | list | length > 0) }}
+
+    # Once per env, at the first import: finalize reaches done only when every
+    # erag release has a deployed revision newer than these.
+    - name: "app_secrets | import | openbao | List the erag Helm releases before their upgrade"
+      ansible.builtin.include_tasks: helm_releases.yaml
+      vars:
+        app_secrets_op: import
+      when:
+        - _app_secrets_had_local | bool
+        - _app_secrets_migration_helm | length == 0
+
+    - name: "app_secrets | import | openbao | Record the migration state"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ app_secrets_migration_configmap }}"
+            namespace: "{{ app_secrets_worker_namespace }}"
+            labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/component: migration}
+          data:
+            state: "{{ 'imported' if _app_secrets_had_local | bool else 'native' }}"
+            started: "{{ _app_secrets_migration_started or now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+            legacy_secrets_found: "{{ app_secrets_worker_result.legacy.found | default(0) | string }}"
+            # "<namespace>/<release>=<revision>,..." ("-" for none).
+            helm_revisions: >-
+              {{ _app_secrets_migration_helm if _app_secrets_migration_helm | length > 0
+                 else ((_app_secrets_erag_releases | default([])) | map(attribute='namespace')
+                       | zip((_app_secrets_erag_releases | default([])) | map(attribute='name')) | map('join', '/')
+                       | zip((_app_secrets_erag_releases | default([])) | map(attribute='revision') | map('string'))
+                       | map('join', '=') | join(',')) or '-' }}
+
+    - name: "app_secrets | import | openbao | Report the migration state"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Migrated: the store now holds the running values; the local copies are removed after the Helm upgrades of this run (import_phase finalize).'
+             if _app_secrets_had_local | bool
+             else 'No local credentials: nothing to migrate (fresh install).' }}

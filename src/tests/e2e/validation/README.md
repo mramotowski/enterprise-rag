@@ -30,7 +30,7 @@ To run specific tests that match a name pattern (using a simple regex), use:
 tox -e e2e -- --build-config-file=<build configuration file> --credentials-file=<credentials file> -k <regex>
 ```
 * `<build configuration file>` - full path to `config.yaml` file
-* `<credentials file>` - full path to `default_credentials.txt` file which contains credentials for admin and user
+* `<credentials file>` - full path to `default_credentials.txt` file which contains credentials for admin and user. When neither it nor `$ERAG_LOG_DIR/default_credentials.txt` exists (`secrets_backend: openbao` writes no file), the tests read the same keys (`KEYCLOAK_ERAG_*`, `MCP_CLIENT_*`) from the Secret `keycloak/erag-credentials`, which External Secrets Operator projects from OpenBao. They fail with `CredentialsNotFound`, naming both sources, when neither exists
 * `<regex>` - desired test name you want to run
 
 ## SharePoint Tests

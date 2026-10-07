@@ -1,0 +1,113 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: shared setup, run first by every openbao op (idempotent).
+#   - checks the openbao settings are path-safe;
+#   - reads the CA bundle ConfigMap (ca.crt only) of the platform openbao role
+#     and refuses one that holds a private key;
+#   - creates the worker namespace (labelled for the ClusterSecretStore; marked
+#     as created by app_secrets when it creates it), the worker ServiceAccount
+#     (no token automount, no RBAC) and the CA copy.
+# app_pre_install calls probe first, so this is where the namespace and the
+# ServiceAccount are created before the first worker run.
+# Expects: app_secrets_op.
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Check the openbao settings"
+  ansible.builtin.assert:
+    that:
+      - (app_secrets_openbao_kv_mount | string) is match('^[A-Za-z0-9._-]+$')
+      - (app_secrets_openbao_kv_mount | string) not in ['.', '..']
+      - (app_secrets_openbao_cluster_id | string) is match('^[A-Za-z0-9._-]+$')
+      - (app_secrets_openbao_cluster_id | string) not in ['.', '..']
+      - (app_secrets_openbao_auth_mount | string) is match('^[A-Za-z0-9._-]+$')
+      - (app_secrets_openbao_address | trim) is match('^https://[^\s/]+')
+      - (app_secrets_worker_namespace | string) is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+      - (app_secrets_worker_sa | string) is match('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
+    fail_msg: >-
+      app_secrets | {{ app_secrets_op }} | openbao settings are invalid:
+      openbao_kv_mount '{{ app_secrets_openbao_kv_mount }}', cluster id
+      '{{ app_secrets_openbao_cluster_id }}' (openbao_cluster_id or the env name) and
+      openbao_auth_mount '{{ app_secrets_openbao_auth_mount }}' must be names of
+      [A-Za-z0-9._-] other than . and ..; the OpenBao address
+      '{{ app_secrets_openbao_address | trim }}' must be https:// (openbao_address in
+      external mode); erag_secrets_namespace '{{ app_secrets_worker_namespace }}' and
+      erag_secrets_worker_sa '{{ app_secrets_worker_sa }}' must be DNS-1123 names.
+    quiet: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Read the OpenBao CA bundle"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ app_secrets_openbao_ca_configmap }}"
+    namespace: "{{ app_secrets_openbao_namespace }}"
+  register: _app_secrets_ca_source
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Check the OpenBao CA bundle"
+  ansible.builtin.assert:
+    that:
+      - _ca is string
+      - "'-----BEGIN CERTIFICATE-----' in _ca"
+      - "'PRIVATE KEY' not in _ca"
+    fail_msg: >-
+      app_secrets | {{ app_secrets_op }} | ConfigMap
+      {{ app_secrets_openbao_namespace }}/{{ app_secrets_openbao_ca_configmap }}
+      {{ 'is missing' if (_app_secrets_ca_source.resources | default([]) | length == 0)
+         else ('holds a private key: only the CA certificate (key ca.crt) may be in it'
+               if (_ca is string and 'PRIVATE KEY' in _ca)
+               else 'has no PEM certificate in key ca.crt') }}.
+      The platform openbao component creates it; run the platform install with
+      secrets_backend: openbao first.
+    quiet: true
+  vars:
+    _ca: "{{ ((_app_secrets_ca_source.resources | default([]) | first | default({})).data | default({}))['ca.crt'] | default(none) }}"
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Look up the worker namespace"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ app_secrets_worker_namespace }}"
+  register: _app_secrets_worker_ns
+  no_log: true
+
+# The marker label is set only when this task creates the namespace: the
+# teardown (delete.yaml) deletes the worker namespace only when it carries the
+# marker, because erag_secrets_namespace may name a namespace someone else owns.
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Create the worker namespace"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ app_secrets_worker_namespace }}"
+        labels: >-
+          {{ {app_secrets_namespace_label: 'true'}
+             | combine({} if (_app_secrets_worker_ns.resources | default([]) | length > 0)
+                       else app_secrets_worker_namespace_marker) }}
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Create the worker ServiceAccount and CA bundle"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ item }}"
+  loop:
+    - apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ app_secrets_worker_sa }}"
+        namespace: "{{ app_secrets_worker_namespace }}"
+        labels: {app.kubernetes.io/part-of: erag-secrets}
+      automountServiceAccountToken: false
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ app_secrets_openbao_ca_configmap }}"
+        namespace: "{{ app_secrets_worker_namespace }}"
+        labels: {app.kubernetes.io/part-of: erag-secrets}
+      data:
+        ca.crt: "{{ _app_secrets_ca_source.resources[0].data['ca.crt'] }}"
+  loop_control:
+    label: "{{ item.kind }} {{ item.metadata.name }}"
+  no_log: true

@@ -1,0 +1,164 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+secrets_backend: "local"                           # global (global_config.yaml)
+app_secrets_registry_file: "{{ role_path }}/files/registry.yaml"
+app_secrets_backends: ["local", "openbao"]
+# Backends that deliver the registry Secrets as ESO projections
+# (app_secrets_projected: true).
+app_secrets_projecting_backends: ["openbao"]
+app_secrets_local_mechanisms: ["file_password", "file_key", "role_managed", "user_supplied"]
+# Ops that default to every credential ID when secret_ids is omitted (probe
+# and the config-only preflight; destructive ops such as delete always need an
+# explicit list).
+app_secrets_all_ids_ops: ["probe", "preflight"]
+# ensure: before_deploy (generate, before the consuming release) or
+# after_deploy (local: mark the deployed Secrets, write default_credentials.txt).
+app_secrets_ensure_phases: ["before_deploy", "after_deploy"]
+
+# Local adapter: the same file app_generate_password writes.
+app_secrets_local_password_file: >-
+  {{ password_file | default((rag_log_dir | default(log_dir ~ '/rag')) ~ '/default_credentials.yaml') }}
+# Local adapter: the file app_keycloak_config wrote from erag-credentials.
+app_secrets_local_txt_file: >-
+  {{ (rag_log_dir | default(log_dir ~ '/rag')) ~ '/default_credentials.txt' }}
+
+# --- openbao adapter (secrets_backend: openbao) -------------------------------
+# Global keys from global_config.yaml (enterprise-ai-solutions): openbao_mode,
+# openbao_address, openbao_kv_mount, openbao_cluster_id, openbao_auth_mount,
+# openbao_auth_audience, eso_refresh_interval, erag_secrets_namespace,
+# erag_secrets_worker_sa. The defaults below match the platform openbao and
+# external_secrets roles.
+app_secrets_openbao_layer: "erag"
+# Namespace of the platform openbao role (its Service and its CA bundle).
+app_secrets_openbao_namespace: "{{ openbao_namespace | default('openbao') }}"
+# Internal mode: the chart's active-node Service (a server cert SAN); it has
+# no endpoint while OpenBao is sealed or down. External mode: openbao_address.
+app_secrets_openbao_address: >-
+  {{ (openbao_address | default(''))
+     if (openbao_mode | default('internal')) == 'external'
+     else 'https://openbao-active.' ~ app_secrets_openbao_namespace ~ '.svc:8200' }}
+app_secrets_openbao_kv_mount: "{{ openbao_kv_mount | default('intel-ai') }}"
+app_secrets_openbao_cluster_id: "{{ openbao_cluster_id | default('', true) or env_name | default('') }}"
+app_secrets_openbao_auth_mount: "{{ openbao_auth_mount | default('kubernetes') }}"
+app_secrets_openbao_audience: "{{ openbao_auth_audience | default('vault') }}"
+app_secrets_openbao_worker_role: "{{ app_secrets_openbao_layer }}-secrets-worker"
+app_secrets_openbao_store: "openbao-{{ app_secrets_openbao_layer }}"
+# ConfigMap with key ca.crt (the CA certificate only), created by the platform
+# openbao role in app_secrets_openbao_namespace and copied to the worker namespace.
+app_secrets_openbao_ca_configmap: "openbao-ca-bundle"
+app_secrets_namespace_label: "secrets.ai-solutions/{{ app_secrets_openbao_layer }}"
+# Namespace annotation read by the platform ExternalSecret admission policy:
+# the comma-separated registry paths (relative to <cluster_id>/) whose
+# credentials the namespace's ExternalSecrets may read.
+app_secrets_paths_annotation: "{{ app_secrets_namespace_label }}-paths"
+
+app_secrets_worker_namespace: "{{ erag_secrets_namespace | default('erag-secrets') }}"
+# Set on the worker namespace only when setup creates it; delete (teardown)
+# deletes only a worker namespace that carries it.
+app_secrets_worker_namespace_marker: {"app.kubernetes.io/managed-by": "app_secrets"}
+app_secrets_worker_sa: "{{ erag_secrets_worker_sa | default('erag-secrets-worker') }}"
+# The worker needs the bao CLI and busybox only: the OpenBao server image.
+app_secrets_worker_image: "quay.io/openbao/openbao:2.7.0"
+app_secrets_worker_timeout: 300            # seconds a worker Job may run
+app_secrets_worker_poll_delay: 5
+app_secrets_worker_bao_timeout: "15s"      # per bao call inside the Job
+
+app_secrets_eso_refresh_interval: "{{ eso_refresh_interval | default('1h') }}"
+app_secrets_eso_wait_retries: 36           # ExternalSecret Ready wait (x delay)
+app_secrets_eso_wait_delay: 5
+# delete: seconds to wait for each ExternalSecret (and the Secret it owns) and
+# for the worker namespace to be gone.
+app_secrets_delete_wait_timeout: 300
+
+# --- import (migration of a local-mode env, AD-12) ----------------------------
+# import_phase: import (app_pre_install, before any ensure: copy the legacy
+# Secrets into OpenBao, hand the Helm-owned Secrets to ESO, unmark) or finalize
+# (app_post_install, after the Helm upgrades: scrub the local artifacts, prune
+# the Helm history).
+app_secrets_import_phases: ["import", "finalize"]
+# The importer: its own ServiceAccount (the platform binds OpenBao role
+# <layer>-secrets-importer to this name in the worker namespace), created only
+# for the run, with a Role per namespace limited to the planned Secrets.
+app_secrets_importer_sa: "{{ app_secrets_openbao_layer }}-secrets-importer"
+app_secrets_openbao_importer_role: "{{ app_secrets_openbao_layer }}-secrets-importer"
+app_secrets_importer_rbac_name: "{{ app_secrets_openbao_layer }}-secrets-importer"
+# Python 3 standard library only: the image of the vector-dims Job.
+app_secrets_importer_image: "{{ vector_dims_job_image | default('docker.io/library/python:3.12-slim') }}"
+app_secrets_importer_kube_api: "https://kubernetes.default.svc"
+# Migration state (ConfigMap in the worker namespace; non-secret):
+# state imported | native | done, started (UTC, ISO 8601).
+app_secrets_migration_configmap: "erag-secrets-migration"
+# The local markup the importer removes (app_password_mgmt).
+app_secrets_markup_label: "meta.erag/has-generated-passwords"
+app_secrets_markup_annotation: "meta.erag/password-mappings"
+# finalize: what it scrubs. Env logs: the *.log files directly in this
+# directory that are older than the migration start.
+app_secrets_migration_log_dir: "{{ log_dir | default('') }}"
+app_secrets_migration_tmp_dir: "{{ rag_tmp_dir | default((tmp_dir | default(log_dir ~ '/tmp')) ~ '/rag') }}"
+# finalize: the erag Helm releases are those of the charts under this
+# directory (found as the deployment manifest finds them).
+app_secrets_erag_charts_dir: "{{ deployment_dir | default('') }}/components"
+app_secrets_discover_components_script: "{{ deployment_dir | default('') }}/scripts/discover_erag_components.py"
+
+# --- rotate (erag_rotate run, AD-9) -------------------------------------------
+# The registry rotate hooks (files/registry.yaml header) and the target fields
+# each needs; validated on every op.
+app_secrets_rotate_hooks:
+  operator-write: []
+  postgres-alter-user: [host, port, database, user]
+  redis-acl-set: [host, port, user]
+  keycloak-client-secret-set: [realm, client_id]
+app_secrets_workload_kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+# The rotator: one Job per credential under the worker ServiceAccount (OpenBao
+# role <layer>-secrets-worker), Python 3 standard library only.
+app_secrets_rotator_image: "{{ app_secrets_importer_image }}"
+# Keycloak hooks: the in-cluster admin REST API (as the configurator Job uses
+# it) and the platform admin Secret, which the rotator reads in-cluster through
+# a Role that exists only while the rotation runs.
+app_secrets_rotate_keycloak_url: >-
+  http://keycloak-service.{{ keycloak_namespace | default('keycloak') }}.svc:8080{{ erag_keycloak_path_prefix | default('') }}
+app_secrets_rotate_keycloak_admin_secret:
+  namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  name: "{{ keycloak_admin_secret_name | default('keycloak-admin-secret') }}"
+  key: "password"
+app_secrets_rotate_keycloak_admin_user: "{{ keycloak_admin_user | default('admin') }}"
+app_secrets_rotator_rbac_name: "{{ app_secrets_openbao_layer }}-secrets-rotator"
+# Seconds per hook network call inside the rotator.
+app_secrets_rotate_hook_timeout: 15
+# After the force-sync: wait for each ExternalSecret (retries x delay), then
+# for each restarted workload's rollout (seconds).
+app_secrets_rotate_sync_retries: 36
+app_secrets_rotate_sync_delay: 5
+app_secrets_rotate_rollout_timeout: 600
+app_secrets_rotate_rollout_delay: 5
+# Whether the rollout of the workload object _rollout_w (k8s_info resource)
+# finished: the controller saw the latest spec and every replica is updated
+# and available (evaluated by tasks/adapters/openbao/restart.yaml).
+app_secrets_rollout_done: >-
+  {%- set w = _rollout_w | default({}, true) -%}
+  {%- set s = w.status | default({}, true) -%}
+  {%- set seen = (s.observedGeneration | default(0) | int) >= (w.metadata.generation | default(0) | int) -%}
+  {%- if w.kind | default('') == 'Deployment' -%}
+    {%- set want = w.spec.replicas | default(1) | int -%}
+    {{ seen and (s.updatedReplicas | default(0) | int) == want and (s.availableReplicas | default(0) | int) >= want
+       and (s.replicas | default(0) | int) == want }}
+  {%- elif w.kind | default('') == 'StatefulSet' -%}
+    {%- set want = w.spec.replicas | default(1) | int -%}
+    {{ seen and (s.updatedReplicas | default(0) | int) == want and (s.readyReplicas | default(0) | int) == want
+       and s.currentRevision | default('') == s.updateRevision | default('') }}
+  {%- elif w.kind | default('') == 'DaemonSet' -%}
+    {%- set want = s.desiredNumberScheduled | default(0) | int -%}
+    {{ seen and (s.updatedNumberScheduled | default(0) | int) == want and (s.numberAvailable | default(0) | int) == want }}
+  {%- else -%}
+    False
+  {%- endif -%}
+
+# --- Cross-role shared defaults - Owned by other roles; declared here so the registry's
+# `enabled` conditions resolve the same in every role that calls a port op. ---
+# registry.yaml gates the grafana key of keycloak-configurator-sensitive on it. Without
+# this, an ensure from app_edp (keycloak/edp-oidc) re-rendered that ExternalSecret
+# without the grafana key.
+telemetry_domain_name: "grafana.{{ base_domain_name | default('solutions.ai') }}"  # app_keycloak_config
+grafana_oauth_domain: "{{ telemetry_domain_name }}"                                 # app_keycloak_config

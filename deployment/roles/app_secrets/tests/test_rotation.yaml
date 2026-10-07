@@ -1,0 +1,151 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests app_secrets rotate with the OpenBao backend (story 12, AD-9) without a
+# cluster: a real OpenBao 2.7.0 and a real Postgres (Docker; the
+# ghcr.io/cloudnative-pg/postgresql:17 image) take the KV writes and the
+# ALTER ROLE; Redis and Keycloak are fakes in the harness (RESP AUTH / ACL
+# SETUSER, the Keycloak admin REST calls), because their images cannot be
+# pulled here. The rotator Job (files/secrets_rotator.py) runs on this host
+# against those servers (the harness maps the in-cluster service names, see
+# FAKE_ENDPOINTS) and a fake Kubernetes API that enforces its Role; the fake
+# ESO answers the force-sync, the fake controllers the rollout restarts.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_rotation.yaml
+#
+# The cases run in a nested ansible-playbook (rotation_cases.yaml, -v). Its
+# whole output, every Job log and every Job plan are then searched for every
+# value of every KV version (and the Keycloak admin password): none may appear.
+
+---
+- name: "app_secrets | test | rotation"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    harness: "{{ playbook_dir }}/files/fake_openbao_cluster.py"
+  tasks:
+    - name: "app_secrets | test | rotation | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_rotation_test_
+      register: _tmp
+
+    - name: "app_secrets | test | rotation | Run"
+      block:
+        - name: "app_secrets | test | rotation | Start OpenBao and the fake TokenReview API"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", start, "{{ _tmp.path }}/openbao"]
+          register: _env
+          changed_when: true
+
+        - name: "app_secrets | test | rotation | Start Postgres"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", pg-start, "{{ _tmp.path }}/openbao"]
+          register: _pg
+          changed_when: true
+
+        - name: "app_secrets | test | rotation | Start the fake Redis and Keycloak"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", fakes-start, "{{ _tmp.path }}/openbao"]
+          register: _fakes
+          changed_when: true
+
+        # The in-cluster names of the registry rotate targets -> the test servers.
+        - name: "app_secrets | test | rotation | Map the rotate targets to the test servers"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/endpoints.json"
+            mode: "0600"
+            content: >-
+              {{ {'fingerprint-postgresql.fingerprint.svc:5432': _pg_addr,
+                  'chat-history-mongodb-postgresql.chat-history.svc:5432': _pg_addr,
+                  'edp-postgresql.edp.svc:5432': _pg_addr,
+                  'pgvector.vdb.svc:5432': _pg_addr,
+                  'edp-redis.edp.svc:6379': '127.0.0.1:' ~ (_fakes.stdout | from_json).redis_port,
+                  'http://keycloak-service.keycloak.svc:8080': 'http://127.0.0.1:' ~ (_fakes.stdout | from_json).kc_port}
+                 | to_json }}
+          vars:
+            _pg_addr: "127.0.0.1:{{ (_pg.stdout | from_json).port }}"
+
+        - name: "app_secrets | test | rotation | Run the cases (nested playbook, output captured)"
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ansible_playbook_python | dirname }}/ansible-playbook -v -i localhost, -c local
+              {{ playbook_dir }}/rotation_cases.yaml > {{ _tmp.path }}/cases.log 2>&1
+          environment:
+            FAKE_OPENBAO_DIR: "{{ _tmp.path }}/openbao"
+            FAKE_K8S_STATE: "{{ _tmp.path }}/cluster.json"
+            FAKE_K8S_ON_APPLY: "{{ ansible_playbook_python }} {{ harness }} hook"
+            FAKE_OPENBAO_ADDR: "{{ (_env.stdout | from_json).addr }}"
+            FAKE_ENDPOINTS: "{{ _tmp.path }}/endpoints.json"
+            OUT_DIR: "{{ _tmp.path }}/out"
+            ANSIBLE_ROLES_PATH: "{{ playbook_dir | dirname | dirname }}"
+            ANSIBLE_COLLECTIONS_PATH: >-
+              {{ playbook_dir }}/fake_collections:{{ lookup('ansible.builtin.env', 'HOME') }}/.ansible/collections:/usr/share/ansible/collections
+          register: _cases
+          changed_when: true
+          failed_when: false
+
+        - name: "app_secrets | test | rotation | Show the result of the cases"
+          ansible.builtin.shell:
+            cmd: "set -o pipefail; grep -E '^fatal: |^localhost  ' {{ _tmp.path }}/cases.log | tail -n 3"
+            executable: /bin/bash
+          register: _tail
+          changed_when: false
+          when: _cases.rc != 0
+
+        - name: "app_secrets | test | rotation | The cases passed"
+          ansible.builtin.assert:
+            that: _cases.rc == 0
+            fail_msg: "{{ _tail.stdout_lines | default([]) }}"
+            quiet: true
+
+        - name: "app_secrets | test | rotation | Collect every stored value (all versions)"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", all-versions, "{{ _tmp.path }}/openbao", "{{ _tmp.path }}/values.txt"]
+          register: _values
+          changed_when: false
+
+        - name: "app_secrets | test | rotation | Collect the Job logs"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", joblogs, "{{ _tmp.path }}/cluster.json", "{{ _tmp.path }}/joblogs.txt"]
+          changed_when: false
+
+        - name: "app_secrets | test | rotation | No value appears in the output, the Job logs or the Job plans"
+          ansible.builtin.command:
+            argv: [grep, -c, -F, -f, "{{ _tmp.path }}/values.txt", "{{ _tmp.path }}/cases.log", "{{ _tmp.path }}/joblogs.txt",
+                   "{{ _tmp.path }}/out/plans.txt"]
+          register: _leaks
+          changed_when: false
+          failed_when: _leaks.rc > 1
+
+        - name: "app_secrets | test | rotation | Assert no value leaked and enough values were checked"
+          ansible.builtin.assert:
+            that:
+              - (_values.stdout | int) >= 15
+              - _leaks.stdout_lines | map('regex_replace', '^.*:', '') | map('int') | sum == 0
+            fail_msg: "{{ _leaks.stdout }} ({{ _values.stdout }} values)"
+            quiet: true
+
+      always:
+        - name: "app_secrets | test | rotation | Stop the fake Redis and Keycloak"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", fakes-stop, "{{ _tmp.path }}/openbao"]
+          changed_when: true
+
+        - name: "app_secrets | test | rotation | Stop Postgres"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", pg-stop, "{{ _tmp.path }}/openbao"]
+          changed_when: true
+
+        - name: "app_secrets | test | rotation | Stop OpenBao and the fake TokenReview API"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", stop, "{{ _tmp.path }}/openbao"]
+          changed_when: true
+
+        - name: "app_secrets | test | rotation | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

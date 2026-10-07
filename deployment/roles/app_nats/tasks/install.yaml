@@ -51,22 +51,26 @@
     namespace: "{{ nats_namespace }}"
   register: _nats_auth_secret
 
+# With projected Secrets the port's ensure creates the pair once in OpenBao and
+# renders nats-auth and its consumer copies (ESO); the role writes no Secret.
 - name: "app_nats | Generate and store NKey material"
   when:
     # Regenerate when the secret is absent, or when it exists but any required
     # key is missing or empty. A complete secret leaves this False (no churn).
-    - (_nats_auth_secret.resources | default([]) | length == 0)
+    - (app_secrets_projected | default(false))
+      or (_nats_auth_secret.resources | default([]) | length == 0)
       or (nats_auth_required_keys | difference(
             _nats_auth_secret.resources[0].data | default({})
             | dict2items | rejectattr('value', 'equalto', '')
             | map(attribute='key') | list) | length > 0)
   block:
+    # Sets nats_auth_nkey_seed and nats_auth_nkey_public.
     - name: "app_nats | Generate client NKey pair"
-      ansible.builtin.command:
-        cmd: python3 {{ role_path }}/files/gen_nkey.py
-      register: _nats_nkey
-      changed_when: true
-      no_log: "{{ secure_logs }}"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [nats/auth]
 
     - name: "app_nats | Create auth secret"
       kubernetes.core.k8s:
@@ -78,13 +82,15 @@
             name: "{{ nats_auth_secret_name }}"
             namespace: "{{ nats_namespace }}"
           data:
-            user.nk: "{{ _nats_nkey.stdout_lines[0] | b64encode }}"
-            user.pub: "{{ _nats_nkey.stdout_lines[1] | b64encode }}"
+            user.nk: "{{ nats_auth_nkey_seed | b64encode }}"
+            user.pub: "{{ nats_auth_nkey_public | b64encode }}"
       no_log: "{{ secure_logs }}"
+      when: not (app_secrets_projected | default(false))
 
 # The controller and router read the same NKey seed to authenticate to NATS, so
 # the secret is mirrored into their namespaces.
 - name: "app_nats | Mirror client NKey to consumer namespaces"
+  when: not (app_secrets_projected | default(false))
   block:
     - name: "app_nats | Read auth secret for mirroring"
       kubernetes.core.k8s_info:

@@ -36,7 +36,7 @@ spec:
           image: {{ .Values.vllmAudioCpu.image.repository }}/{{ .Values.vllmAudioCpu.image.name }}:{{ .Values.vllmAudioCpu.image.tag }}
           imagePullPolicy: {{ .Values.vllmAudioCpu.image.pullPolicy }}
           env:
-          {{- if .Values.hfToken }}
+          {{- if or .Values.hfToken .Values.hfTokenSecret }}
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

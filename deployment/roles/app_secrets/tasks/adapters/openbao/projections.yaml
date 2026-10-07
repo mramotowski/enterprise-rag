@@ -1,0 +1,105 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: the registry secrets: map as a list of projections (one per
+# Secret, or per variant for entries with variants):
+#   {key: <namespace>/<name>, namespace, name, variant, data,
+#    refs: [<credential-id>.<kv_key> read from OpenBao], cids: [<credential-id>],
+#    undefined_templates: [<name>]}
+# A {template, sources} key reads only the sources its template text uses
+# (${n}); with an undefined template, all of its sources count. {value} and
+# {value_from} keys read nothing from OpenBao. Entries whose `enabled` resolves
+# false are left out, and so are data keys whose own `enabled` resolves false.
+# Sets: app_secrets_projections.
+
+---
+# Its own task: Jinja config refs in the secrets: keys are resolved by this
+# top-level dict2items, not inside a Jinja loop over the mapping.
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Resolve the registry Secret keys"
+  ansible.builtin.set_fact:
+    _app_secrets_secret_entries: "{{ app_secrets_registry.secrets | dict2items }}"
+  no_log: true
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | List the registry projections"
+  ansible.builtin.set_fact:
+    app_secrets_projections: "{{ _projections }}"
+  vars:
+    _templates: "{{ app_secrets_registry.templates | default({}, true) }}"
+    _projections: >-
+      {%- set out = [] -%}
+      {%- for s in _app_secrets_secret_entries if s.value.enabled | default(true) | bool -%}
+        {%- set ns_name = s.key.split('/', 1) -%}
+        {%- set candidates = [] -%}
+        {%- if s.value.variants is defined -%}
+          {%- for v in s.value.variants | dict2items -%}
+            {%- set _ = candidates.append({'variant': v.key, 'data': v.value.data}) -%}
+          {%- endfor -%}
+        {%- else -%}
+          {%- set _ = candidates.append({'variant': none, 'data': s.value.data}) -%}
+        {%- endif -%}
+        {#- A data key whose own `enabled` resolves false is not part of the Secret. -#}
+        {%- for c in candidates -%}
+          {%- set kept = {} -%}
+          {%- for d in c.data | dict2items if d.value.enabled | default(true) | bool -%}
+            {%- set _ = kept.update({d.key: d.value}) -%}
+          {%- endfor -%}
+          {%- set _ = c.update({'data': kept}) -%}
+        {%- endfor -%}
+        {%- for c in candidates -%}
+          {%- set refs = [] -%}
+          {%- set undefined = [] -%}
+          {%- for d in c.data | dict2items -%}
+            {%- if d.value['from'] is defined -%}
+              {%- set _ = refs.append(d.value['from']) -%}
+            {%- elif d.value.template is defined -%}
+              {%- if d.value.template in _templates -%}
+                {%- for n in _templates[d.value.template] | regex_findall('[$][{]([0-9]+)[}]') | unique -%}
+                  {%- if (n | int) < (d.value.sources | length) -%}
+                    {%- set _ = refs.append(d.value.sources[n | int]) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- else -%}
+                {%- set _ = undefined.append(d.value.template) -%}
+                {%- set _ = refs.extend(d.value.sources) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set _ = out.append({'key': s.key, 'namespace': ns_name[0], 'name': ns_name[1],
+                                  'variant': c.variant, 'data': c.data, 'refs': refs | unique | list,
+                                  'cids': refs | map('regex_replace', '[.][^.]*$', '') | unique | list,
+                                  'undefined_templates': undefined | unique | list}) -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true
+
+# The registry paths each namespace's ExternalSecrets may read (the namespace
+# annotation of the platform admission policy), over every entry, variant, key
+# and template source, `enabled` or not: every ensure writes the same value,
+# whichever role runs it and whatever facts that role has set. Trade-off: a
+# namespace may also read the registry paths of its projections that the
+# current config leaves out (e.g. edp: the operator S3 keys with SeaweedFS
+# storage); it still reads nothing the registry does not project into it.
+- name: "app_secrets | {{ app_secrets_op }} | openbao | List the registry paths per namespace"
+  ansible.builtin.set_fact:
+    app_secrets_namespace_paths: "{{ _paths }}"
+  vars:
+    _paths: >-
+      {%- set out = {} -%}
+      {%- for s in _app_secrets_secret_entries -%}
+        {%- set ns = s.key.split('/', 1)[0] -%}
+        {%- set datas = [s.value.data] if s.value.data is defined
+                        else (s.value.variants | default({}) | dict2items | map(attribute='value.data') | list) -%}
+        {%- set cids = [] -%}
+        {%- for data in datas -%}
+          {%- for d in data | dict2items -%}
+            {%- for ref in ([d.value['from']] if d.value['from'] is defined else []) + (d.value.sources | default([])) -%}
+              {%- set _ = cids.append(ref | regex_replace('[.][^.]*$', '')) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set _ = out.update({ns: (out.get(ns, []) + (cids | map('extract', app_secrets_catalog)
+                                                         | map(attribute='path') | list)) | unique | sort}) -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true

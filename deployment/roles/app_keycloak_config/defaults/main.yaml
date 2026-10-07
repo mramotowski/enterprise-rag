@@ -82,3 +82,12 @@ grafana_oauth_namespace: "{{ observability_namespace | default('monitoring') }}"
 grafana_oauth_deployment: "kube-prometheus-stack-grafana"
 grafana_oauth_secret_name: "grafana-sso-env"
 grafana_oauth_keycloak_internal_url: "http://keycloak-service.{{ keycloak_namespace | default('keycloak') }}.svc.cluster.local:8080"
+
+# --- Client secret drift check (validate, projected Secrets only) ---
+# Image of the in-cluster drift check Job: Python 3 standard library only, the
+# image of the vector-dims Job.
+keycloak_drift_job_image: "{{ vector_dims_job_image | default('docker.io/library/python:3.12-slim') }}"
+# Admin API base the Job calls (the configurator Job's Keycloak URL).
+keycloak_drift_keycloak_url: "http://keycloak-service.{{ keycloak_namespace }}.svc:8080{{ erag_keycloak_path_prefix | default('') }}"
+# activeDeadlineSeconds of the Job: image pull, pod start and a few HTTP calls.
+keycloak_drift_job_timeout: 240

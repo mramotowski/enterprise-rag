@@ -1,0 +1,381 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests the Keycloak configurator without a cluster:
+#   - templates/configurator-job.yaml.j2 rendered with local and with projected
+#     Secrets (app_secrets_projected): in projected mode the manifest holds no
+#     value, no Secret, no Role rules and no SA token, and every credential env
+#     is a secretKeyRef to erag-credentials or keycloak-configurator-sensitive;
+#   - files/keycloak_configurator_job.sh run against a fake Keycloak admin API
+#     and a kubectl stub (files/fake_keycloak.py): in projected mode
+#     (CREDENTIALS_SOURCE=projection) the users get the projected passwords,
+#     the MCP, EnterpriseRAG-oidc-minio and grafana-oauth clients the projected
+#     secrets, kubectl is never called and no value is logged; existing users
+#     keep their password; missing inputs, a failed secret update and a
+#     password the realm policy refuses fail the Job. Local mode stores what it
+#     created in erag-credentials, as before.
+#
+# Run from the enterprise-rag repo root (needs bash, curl, jq and coreutils):
+#   ansible-playbook -i localhost, -c local deployment/roles/app_keycloak_config/tests/test_configurator.yaml
+# The values below are test values only.
+
+---
+- name: "app_keycloak_config | test | configurator"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    role_dir: "{{ playbook_dir | dirname }}"
+    harness: "{{ ansible_playbook_python }} {{ playbook_dir }}/files/fake_keycloak.py"
+    script: "{{ role_dir }}/files/keycloak_configurator_job.sh"
+    # Inputs of the configurator template (configure_keycloak.yaml sets them).
+    render_vars:
+      role_path: "{{ role_dir }}"
+      keycloak_namespace: keycloak
+      configurator_job_name: keycloak-configurator-1
+      init_container_image: registry.test/enterprise-rag-init-container:t
+      erag_keycloak_realm: EnterpriseRAG
+      keycloak_admin_user: admin
+      keycloak_admin_secret_name: keycloak-admin-secret
+      minio_domain: s3.test
+      minio_path_prefix: ""
+      ui_domain: ui.test
+      credentials_secret_name: erag-credentials
+      grafana_oauth_domain: grafana.test
+      grafana_oauth_path_prefix: ""
+      grafana_oauth_client_secret: cfg-grafana-secret-0001
+      mcp_enabled: true
+      mcp_keycloak_client_id: mcp-client
+      mcp_jwt_audience: mcp-gateway
+      mcp_access_token_lifespan: 900
+      erag_keycloak_oidc_endpoint: https://idp.test/.well-known/openid-configuration
+      erag_keycloak_oidc_client_id: oidc-client
+      erag_keycloak_oidc_client_secret: cfg-oidc-secret-0001
+      erag_keycloak_federation_endpoint: ldaps://ldap.test
+      erag_keycloak_federation_bind_password: cfg-ldap-secret-0001
+    config_values: [cfg-grafana-secret-0001, cfg-oidc-secret-0001, cfg-ldap-secret-0001]
+    # Projected credential env -> [Secret, key].
+    projected_refs:
+      KEYCLOAK_ADMIN_PASSWORD: [keycloak-admin-secret, password]
+      KEYCLOAK_ERAG_ADMIN_PASSWORD: [erag-credentials, KEYCLOAK_ERAG_ADMIN_PASSWORD]
+      KEYCLOAK_ERAG_USER_PASSWORD: [erag-credentials, KEYCLOAK_ERAG_USER_PASSWORD]
+      KEYCLOAK_ERAG_MAINTAINER_PASSWORD: [erag-credentials, KEYCLOAK_ERAG_MAINTAINER_PASSWORD]
+      MCP_CLIENT_SECRET: [erag-credentials, MCP_CLIENT_SECRET]
+      GRAFANA_OAUTH_CLIENT_SECRET: [keycloak-configurator-sensitive, grafana-oauth-client-secret]
+      EDP_OIDC_CLIENT_SECRET: [keycloak-configurator-sensitive, edp-oidc-client-secret]
+      OIDC_CLIENT_SECRET: [keycloak-configurator-sensitive, oidc-client-secret]
+      FEDERATION_BIND_PASSWORD: [keycloak-configurator-sensitive, federation-bind-password]
+    base_env:
+      KEYCLOAK_ADMIN_PASSWORD: test-admin
+      KEYCLOAK_REALM: EnterpriseRAG
+      CREDENTIALS_SECRET_NAMESPACE: keycloak
+      UI_DOMAIN: ui.test
+      MINIO_DOMAIN: s3.test
+      GRAFANA_DOMAIN: grafana.test
+      MCP_ENABLED: "true"
+      OIDC_ENDPOINT: "@BASE@/oidc/.well-known/openid-configuration"
+      OIDC_ALIAS: enterprise-sso
+      OIDC_CLIENT_ID: oidc-client
+      FEDERATION_ENDPOINT: ldaps://ldap.test
+      FEDERATION_BIND_DN: cn=bind
+    projected_env:
+      CREDENTIALS_SOURCE: projection
+      KEYCLOAK_ERAG_ADMIN_PASSWORD: "Pa1!admin-projected-0001"
+      KEYCLOAK_ERAG_USER_PASSWORD: "Pu2#user-projected-0001"
+      KEYCLOAK_ERAG_MAINTAINER_PASSWORD: "Pm3%maint-projected-0001"
+      MCP_CLIENT_SECRET: mcpprojected0001mcpprojected0001
+      GRAFANA_OAUTH_CLIENT_SECRET: grafanaprojected0001grafana00001
+      EDP_OIDC_CLIENT_SECRET: edpprojected0001edpprojected0001
+      OIDC_CLIENT_SECRET: oidcprojected0001
+      FEDERATION_BIND_PASSWORD: ldapprojected0001
+    rerun_env:
+      KEYCLOAK_ERAG_ADMIN_PASSWORD: "Ra1!admin-rerun-0002"
+      KEYCLOAK_ERAG_USER_PASSWORD: "Ru2#user-rerun-0002"
+      KEYCLOAK_ERAG_MAINTAINER_PASSWORD: "Rm3%maint-rerun-0002"
+      MCP_CLIENT_SECRET: mcprerun0002mcprerun0002mcprerun
+      GRAFANA_OAUTH_CLIENT_SECRET: grafanarerun0002grafanarerun0002
+      EDP_OIDC_CLIENT_SECRET: edprerun0002edprerun0002edprerun
+  tasks:
+    - name: "app_keycloak_config | test | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: kc_configurator_test_
+      register: _tmp
+
+    - name: "app_keycloak_config | test | Run"
+      block:
+        # --- Job manifest ------------------------------------------------------------
+
+        - name: "app_keycloak_config | test | Render the Job manifest ({{ item }})"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/job-{{ item }}.yaml"
+            mode: "0600"
+            content: >-
+              {{ lookup('ansible.builtin.template', role_dir ~ '/templates/configurator-job.yaml.j2',
+                        template_vars=render_vars | combine({'app_secrets_projected': item == 'projected'})) }}
+          loop: [local, projected]
+
+        # Projected with MCP, Grafana, OIDC and federation off: the Job may only
+        # reference the keys the projections carry then (registry per-key enabled).
+        - name: "app_keycloak_config | test | Render the projected Job manifest without the optional features"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/job-projected-minimal.yaml"
+            mode: "0600"
+            content: >-
+              {{ lookup('ansible.builtin.template', role_dir ~ '/templates/configurator-job.yaml.j2',
+                        template_vars=render_vars | combine({'app_secrets_projected': true, 'mcp_enabled': false,
+                                                             'grafana_oauth_domain': '', 'erag_keycloak_oidc_endpoint': '',
+                                                             'erag_keycloak_federation_endpoint': ''})) }}
+
+        - name: "app_keycloak_config | test | Check the projected Job manifest without the optional features"
+          ansible.builtin.assert:
+            that:
+              - _refs == ['KEYCLOAK_ADMIN_PASSWORD', 'KEYCLOAK_ERAG_ADMIN_PASSWORD', 'KEYCLOAK_ERAG_USER_PASSWORD', 'KEYCLOAK_ERAG_MAINTAINER_PASSWORD', 'EDP_OIDC_CLIENT_SECRET']
+            fail_msg: "projected minimal manifest refs {{ _refs }}"
+            quiet: true
+          vars:
+            _docs: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/job-projected-minimal.yaml') | ansible.builtin.from_yaml_all | list }}"
+            _refs: >-
+              {{ (_docs | selectattr('kind', 'equalto', 'Job') | first).spec.template.spec.containers[0].env
+                 | selectattr('valueFrom', 'defined') | map(attribute='name') | list }}
+
+        # --- assert_oidc_config.yaml ----------------------------------------------------
+
+        - name: "app_keycloak_config | test | OIDC and SharePoint configured without the client secret in config"
+          ansible.builtin.include_tasks: oidc_assert_case.yaml
+          loop: [local, projected]
+          loop_control:
+            loop_var: oidc_mode
+
+        - name: "app_keycloak_config | test | The client secret is required in config only with local Secrets"
+          ansible.builtin.assert:
+            that:
+              - "'Incomplete Single Sign-On configuration' in _oidc_assert.local"
+              - "'erag_keycloak_oidc_client_secret' in _oidc_assert.local"
+              - _oidc_assert.projected == 'passed'
+            fail_msg: "{{ _oidc_assert | to_json }}"
+            quiet: true
+
+        - name: "app_keycloak_config | test | Check the projected Job manifest"
+          ansible.builtin.assert:
+            that:
+              - _docs | selectattr('kind', 'equalto', 'Secret') | list | length == 0
+              - config_values | select('in', _text) | list | length == 0
+              - (_docs | selectattr('kind', 'equalto', 'Role') | first).rules == []
+              - _pod.automountServiceAccountToken == false
+              - _env | selectattr('name', 'equalto', 'CREDENTIALS_SOURCE') | map(attribute='value') | list == ['projection']
+              # Every credential is a secretKeyRef, every other entry a literal.
+              - _refs == projected_refs
+              - _env | rejectattr('valueFrom', 'defined') | map(attribute='name') | select('in', projected_refs.keys() | list) | list == []
+            fail_msg: "projected manifest: refs {{ _refs }}"
+            quiet: true
+          vars:
+            _text: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/job-projected.yaml') }}"
+            _docs: "{{ _text | ansible.builtin.from_yaml_all | list }}"
+            _pod: "{{ (_docs | selectattr('kind', 'equalto', 'Job') | first).spec.template.spec }}"
+            _env: "{{ _pod.containers[0].env }}"
+            _refs: >-
+              {{ dict(_env | selectattr('valueFrom', 'defined') | map(attribute='name')
+                      | zip(_env | selectattr('valueFrom', 'defined')
+                            | map(attribute='valueFrom.secretKeyRef') | map('dict2items')
+                            | map('map', attribute='value') | map('list'))) }}
+
+        - name: "app_keycloak_config | test | Check the local Job manifest (as before)"
+          ansible.builtin.assert:
+            that:
+              - (_docs | selectattr('kind', 'equalto', 'Secret') | first).metadata.name == 'keycloak-configurator-sensitive'
+              - (_docs | selectattr('kind', 'equalto', 'Secret') | first).data.keys() | sort == ['federation-bind-password', 'oidc-client-secret']
+              - (_docs | selectattr('kind', 'equalto', 'Role') | first).rules[0].verbs == ['get', 'list', 'create', 'update', 'patch']
+              - _pod.automountServiceAccountToken is not defined
+              - _env | selectattr('name', 'equalto', 'CREDENTIALS_SOURCE') | list == []
+              - _env | selectattr('name', 'equalto', 'GRAFANA_OAUTH_CLIENT_SECRET') | map(attribute='value') | list == ['cfg-grafana-secret-0001']
+              - _env | selectattr('name', 'match', '^KEYCLOAK_ERAG_') | list == []
+            fail_msg: local manifest differs from the local-mode shape
+            quiet: true
+          vars:
+            _docs: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/job-local.yaml') | ansible.builtin.from_yaml_all | list }}"
+            _pod: "{{ (_docs | selectattr('kind', 'equalto', 'Job') | first).spec.template.spec }}"
+            _env: "{{ _pod.containers[0].env }}"
+
+        # --- configurator script ---------------------------------------------------------
+
+        - name: "app_keycloak_config | test | Write the cases"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/{{ item.name }}.json"
+            mode: "0600"
+            content: "{{ item | to_json }}"
+          loop:
+            - {name: local-fresh, env: "{{ base_env | combine({'GRAFANA_OAUTH_CLIENT_SECRET': 'localgrafana0001', 'OIDC_CLIENT_SECRET': 'x', 'FEDERATION_BIND_PASSWORD': 'y'}) }}"}
+            - {name: projected-fresh, env: "{{ base_env | combine(projected_env) }}"}
+            - {name: projected-rerun, env: "{{ base_env | combine(projected_env, rerun_env) }}"}
+            - name: projected-mcp-recreate
+              env: "{{ base_env | combine(projected_env) }}"
+              # An existing mcp-client without a service-account user (enabling the
+              # flag later does not create one): the configurator recreates it.
+              kc_seed:
+                realms:
+                  EnterpriseRAG:
+                    policy: "length(12) and digits(1) and upperCase(1) and lowerCase(1) and specialChars(1)"
+                    users: {}
+                    clients:
+                      mcp-client: {id: seed-mcp, clientId: mcp-client, publicClient: false, secret: seedsecret, sa_user: false}
+            # MCP, Grafana, OIDC and federation off: only the users and the EDP client.
+            - name: projected-minimal
+              env:
+                KEYCLOAK_ADMIN_PASSWORD: test-admin
+                CREDENTIALS_SECRET_NAMESPACE: keycloak
+                CREDENTIALS_SOURCE: projection
+                KEYCLOAK_ERAG_ADMIN_PASSWORD: "{{ projected_env.KEYCLOAK_ERAG_ADMIN_PASSWORD }}"
+                KEYCLOAK_ERAG_USER_PASSWORD: "{{ projected_env.KEYCLOAK_ERAG_USER_PASSWORD }}"
+                KEYCLOAK_ERAG_MAINTAINER_PASSWORD: "{{ projected_env.KEYCLOAK_ERAG_MAINTAINER_PASSWORD }}"
+                EDP_OIDC_CLIENT_SECRET: "{{ projected_env.EDP_OIDC_CLIENT_SECRET }}"
+            - {name: projected-missing, env: "{{ base_env | combine(projected_env, {'EDP_OIDC_CLIENT_SECRET': ''}) }}", kc_seed: {realms: {}}}
+            - {name: projected-missing-features, env: "{{ base_env | combine(projected_env, {'MCP_CLIENT_SECRET': '', 'GRAFANA_OAUTH_CLIENT_SECRET': '', 'OIDC_CLIENT_SECRET': '', 'FEDERATION_BIND_PASSWORD': ''}) }}", kc_seed: {realms: {}}}
+            - {name: projected-mcp-set-fails, env: "{{ base_env | combine(projected_env) }}", fail_secret_client: mcp-client, kc_seed: {realms: {}}}
+            - {name: projected-set-fails, env: "{{ base_env | combine(projected_env) }}", fail_secret_client: EnterpriseRAG-oidc-minio, kc_seed: {realms: {}}}
+            - {name: projected-policy, env: "{{ base_env | combine(projected_env, {'KEYCLOAK_ERAG_ADMIN_PASSWORD': 'short'}) }}", kc_seed: {realms: {}}}
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "app_keycloak_config | test | Run the configurator"
+          ansible.builtin.command:
+            argv: "{{ harness.split(' ') + ['run', _tmp.path ~ '/' ~ item.dir, script, _tmp.path ~ '/' ~ item.name ~ '.json'] }}"
+          register: _runs
+          changed_when: true
+          loop:
+            - {name: local-fresh, dir: local}
+            - {name: projected-fresh, dir: projected}
+            - {name: projected-rerun, dir: projected}
+            - {name: projected-mcp-recreate, dir: recreate}
+            - {name: projected-minimal, dir: minimal}
+            - {name: projected-missing, dir: missing}
+            - {name: projected-set-fails, dir: set-fails}
+            - {name: projected-missing-features, dir: missing-features}
+            - {name: projected-mcp-set-fails, dir: mcp-set-fails}
+            - {name: projected-policy, dir: policy}
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "app_keycloak_config | test | Collect the results"
+          ansible.builtin.set_fact:
+            _rc: "{{ dict(_runs.results | map(attribute='item.name') | zip(_runs.results | map(attribute='stdout') | map('from_json') | map(attribute='rc'))) }}"
+
+        - name: "app_keycloak_config | test | Local mode stores what it created in erag-credentials"
+          ansible.builtin.assert:
+            that:
+              - _rc['local-fresh'] == 0
+              - _kubectl | select('match', '^\\["apply"') | list | length == 2
+              - _secret.keys() | sort == ['KEYCLOAK_ERAG_ADMIN_PASSWORD', 'KEYCLOAK_ERAG_ADMIN_USERNAME', 'KEYCLOAK_ERAG_MAINTAINER_PASSWORD', 'KEYCLOAK_ERAG_MAINTAINER_USERNAME', 'KEYCLOAK_ERAG_USER_PASSWORD', 'KEYCLOAK_ERAG_USER_USERNAME', 'MCP_CLIENT_ID', 'MCP_CLIENT_SECRET']
+              - _users['erag-admin'].password == _secret.KEYCLOAK_ERAG_ADMIN_PASSWORD | b64decode
+              - _users['erag-maintainer'].password == _secret.KEYCLOAK_ERAG_MAINTAINER_PASSWORD | b64decode
+              - _clients['mcp-client'].secret == _secret.MCP_CLIENT_SECRET | b64decode
+              - _clients['grafana-oauth'].secret == 'localgrafana0001'
+            fail_msg: local mode differs (rc {{ _rc['local-fresh'] }})
+            quiet: true
+          no_log: true
+          vars:
+            _kubectl: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/local/local-fresh/kubectl.jsonl').splitlines() }}"
+            _secret: "{{ (lookup('ansible.builtin.file', _tmp.path ~ '/local/kubectl-state.json') | from_json)['keycloak/erag-credentials'] }}"
+            _users: "{{ (lookup('ansible.builtin.file', _tmp.path ~ '/local/kc-state.json') | from_json).realms.EnterpriseRAG.users }}"
+            _clients: "{{ (lookup('ansible.builtin.file', _tmp.path ~ '/local/kc-state.json') | from_json).realms.EnterpriseRAG.clients }}"
+
+        - name: "app_keycloak_config | test | Read the projected-fresh results"
+          ansible.builtin.set_fact:
+            _fresh_log: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/projected/projected-fresh/out.log') }}"
+            _fresh_trace: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/projected/projected-fresh/trace.jsonl').splitlines() | map('from_json') | list }}"
+          no_log: true
+
+        - name: "app_keycloak_config | test | Projected mode sets the projections in Keycloak, calls no kubectl, logs no value"
+          ansible.builtin.assert:
+            that:
+              - _rc['projected-fresh'] == 0
+              - _rc['projected-rerun'] == 0
+              - lookup('ansible.builtin.file', _tmp.path ~ '/projected/projected-fresh/kubectl.jsonl') == ''
+              - lookup('ansible.builtin.file', _tmp.path ~ '/projected/projected-rerun/kubectl.jsonl') == ''
+              # Fresh: created with the projected passwords, temporary as before.
+              # Re-run (409): users keep their password; client secrets follow the projection.
+              - _users['erag-admin'].password == projected_env.KEYCLOAK_ERAG_ADMIN_PASSWORD
+              - _users['erag-admin'].temporary
+              - _users['erag-user'].password == projected_env.KEYCLOAK_ERAG_USER_PASSWORD
+              - _users['erag-maintainer'].password == projected_env.KEYCLOAK_ERAG_MAINTAINER_PASSWORD
+              - _clients['mcp-client'].secret == rerun_env.MCP_CLIENT_SECRET
+              - _clients['EnterpriseRAG-oidc-minio'].secret == rerun_env.EDP_OIDC_CLIENT_SECRET
+              - _clients['grafana-oauth'].secret == rerun_env.GRAFANA_OAUTH_CLIENT_SECRET
+              - "\"User 'erag-admin' keeps its password\" in lookup('ansible.builtin.file', _tmp.path ~ '/projected/projected-rerun/out.log')"
+              # The external IdP gets the projected OIDC client secret, the LDAP
+              # federation the projected bind password.
+              - _fresh_trace | selectattr('path', 'search', '/identity-provider/instances$') | map(attribute='body') | select('search', projected_env.OIDC_CLIENT_SECRET) | list | length == 1
+              - _fresh_trace | selectattr('path', 'search', '/components$') | map(attribute='body') | select('search', projected_env.FEDERATION_BIND_PASSWORD) | list | length == 1
+              # No secret is read back from Keycloak except to verify an update.
+              - _fresh_trace | selectattr('path', 'search', '/client-secret$') | list | length == 3
+              - projected_env.values() | select('in', _fresh_log) | reject('equalto', 'projection') | list == []
+              - rerun_env.values() | select('in', lookup('ansible.builtin.file', _tmp.path ~ '/projected/projected-rerun/out.log')) | list == []
+            fail_msg: projected mode differs (rc {{ _rc['projected-fresh'] }}, {{ _rc['projected-rerun'] }})
+            quiet: true
+          no_log: true
+          vars:
+            _state: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/projected/kc-state.json') | from_json }}"
+            _users: "{{ _state.realms.EnterpriseRAG.users }}"
+            _clients: "{{ _state.realms.EnterpriseRAG.clients }}"
+
+        - name: "app_keycloak_config | test | Projected mode recreates an MCP client without service account and sets its secret"
+          ansible.builtin.assert:
+            that:
+              - _rc['projected-mcp-recreate'] == 0
+              - _clients['mcp-client'].id != 'seed-mcp'
+              - _clients['mcp-client'].sa_user
+              - _clients['mcp-client'].secret == projected_env.MCP_CLIENT_SECRET
+            fail_msg: MCP recreate path (rc {{ _rc['projected-mcp-recreate'] }})
+            quiet: true
+          no_log: true
+          vars:
+            _clients: "{{ (lookup('ansible.builtin.file', _tmp.path ~ '/recreate/kc-state.json') | from_json).realms.EnterpriseRAG.clients }}"
+
+        - name: "app_keycloak_config | test | Projected mode without the optional features"
+          ansible.builtin.assert:
+            that:
+              - _rc['projected-minimal'] == 0
+              - lookup('ansible.builtin.file', _tmp.path ~ '/minimal/projected-minimal/kubectl.jsonl') == ''
+              - _clients.keys() | sort == ['EnterpriseRAG-oidc', 'EnterpriseRAG-oidc-backend', 'EnterpriseRAG-oidc-minio']
+              - _clients['EnterpriseRAG-oidc-minio'].secret == projected_env.EDP_OIDC_CLIENT_SECRET
+              - _users.keys() | sort == ['erag-admin', 'erag-maintainer', 'erag-user']
+            fail_msg: minimal projected run (rc {{ _rc['projected-minimal'] }})
+            quiet: true
+          no_log: true
+          vars:
+            _clients: "{{ (lookup('ansible.builtin.file', _tmp.path ~ '/minimal/kc-state.json') | from_json).realms.EnterpriseRAG.clients }}"
+            _users: "{{ (lookup('ansible.builtin.file', _tmp.path ~ '/minimal/kc-state.json') | from_json).realms.EnterpriseRAG.users }}"
+
+        - name: "app_keycloak_config | test | Read the failure logs"
+          ansible.builtin.set_fact:
+            _fail_logs: >-
+              {{ dict(['missing', 'missing-features', 'mcp-set-fails', 'set-fails', 'policy']
+                      | zip([lookup('ansible.builtin.file', _tmp.path ~ '/missing/projected-missing/out.log'),
+                             lookup('ansible.builtin.file', _tmp.path ~ '/missing-features/projected-missing-features/out.log'),
+                             lookup('ansible.builtin.file', _tmp.path ~ '/mcp-set-fails/projected-mcp-set-fails/out.log'),
+                             lookup('ansible.builtin.file', _tmp.path ~ '/set-fails/projected-set-fails/out.log'),
+                             lookup('ansible.builtin.file', _tmp.path ~ '/policy/projected-policy/out.log')])) }}
+
+        - name: "app_keycloak_config | test | Projected mode fails on a missing input, a failed secret update and a refused password"
+          ansible.builtin.assert:
+            that:
+              - _rc['projected-missing'] != 0
+              - "'Projected credentials missing or empty: EDP_OIDC_CLIENT_SECRET - Keycloak left unchanged' in _fail_logs['missing']"
+              - (lookup('ansible.builtin.file', _tmp.path ~ '/missing/kc-state.json') | from_json).realms == {}
+              - _rc['projected-missing-features'] != 0
+              - "'Projected credentials missing or empty: MCP_CLIENT_SECRET GRAFANA_OAUTH_CLIENT_SECRET OIDC_CLIENT_SECRET FEDERATION_BIND_PASSWORD - Keycloak left unchanged' in _fail_logs['missing-features']"
+              - _rc['projected-mcp-set-fails'] != 0
+              - "'MCP client configuration failed - the projected MCP client secret is not in Keycloak' in _fail_logs['mcp-set-fails']"
+              - _rc['projected-set-fails'] != 0
+              - "'The EnterpriseRAG-oidc-minio client secret was not set from the projection' in _fail_logs['set-fails']"
+              - "'Keycloak does not hold every projected credential' in _fail_logs['set-fails']"
+              - _rc['projected-policy'] != 0
+              - "\"Failed to create user 'erag-admin' with the projected password (HTTP 400)\" in _fail_logs['policy']"
+              - "'erag-admin' not in (lookup('ansible.builtin.file', _tmp.path ~ '/policy/kc-state.json') | from_json).realms.EnterpriseRAG.users"
+            fail_msg: failure cases (rc {{ _rc['projected-missing'] }}, {{ _rc['projected-set-fails'] }}, {{ _rc['projected-policy'] }})
+            quiet: true
+
+      always:
+        - name: "app_keycloak_config | test | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

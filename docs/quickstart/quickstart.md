@@ -130,7 +130,7 @@ Then add the same line to your local `/etc/hosts`.
 - Keycloak: `https://keycloak.solutions.ai`
 - Grafana: `https://grafana.solutions.ai`
 
-**Credentials:** `env/local/logs/rag/default_credentials.yaml` (one-time passwords; change after first login).
+**Credentials:** the UI users' one-time passwords are in `env/local/logs/rag/default_credentials.txt`, the Keycloak admin and service passwords in `env/local/logs/rag/default_credentials.yaml`; change the UI passwords after first login. With `secrets_backend: openbao` they are in OpenBao instead: see [Credentials in OpenBao](../deploy/openbao.md#first-login-credentials). Full table: [Install - Credentials](../deploy/install_rag.md#credentials).
 
 ## Next steps
 

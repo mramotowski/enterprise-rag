@@ -1,0 +1,108 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+
+   openbao adapter: one importer run (migration, AD-12) = this ConfigMap
+   (script + plan) and Job. Rendered by tasks/adapters/openbao/run_worker.yaml
+   from import.yaml. Non-secret input only: the plan (credential ids, KV paths,
+   Secret names and keys) and the settings in env. The importer reads the
+   legacy Secrets through the Kubernetes API with its own projected token (RBAC
+   limited by resourceNames) and logs in to OpenBao with a second projected
+   token; both CAs come from ConfigMaps. #}
+{% set _labels = {
+     'app.kubernetes.io/part-of': 'erag-secrets',
+     'app.kubernetes.io/component': app_secrets_job_component,
+     'app.kubernetes.io/managed-by': 'app_secrets',
+     'erag-secrets/op': app_secrets_worker_op} %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ _app_secrets_job_name | to_json }}
+  namespace: {{ app_secrets_worker_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  secrets_importer.py: {{ lookup('ansible.builtin.file', role_path ~ '/files/secrets_importer.py') | to_json }}
+  plan.json: {{ app_secrets_importer_plan | to_json | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _app_secrets_job_name | to_json }}
+  namespace: {{ app_secrets_worker_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ app_secrets_worker_timeout | int }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {{ _labels | to_json }}
+    spec:
+      serviceAccountName: {{ app_secrets_importer_sa | to_json }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: importer
+          image: {{ app_secrets_importer_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-I", "/etc/erag-secrets/secrets_importer.py"]
+          env:
+            - {name: BAO_ADDR, value: {{ app_secrets_openbao_address | trim | to_json }}}
+            - {name: BAO_CACERT, value: "/etc/openbao-ca/ca.crt"}
+            - {name: BAO_CLIENT_TIMEOUT, value: {{ app_secrets_worker_bao_timeout | to_json }}}
+            - {name: OB_AUTH_MOUNT, value: {{ app_secrets_openbao_auth_mount | to_json }}}
+            - {name: OB_ROLE, value: {{ app_secrets_openbao_importer_role | to_json }}}
+            - {name: OB_JWT_FILE, value: "/var/run/secrets/erag-importer/openbao-token"}
+            - {name: OB_PLAN_FILE, value: "/etc/erag-secrets/plan.json"}
+            - {name: KUBE_API, value: {{ app_secrets_importer_kube_api | to_json }}}
+            - {name: KUBE_CACERT, value: "/etc/kube-ca/ca.crt"}
+            - {name: KUBE_TOKEN_FILE, value: "/var/run/secrets/erag-importer/kube-token"}
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: importer, mountPath: /etc/erag-secrets, readOnly: true}
+            - {name: openbao-ca, mountPath: /etc/openbao-ca, readOnly: true}
+            - {name: kube-ca, mountPath: /etc/kube-ca, readOnly: true}
+            - {name: tokens, mountPath: /var/run/secrets/erag-importer, readOnly: true}
+      volumes:
+        - name: importer
+          configMap:
+            name: {{ _app_secrets_job_name | to_json }}
+            defaultMode: 0444
+        - name: openbao-ca
+          configMap:
+            name: {{ app_secrets_openbao_ca_configmap | to_json }}
+            items:
+              - {key: ca.crt, path: ca.crt}
+        # Published by Kubernetes in every namespace: the API server CA.
+        - name: kube-ca
+          configMap:
+            name: kube-root-ca.crt
+            items:
+              - {key: ca.crt, path: ca.crt}
+        - name: tokens
+          projected:
+            sources:
+              # No audience: the API server's own.
+              - serviceAccountToken:
+                  expirationSeconds: 600
+                  path: kube-token
+              - serviceAccountToken:
+                  audience: {{ app_secrets_openbao_audience | to_json }}
+                  expirationSeconds: 600
+                  path: openbao-token

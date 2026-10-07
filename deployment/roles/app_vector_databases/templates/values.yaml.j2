@@ -2,9 +2,16 @@
 Copyright (C) 2024-2026 Intel Corporation
 SPDX-License-Identifier: Apache-2.0
 #}
+{# With projected Secrets (ESO) the chart templates no Secret and no password
+   is rendered here. #}
+{% if app_secrets_projected | default(false) %}
+externalSecrets: true
+{% endif %}
 
 {% if vector_databases_vector_store == "pgvector" %}
+{% if not (app_secrets_projected | default(false)) %}
 vector_database_password: {{ POSTGRES_PASSWORD }}
+{% endif %}
 vector_database_username: {{ vector_database_connection_username | default("edp") }}
 vector_database_name: {{ vector_database_name | default("vdb") }}
 
@@ -14,7 +21,9 @@ pgvector:
 
 {% if vector_databases_vector_store == "mssql" %}
 {% set mssql = vector_databases_stores.mssql %}
+{% if not (app_secrets_projected | default(false)) %}
 vector_database_password: {{ MSSQL_PASSWORD }}
+{% endif %}
 vector_database_username: {{ vector_database_connection_username | default("edp") }}
 vector_database_name: {{ vector_database_name | default("vdb") }}
 
@@ -29,7 +38,9 @@ mssql:
 {% set redis = vector_databases_stores['redis-cluster'] %}
 
 vectorStore: {{ vector_databases_vector_store }}
+{% if not (app_secrets_projected | default(false)) %}
 vector_database_password: {{ REDIS_PASSWORD }}
+{% endif %}
 
 redis-cluster:
   cluster:

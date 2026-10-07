@@ -1,0 +1,121 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+
+   openbao adapter: one rotator run (rotation of one credential, AD-9) = this
+   ConfigMap (script + plan) and Job. Rendered by
+   tasks/adapters/openbao/run_worker.yaml from rotate_one.yaml. Non-secret
+   input only: the plan (credential id, KV path, keys, generator, hook and its
+   server address) and the settings in env. The rotator runs under the worker
+   ServiceAccount and logs in to OpenBao with a projected token. Only a
+   Keycloak hook also gets an API-audience token and the API CA, to read the
+   platform admin Secret (a Role that exists only during the rotation). #}
+{% set _kube = app_secrets_rotator_plan.hook == 'keycloak-client-secret-set' %}
+{% set _labels = {
+     'app.kubernetes.io/part-of': 'erag-secrets',
+     'app.kubernetes.io/component': app_secrets_job_component,
+     'app.kubernetes.io/managed-by': 'app_secrets',
+     'erag-secrets/op': app_secrets_worker_op} %}
+{# Istio ambient with mesh-wide STRICT mTLS: the target namespaces accept only
+   mesh traffic, so the pod joins the mesh. #}
+{% set _pod_labels = _labels | combine({'istio.io/dataplane-mode': 'ambient'} if istio_enabled | default(false) | bool else {}) %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ _app_secrets_job_name | to_json }}
+  namespace: {{ app_secrets_worker_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  secrets_rotator.py: {{ lookup('ansible.builtin.file', role_path ~ '/files/secrets_rotator.py') | to_json }}
+  plan.json: {{ app_secrets_rotator_plan | to_json | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _app_secrets_job_name | to_json }}
+  namespace: {{ app_secrets_worker_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ app_secrets_worker_timeout | int }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {{ _pod_labels | to_json }}
+    spec:
+      serviceAccountName: {{ app_secrets_worker_sa | to_json }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rotator
+          image: {{ app_secrets_rotator_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-I", "/etc/erag-secrets/secrets_rotator.py"]
+          env:
+            - {name: BAO_ADDR, value: {{ app_secrets_openbao_address | trim | to_json }}}
+            - {name: BAO_CACERT, value: "/etc/openbao-ca/ca.crt"}
+            - {name: BAO_CLIENT_TIMEOUT, value: {{ app_secrets_worker_bao_timeout | to_json }}}
+            - {name: OB_AUTH_MOUNT, value: {{ app_secrets_openbao_auth_mount | to_json }}}
+            - {name: OB_ROLE, value: {{ app_secrets_openbao_worker_role | to_json }}}
+            - {name: OB_JWT_FILE, value: "/var/run/secrets/erag-rotator/openbao-token"}
+            - {name: OB_PLAN_FILE, value: "/etc/erag-secrets/plan.json"}
+{% if _kube %}
+            - {name: KUBE_API, value: {{ app_secrets_importer_kube_api | to_json }}}
+            - {name: KUBE_CACERT, value: "/etc/kube-ca/ca.crt"}
+            - {name: KUBE_TOKEN_FILE, value: "/var/run/secrets/erag-rotator/kube-token"}
+{% endif %}
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: rotator, mountPath: /etc/erag-secrets, readOnly: true}
+            - {name: openbao-ca, mountPath: /etc/openbao-ca, readOnly: true}
+{% if _kube %}
+            - {name: kube-ca, mountPath: /etc/kube-ca, readOnly: true}
+{% endif %}
+            - {name: tokens, mountPath: /var/run/secrets/erag-rotator, readOnly: true}
+      volumes:
+        - name: rotator
+          configMap:
+            name: {{ _app_secrets_job_name | to_json }}
+            defaultMode: 0444
+        - name: openbao-ca
+          configMap:
+            name: {{ app_secrets_openbao_ca_configmap | to_json }}
+            items:
+              - {key: ca.crt, path: ca.crt}
+{% if _kube %}
+        # Published by Kubernetes in every namespace: the API server CA.
+        - name: kube-ca
+          configMap:
+            name: kube-root-ca.crt
+            items:
+              - {key: ca.crt, path: ca.crt}
+{% endif %}
+        - name: tokens
+          projected:
+            sources:
+{% if _kube %}
+              # No audience: the API server's own.
+              - serviceAccountToken:
+                  expirationSeconds: 600
+                  path: kube-token
+{% endif %}
+              - serviceAccountToken:
+                  audience: {{ app_secrets_openbao_audience | to_json }}
+                  expirationSeconds: 600
+                  path: openbao-token

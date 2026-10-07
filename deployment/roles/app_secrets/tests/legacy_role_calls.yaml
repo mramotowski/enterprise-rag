@@ -1,0 +1,344 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_role_calls.yaml: the credential tasks of the component roles
+# as they were before they switched to app_secrets,
+# in components.yaml order. Releases and Jobs are simulated by
+# sim_release.yaml, the same way as in port_role_calls.yaml.
+
+---
+# --- app_pre_install ---------------------------------------------------------------
+- name: "app_pre_install | Load credentials from password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: lookup.yaml
+
+- name: "app_pre_install | Load init passwords"
+  ansible.builtin.include_role:
+    name: app_generate_password
+
+# --- app_vector_databases (the engine in vector_databases_vector_store) -------------
+- name: "app_vector_databases | Configure Redis-based vector store"
+  when: vector_databases_vector_store == 'redis-cluster'
+  block:
+    - name: "app_vector_databases | Generate password for Redis"
+      ansible.builtin.include_role:
+        name: app_generate_password
+        tasks_from: generate_password.yaml
+      loop:
+        - {name: 'REDIS', user: "default"}
+      when: REDIS_PASSWORD is not defined
+
+- name: "app_vector_databases | Configure Postgres-like vector store"
+  when: vector_databases_vector_store == 'pgvector'
+  block:
+    - name: "app_vector_databases | Generate password"
+      ansible.builtin.include_role:
+        name: app_generate_password
+        tasks_from: generate_password.yaml
+      loop:
+        - {name: 'POSTGRES', user: "{{ vector_database_connection_username }}"}
+
+- name: "app_vector_databases | Configure Mssql-like vector store"
+  when: vector_databases_vector_store == 'mssql'
+  block:
+    - name: "app_vector_databases | Generate password"
+      ansible.builtin.include_role:
+        name: app_generate_password
+        tasks_from: generate_password.yaml
+      loop:
+        - {name: 'MSSQL', user: "default"}
+
+- name: "app_secrets | test | sim | vector database release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: vector databases
+    sim_secrets: "{{ sim_vdb_secrets }}"
+
+- name: "app_vector_databases | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ vector_databases_namespace }}"
+    secret_name: "redis-cluster-secret"
+    password_mappings:
+      - {key: REDIS_PASSWORD, variable: REDIS_PASSWORD, user: "default"}
+  when: vector_databases_vector_store in ['redis-cluster']
+
+- name: "app_vector_databases | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ vector_databases_namespace }}"
+    secret_name: "pgvector-secret"
+    password_mappings:
+      - {key: POSTGRES_PASSWORD, variable: POSTGRES_PASSWORD, user: "{{ vector_database_connection_username }}"}
+  when: vector_databases_vector_store == 'pgvector'
+
+- name: "app_vector_databases | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ vector_databases_namespace }}"
+    secret_name: "mssql-secret"
+    password_mappings:
+      - {key: MSSQL_PASSWORD, variable: MSSQL_PASSWORD, user: "{{ vector_database_connection_username }}"}
+  when: vector_databases_vector_store == 'mssql'
+
+# --- app_keycloak_config -------------------------------------------------------------
+- name: "app_keycloak_config | Mark admin secret for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ keycloak_namespace }}"
+    secret_name: "{{ keycloak_admin_secret_name }}"
+    password_mappings:
+      - { key: password, variable: KEYCLOAK_REALM_ADMIN_PASSWORD, user: "{{ keycloak_admin_user }}" }
+
+- name: "app_keycloak_config | Check for existing Grafana SSO env Secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ grafana_oauth_secret_name }}"
+    namespace: "{{ grafana_oauth_namespace }}"
+  register: _kc_grafana_sso
+  failed_when: false
+
+- name: "app_keycloak_config | Reuse existing Grafana OAuth client secret"
+  ansible.builtin.set_fact:
+    grafana_oauth_client_secret: "{{ _kc_grafana_sso.resources[0].data['GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET'] | b64decode }}"
+  when:
+    - (_kc_grafana_sso.resources | default([])) | length > 0
+    - _kc_grafana_sso.resources[0].data['GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET'] is defined
+  no_log: "{{ secure_logs | default(true) }}"
+
+- name: "app_keycloak_config | Generate Grafana OAuth client secret (first run)"
+  ansible.builtin.set_fact:
+    grafana_oauth_client_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+  when: grafana_oauth_client_secret | default('') | length == 0
+  no_log: "{{ secure_logs | default(true) }}"
+
+- name: "app_secrets | test | sim | configurator Job"
+  ansible.builtin.include_tasks: sim_configurator.yaml
+
+- name: "app_keycloak_config | Read erag-credentials secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ credentials_secret_name }}"
+    namespace: "{{ keycloak_namespace }}"
+  register: erag_credentials_secret
+  no_log: "{{ secure_logs }}"
+
+- name: "app_keycloak_config | Write default_credentials.txt from erag-credentials secret"
+  ansible.builtin.copy:
+    dest: "{{ rag_log_dir }}/default_credentials.txt"
+    mode: '0600'
+    content: |
+      KEYCLOAK_ERAG_ADMIN_USERNAME={{ erag_credentials_secret.resources[0].data['KEYCLOAK_ERAG_ADMIN_USERNAME'] | b64decode }}
+      KEYCLOAK_ERAG_ADMIN_PASSWORD="{{ erag_credentials_secret.resources[0].data['KEYCLOAK_ERAG_ADMIN_PASSWORD'] | b64decode }}"
+      KEYCLOAK_ERAG_USER_USERNAME={{ erag_credentials_secret.resources[0].data['KEYCLOAK_ERAG_USER_USERNAME'] | b64decode }}
+      KEYCLOAK_ERAG_USER_PASSWORD="{{ erag_credentials_secret.resources[0].data['KEYCLOAK_ERAG_USER_PASSWORD'] | b64decode }}"
+      KEYCLOAK_ERAG_MAINTAINER_USERNAME={{ erag_credentials_secret.resources[0].data['KEYCLOAK_ERAG_MAINTAINER_USERNAME'] | b64decode }}
+      KEYCLOAK_ERAG_MAINTAINER_PASSWORD="{{ erag_credentials_secret.resources[0].data['KEYCLOAK_ERAG_MAINTAINER_PASSWORD'] | b64decode }}"
+      {% if mcp_enabled | default(false) | bool and erag_credentials_secret.resources[0].data['MCP_CLIENT_SECRET'] is defined %}
+      MCP_CLIENT_ID={{ erag_credentials_secret.resources[0].data['MCP_CLIENT_ID'] | b64decode }}
+      MCP_CLIENT_SECRET="{{ erag_credentials_secret.resources[0].data['MCP_CLIENT_SECRET'] | b64decode }}"
+      {% endif %}
+  no_log: "{{ secure_logs }}"
+  when: erag_credentials_secret.resources | length > 0
+
+- name: "app_secrets | test | sim | Grafana SSO env"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: Grafana SSO env
+    sim_secrets:
+      - {namespace: "{{ grafana_oauth_namespace }}", name: "{{ grafana_oauth_secret_name }}", data: {GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: "{{ grafana_oauth_client_secret }}"}}
+
+# --- app_chat_history -------------------------------------------------------------------
+- name: "app_chat_history | Generate password"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - name: "CHAT_HISTORY_POSTGRES"
+      user: "{{ chat_history_db_user }}"
+
+- name: "app_secrets | test | sim | chat-history release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: chat-history
+    sim_secrets: "{{ sim_chat_history_secrets }}"
+
+- name: "app_chat_history | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ chat_history_namespace }}"
+    secret_name: "{{ chat_history_db_password_secret_name }}"
+    password_mappings:
+      - {key: POSTGRES_PASSWORD, variable: CHAT_HISTORY_POSTGRES_PASSWORD, user: "{{ chat_history_db_user }}"}
+
+# --- app_nats ----------------------------------------------------------------------------
+- name: "app_nats | Check for existing auth secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ nats_auth_secret_name }}"
+    namespace: "{{ nats_namespace }}"
+  register: _nats_auth_secret
+
+- name: "app_nats | Generate and store NKey material"
+  when:
+    - (_nats_auth_secret.resources | default([]) | length == 0)
+      or (nats_auth_required_keys | difference(
+            _nats_auth_secret.resources[0].data | default({})
+            | dict2items | rejectattr('value', 'equalto', '')
+            | map(attribute='key') | list) | length > 0)
+  block:
+    # gen_nkey.py moved unchanged from app_nats/files to app_secrets/files.
+    - name: "app_nats | Generate client NKey pair"
+      ansible.builtin.command:
+        cmd: python3 {{ playbook_dir }}/../files/gen_nkey.py
+      register: _nats_nkey
+      changed_when: true
+      no_log: "{{ secure_logs }}"
+
+    - name: "app_nats | Create auth secret"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ nats_auth_secret_name }}"
+            namespace: "{{ nats_namespace }}"
+          data:
+            user.nk: "{{ _nats_nkey.stdout_lines[0] | b64encode }}"
+            user.pub: "{{ _nats_nkey.stdout_lines[1] | b64encode }}"
+      no_log: "{{ secure_logs }}"
+
+- name: "app_secrets | test | sim | NATS mirror"
+  ansible.builtin.include_tasks: sim_nats_mirror.yaml
+
+# --- app_fingerprint ------------------------------------------------------------------------
+- name: "app_fingerprint | Generate password"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - name: "FINGERPRINT_POSTGRES"
+      user: "{{ fingerprint_db_user }}"
+
+- name: "app_secrets | test | sim | fingerprint release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: fingerprint
+    sim_secrets: "{{ sim_fingerprint_secrets }}"
+
+- name: "app_fingerprint | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ fingerprint_namespace }}"
+    secret_name: "{{ fingerprint_db_password_secret_name }}"
+    password_mappings:
+      - {key: password, variable: FINGERPRINT_POSTGRES_PASSWORD, user: "{{ fingerprint_db_user }}"}
+
+# --- app_edp ----------------------------------------------------------------------------------
+- name: "app_edp | Generate random string for keys"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_key
+  loop:
+    - {name: EDP_MINIO_ACCESS_KEY}
+    - {name: EDP_MINIO_SECRET_KEY}
+  no_log: "{{ secure_logs }}"
+
+- name: "app_edp | Generate password"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password
+  loop:
+    - {name: EDP_REDIS, user: "{{ edp_redis_username }}"}
+    - {name: EDP_POSTGRESQL, user: "{{ edp_postgresql_user_username }}"}
+    - {name: EDP_POSTGRESQL_ADMIN, user: "{{ edp_postgresql_admin_username }}"}
+  no_log: "{{ secure_logs }}"
+
+# seaweedfs.yaml (edp_storage_type seaweedfs)
+- name: "app_edp | Check if SeaweedFS admin secret exists"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: seaweedfs-admin-secret
+    namespace: "{{ edp_seaweedfs_namespace }}"
+  register: seaweedfs_admin_secret_check
+
+- name: "app_edp | Generate SeaweedFS admin password"
+  ansible.builtin.set_fact:
+    seaweedfs_admin_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+    seaweedfs_admin_user: "admin"
+  when: seaweedfs_admin_secret_check.resources | length == 0
+
+- name: "app_secrets | test | sim | SeaweedFS Secrets"
+  ansible.builtin.include_tasks: sim_seaweedfs.yaml
+
+- name: "app_edp | Mark SeaweedFS secrets for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ edp_seaweedfs_namespace }}"
+    secret_name: "seaweedfs-s3-secret"
+    password_mappings:
+      - { key: admin_access_key_id, variable: EDP_SEAWEEDFS_ACCESS_KEY, user: "" }
+      - { key: admin_secret_access_key, variable: EDP_SEAWEEDFS_SECRET_KEY, user: "" }
+
+- name: "app_edp | Mark SeaweedFS admin secrets for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ edp_seaweedfs_namespace }}"
+    secret_name: "seaweedfs-admin-secret"
+    password_mappings:
+      - { key: adminUser, variable: SEAWEEDFS_ADMIN_USER, user: "" }
+      - { key: adminPassword, variable: SEAWEEDFS_ADMIN_PASSWORD, user: "" }
+
+- name: "app_edp | Update credentials file from password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: lookup.yaml
+
+- name: "app_secrets | test | sim | EDP release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: EDP
+    sim_secrets: "{{ sim_edp_secrets }}"
+
+- name: "app_edp | Mark secrets for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ edp_namespace }}"
+    secret_name: "{{ item.secret_name }}"
+    password_mappings: "{{ item.password_mappings }}"
+  loop:
+    - secret_name: "edp-access-secret"
+      password_mappings:
+        - {key: EDP_ACCESS_KEY, variable: EDP_MINIO_ACCESS_KEY, user: ""}
+        - {key: EDP_SECRET_KEY, variable: EDP_MINIO_SECRET_KEY, user: ""}
+    - secret_name: "edp-redis-secret"
+      password_mappings:
+        - {key: password, variable: EDP_REDIS_PASSWORD, user: "{{ edp_redis_username }}"}
+    - secret_name: "edp-postgresql-secret"
+      password_mappings:
+        - {key: DATABASE_PASSWORD, variable: EDP_POSTGRESQL_PASSWORD, user: "{{ edp_postgresql_user_username }}"}
+        - {key: DATABASE_ADMIN_PASSWORD, variable: EDP_POSTGRESQL_ADMIN_PASSWORD, user: "{{ edp_postgresql_admin_username }}"}

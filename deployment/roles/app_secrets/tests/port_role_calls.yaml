@@ -1,0 +1,473 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_role_calls.yaml: the same credential tasks after the switch
+# to app_secrets, as the component roles make them now (test_role_calls.yaml
+# checks that the roles carry these exact port calls), in components.yaml
+# order. Releases and Jobs are simulated as in legacy_role_calls.yaml.
+
+---
+# --- app_pre_install ---------------------------------------------------------------
+- name: "app_pre_install | Check where the operator-supplied secrets come from"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+
+- name: "app_pre_install | Open the credential store"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: probe.yaml
+
+- name: "app_pre_install | Import the running credentials into the credential store"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: import.yaml
+  vars:
+    secret_ids: "{{ app_pre_install_import_secret_ids }}"
+  when: app_secrets_projected | default(false)
+
+# project_hf_token.yaml (also run first by app_inference_models).
+- name: "app_pre_install | HF token | Check where the operator-supplied secrets come from"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+  vars:
+    configuration_issues: []
+  when: app_secrets_projected is not defined
+
+- name: "app_pre_install | HF token | Projected HF token"
+  when:
+    - app_secrets_projected | default(false)
+    - hugging_token_projected is not defined
+  block:
+    - name: "app_pre_install | Look up the operator HF token in the credential store"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: status.yaml
+      vars:
+        secret_ids: [user/hf-token]
+
+    - name: "app_pre_install | Record whether the HF token is in the credential store"
+      ansible.builtin.set_fact:
+        hugging_token_projected: "{{ app_secrets_status['user/hf-token'].exists | bool }}"
+
+    - name: "app_pre_install | Project the HF token"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [user/hf-token]
+      when: hugging_token_projected | bool
+
+# --- app_vector_databases (the engine in vector_databases_vector_store) -------------
+- name: "app_vector_databases | Configure Redis-based vector store"
+  when: vector_databases_vector_store == 'redis-cluster'
+  block:
+    - name: "app_vector_databases | Generate password for Redis"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [vector-db/redis]
+
+- name: "app_vector_databases | Configure Postgres-like vector store"
+  when: vector_databases_vector_store == 'pgvector'
+  block:
+    - name: "app_vector_databases | Generate password"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [vector-db/pgvector]
+
+- name: "app_vector_databases | Configure Mssql-like vector store"
+  when: vector_databases_vector_store == 'mssql'
+  block:
+    - name: "app_vector_databases | Generate password"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [vector-db/mssql]
+
+- name: "app_secrets | test | sim | vector database release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: vector databases
+    sim_secrets: "{{ sim_vdb_secrets }}"
+
+- name: "app_vector_databases | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [vector-db/redis]
+    ensure_phase: after_deploy
+  when: vector_databases_vector_store in ['redis-cluster']
+
+- name: "app_vector_databases | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [vector-db/pgvector]
+    ensure_phase: after_deploy
+  when: vector_databases_vector_store == 'pgvector'
+
+- name: "app_vector_databases | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [vector-db/mssql]
+    ensure_phase: after_deploy
+  when: vector_databases_vector_store == 'mssql'
+
+# --- app_keycloak_config -------------------------------------------------------------
+- name: "app_keycloak_config | Mark admin secret for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [platform/keycloak-admin]
+    ensure_phase: after_deploy
+
+- name: "app_keycloak_config | Check for existing Grafana SSO env Secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ grafana_oauth_secret_name }}"
+    namespace: "{{ grafana_oauth_namespace }}"
+  register: _kc_grafana_sso
+  failed_when: false
+
+- name: "app_keycloak_config | Reuse existing Grafana OAuth client secret"
+  ansible.builtin.set_fact:
+    grafana_oauth_client_secret: "{{ _kc_grafana_sso.resources[0].data['GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET'] | b64decode }}"
+  when:
+    - (_kc_grafana_sso.resources | default([])) | length > 0
+    - _kc_grafana_sso.resources[0].data['GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET'] is defined
+  no_log: "{{ secure_logs | default(true) }}"
+
+- name: "app_keycloak_config | Generate Grafana OAuth client secret (first run)"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [keycloak/grafana-oauth]
+  when: grafana_oauth_client_secret | default('') | length == 0
+
+# Projected Secrets only (skipped here: local backend).
+- name: "app_keycloak_config | Ensure the Keycloak credentials and configurator inputs"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: >-
+      {{ ['keycloak/erag-admin', 'keycloak/erag-user', 'keycloak/erag-maintainer', 'keycloak/edp-oidc']
+         + (['keycloak/mcp-client'] if mcp_enabled | default(false) | bool else [])
+         + (['keycloak/grafana-oauth'] if grafana_oauth_domain | default('', true) | string | length > 0 else [])
+         + (['user/keycloak-oidc'] if erag_keycloak_oidc_endpoint | default('', true) | string | length > 0 else [])
+         + (['user/ldap-bind'] if erag_keycloak_federation_endpoint | default('', true) | string | length > 0 else []) }}
+  when: app_secrets_projected | default(false)
+
+- name: "app_secrets | test | sim | configurator Job"
+  ansible.builtin.include_tasks: sim_configurator.yaml
+
+- name: "app_keycloak_config | Write the Keycloak credentials file from erag-credentials"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: >-
+      {{ ['keycloak/erag-admin', 'keycloak/erag-user', 'keycloak/erag-maintainer']
+         + (['keycloak/mcp-client'] if mcp_enabled | default(false) | bool else []) }}
+    ensure_phase: after_deploy
+
+# Projected Secrets only (skipped here: local backend).
+- name: "app_keycloak_config | grafana-sso | Project grafana-sso-env"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [keycloak/grafana-oauth]
+  when: app_secrets_projected | default(false)
+
+- name: "app_secrets | test | sim | Grafana SSO env"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: Grafana SSO env
+    sim_secrets:
+      - {namespace: "{{ grafana_oauth_namespace }}", name: "{{ grafana_oauth_secret_name }}", data: {GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: "{{ grafana_oauth_client_secret }}"}}
+
+# --- app_chat_history -------------------------------------------------------------------
+- name: "app_chat_history | Generate password"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [chat-history/postgres]
+
+- name: "app_secrets | test | sim | chat-history release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: chat-history
+    sim_secrets: "{{ sim_chat_history_secrets }}"
+
+- name: "app_chat_history | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [chat-history/postgres]
+    ensure_phase: after_deploy
+
+# --- app_nats ----------------------------------------------------------------------------
+- name: "app_nats | Check for existing auth secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ nats_auth_secret_name }}"
+    namespace: "{{ nats_namespace }}"
+  register: _nats_auth_secret
+
+- name: "app_nats | Generate and store NKey material"
+  when:
+    - (_nats_auth_secret.resources | default([]) | length == 0)
+      or (nats_auth_required_keys | difference(
+            _nats_auth_secret.resources[0].data | default({})
+            | dict2items | rejectattr('value', 'equalto', '')
+            | map(attribute='key') | list) | length > 0)
+  block:
+    - name: "app_nats | Generate client NKey pair"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [nats/auth]
+
+    - name: "app_nats | Create auth secret"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ nats_auth_secret_name }}"
+            namespace: "{{ nats_namespace }}"
+          data:
+            user.nk: "{{ nats_auth_nkey_seed | b64encode }}"
+            user.pub: "{{ nats_auth_nkey_public | b64encode }}"
+      no_log: "{{ secure_logs }}"
+
+- name: "app_secrets | test | sim | NATS mirror"
+  ansible.builtin.include_tasks: sim_nats_mirror.yaml
+
+# --- app_fingerprint ------------------------------------------------------------------------
+- name: "app_fingerprint | Generate password"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [fingerprint/postgres]
+
+- name: "app_secrets | test | sim | fingerprint release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: fingerprint
+    sim_secrets: "{{ sim_fingerprint_secrets }}"
+
+- name: "app_fingerprint | Mark secret for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [fingerprint/postgres]
+    ensure_phase: after_deploy
+
+# --- app_edp ----------------------------------------------------------------------------------
+# tasks/secret_config.yaml sets it (with edp_secret_config).
+- name: "app_secrets | test | sim | EDP storage type"
+  ansible.builtin.set_fact:
+    edp_secret_storage: "{{ edp_storage_type | default('seaweedfs') }}"
+
+- name: "app_edp | Generate keys and passwords"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [edp/object-store, edp/redis, edp/postgresql]
+
+# Projected Secrets only (skipped here: local backend).
+- name: "app_edp | Project the minio OIDC client secret"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [keycloak/edp-oidc]
+  when: app_secrets_projected | default(false)
+
+- name: "app_edp | Check the operator S3 keys"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [user/edp-s3]
+  when: edp_secret_storage in ['s3', 's3compatible']
+
+- name: "app_edp | Check the SharePoint client secret"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [user/sharepoint]
+  when: erag_keycloak_oidc_tenant_id | default('', true) | string | trim | length > 0
+
+# seaweedfs.yaml (edp_storage_type seaweedfs)
+- name: "app_edp | Check if SeaweedFS admin secret exists"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: seaweedfs-admin-secret
+    namespace: "{{ edp_seaweedfs_namespace }}"
+  register: seaweedfs_admin_secret_check
+
+- name: "app_edp | Set SeaweedFS admin user"
+  ansible.builtin.set_fact:
+    seaweedfs_admin_user: "admin"
+  when: seaweedfs_admin_secret_check.resources | length == 0
+
+- name: "app_edp | Generate SeaweedFS admin password"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [seaweedfs/admin]
+  when: (app_secrets_projected | default(false)) or seaweedfs_admin_secret_check.resources | length == 0
+
+- name: "app_secrets | test | sim | SeaweedFS Secrets"
+  ansible.builtin.include_tasks: sim_seaweedfs.yaml
+
+- name: "app_edp | Mark SeaweedFS secrets for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [edp/object-store, seaweedfs/admin]
+    ensure_phase: after_deploy
+
+# Test only: on a fresh install edp-access-secret is created by the EDP release
+# below, so marking before it must have skipped it, not created it.
+- name: "app_secrets | test | after_deploy did not create Secrets ahead of their release"
+  kubernetes.core.k8s_info:
+    kind: Secret
+    name: edp-access-secret
+    namespace: "{{ edp_namespace }}"
+  register: _test_early_secret
+  failed_when: _test_early_secret.resources | length > 0
+  when: inventory_hostname is match('port_fresh')
+
+- name: "app_secrets | test | sim | EDP release"
+  ansible.builtin.include_tasks: sim_release.yaml
+  vars:
+    sim_label: EDP
+    sim_secrets: "{{ sim_edp_secrets }}"
+
+- name: "app_edp | Mark secrets for password management"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [edp/object-store, edp/redis, edp/postgresql]
+    ensure_phase: after_deploy
+
+# --- app_pipeline / app_audio (projected HF token only) ------------------------------
+- name: "app_pipeline | Project the HF token into the pipeline namespace"
+  when:
+    - app_secrets_projected | default(false)
+    - hugging_token_projected | default(false) | bool
+  block:
+    - name: "app_pipeline | Ensure the HF token projection"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [user/hf-token]
+
+- name: "app_audio | Project the HF token into the audio namespace"
+  when:
+    - app_secrets_projected | default(false)
+    - hugging_token_projected | default(false) | bool
+  block:
+    - name: "app_audio | Ensure the HF token projection"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [user/hf-token]
+
+# --- app_mcp_gateway edge auth check (tasks/verify_edge_auth.yaml) --------------------
+- name: "app_mcp_gateway | Determine the credential delivery mode"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+  vars:
+    configuration_issues: []
+  when: app_secrets_projected is not defined
+
+# --- app_keycloak_config client secret drift check (tasks/check_client_drift.yaml) --------
+- name: "app_keycloak_config | Determine the credential delivery mode"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+  vars:
+    configuration_issues: []
+  when: app_secrets_projected is not defined
+
+# --- app_post_install teardown (tasks/teardown.yaml): OpenBao gate, first ------------
+- name: "app_post_install | OpenBao is usable for the credential delete"
+  when: component_action | default('install') == 'teardown'
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: probe.yaml
+  vars:
+    app_secrets_probe_teardown: true
+
+# --- app_pre_install teardown (tasks/teardown.yaml) ---------------------------------
+- name: "app_pre_install | Remove the erag credentials from the credential store"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: delete.yaml
+  vars:
+    secret_ids: "{{ app_pre_install_teardown_secret_ids }}"
+  when: component_action | default('install') == 'teardown'
+
+# --- app_pre_install rotate-only run (tasks/rotate.yaml) ----------------------------
+- name: "app_pre_install | Rotate | Rotate the requested credentials"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: rotate.yaml
+  vars:
+    secret_ids: "{{ app_pre_install_rotate_ids }}"
+  when: app_pre_install_rotate_run | default(false) | bool
+
+# --- app_post_install (tasks/install.yaml and tasks/upgrade.yaml) -------------------
+- name: "app_post_install | Remove the local credential copies after a migration"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: import.yaml
+  vars:
+    secret_ids: "{{ app_post_install_import_secret_ids }}"
+    import_phase: finalize
+  when:
+    - component_action | default('install') == 'install'
+    - app_secrets_projected | default(false)
+
+- name: "app_post_install | Upgrade — remove the local credential copies after a migration"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: import.yaml
+  vars:
+    secret_ids: "{{ app_post_install_import_secret_ids }}"
+    import_phase: finalize
+  when: app_secrets_projected | default(false)

@@ -73,3 +73,19 @@
     path: "{{ rag_tmp_dir }}"
     state: absent
   when: component_action | default('install') == 'install'
+
+# Projected Secrets, after a migration from local credentials (app_pre_install
+# imported them): now that every release has been upgraded to the
+# ESO-managed Secrets, the local copies go: the credential files, the rag tmp
+# dir, the env logs of the earlier runs and the older Helm release revisions
+# (AD-12). Install only here; upgrade.yaml does it after its snapshots.
+- name: "app_post_install | Remove the local credential copies after a migration"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: import.yaml
+  vars:
+    secret_ids: "{{ app_post_install_import_secret_ids }}"
+    import_phase: finalize
+  when:
+    - component_action | default('install') == 'install'
+    - app_secrets_projected | default(false)

@@ -1,0 +1,186 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Shared by every port operation: load the registry, expand it into a catalog
+# of concrete credential IDs, and validate secret_ids and secrets_backend
+# before any adapter runs (so nothing is written for an invalid request).
+# Expects: app_secrets_op, secret_ids (probe: optional, default every
+# credential ID), ensure_phase (ensure only, optional).
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | Load credential registry"
+  ansible.builtin.include_vars:
+    file: "{{ app_secrets_registry_file }}"
+    name: app_secrets_registry
+
+# Entries with `variants` (vector-db/<engine>) expand to one concrete ID per
+# variant (<component>/<variant>); the variant's fields override the base.
+- name: "app_secrets | {{ app_secrets_op }} | Build credential catalog"
+  ansible.builtin.set_fact:
+    app_secrets_catalog: "{{ _catalog }}"
+  vars:
+    _catalog: >-
+      {%- set out = {} -%}
+      {%- for rid, entry in app_secrets_registry.credentials.items() -%}
+        {%- if entry.variants is defined -%}
+          {%- set base = entry | dict2items | rejectattr('key', 'equalto', 'variants') | items2dict -%}
+          {%- for variant, overrides in entry.variants.items() -%}
+            {%- set _ = out.update({(rid.split('/')[0] ~ '/' ~ variant): (base | combine(overrides, {'registry_id': rid}))}) -%}
+          {%- endfor -%}
+        {%- else -%}
+          {%- set _ = out.update({rid: (entry | combine({'registry_id': rid}))}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+# platform: entries (platform-owned Secrets erag only marks) are kept apart
+# from the credential catalog; they are valid only for ensure/after_deploy.
+- name: "app_secrets | {{ app_secrets_op }} | Build platform catalog"
+  ansible.builtin.set_fact:
+    app_secrets_platform_catalog: >-
+      {{ app_secrets_registry.platform | default({}) | dict2items
+         | map('combine', {'value': {'platform': true}}, recursive=true) | items2dict }}
+
+- name: "app_secrets | {{ app_secrets_op }} | Validate registry entries"
+  ansible.builtin.assert:
+    that: _invalid | length == 0
+    fail_msg: >-
+      app_secrets | {{ app_secrets_op }} | invalid registry entries in
+      {{ app_secrets_registry_file }}: {{ _invalid | join('; ') }}
+    quiet: true
+  vars:
+    _required: ['owner_role', 'path', 'keys', 'legacy', 'rotate', 'local']
+    _invalid: >-
+      {%- set bad = [] -%}
+      {%- for cid, e in app_secrets_catalog.items() -%}
+        {%- if not (cid is match('^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$')) -%}
+          {%- set _ = bad.append(cid ~ ': id is not lower-kebab <component>/<credential>') -%}
+        {%- endif -%}
+        {%- set missing = _required | reject('in', e.keys() | list) | list -%}
+        {%- if missing | length > 0 -%}
+          {%- set _ = bad.append(cid ~ ': missing ' ~ (missing | join(', '))) -%}
+        {%- elif (e.local.mechanism | default('')) not in app_secrets_local_mechanisms -%}
+          {%- set _ = bad.append(cid ~ ': local.mechanism must be one of ' ~ (app_secrets_local_mechanisms | join(', '))) -%}
+        {%- elif not ((e.rotate.hook is defined and e.rotate.restart is defined) or (e.rotate.none | default(false) and e.rotate.reason is defined)) -%}
+          {%- set _ = bad.append(cid ~ ': rotate must be {hook, restart} or {none, reason}') -%}
+        {%- elif e.rotate.hook is defined -%}
+          {%- set r = e.rotate -%}
+          {%- set gen = e['keys'] | dict2items | rejectattr('value.generated_by', 'defined')
+                        | selectattr('value.generate.type', 'in', ['password', 'hex']) | map(attribute='key') | list -%}
+          {%- if r.hook not in app_secrets_rotate_hooks -%}
+            {%- set _ = bad.append(cid ~ ': unknown rotate.hook ' ~ r.hook ~ ' (valid: ' ~ (app_secrets_rotate_hooks.keys() | sort | join(', ')) ~ ')') -%}
+          {%- elif r.restart is string or r.restart is not sequence
+                   or (r.restart | reject('in', (app_secrets_registry.workloads | default({}, true)).keys() | list) | list | length > 0) -%}
+            {%- set _ = bad.append(cid ~ ': rotate.restart must list names of the registry workloads: map') -%}
+          {%- elif r.hook == 'operator-write' and ('keys' in r or 'target' in r or not e.path.startswith('erag/user/')) -%}
+            {%- set _ = bad.append(cid ~ ': rotate.hook operator-write is for erag/user/* entries, without keys or target') -%}
+          {%- elif r.hook != 'operator-write' and ('keys' not in r or r['keys'] is string or (r['keys'] | length) != 1
+                                                   or r['keys'][0] not in gen) -%}
+            {%- set _ = bad.append(cid ~ ': rotate.keys must name exactly one kv_key with a password or hex generator') -%}
+          {%- elif r.hook != 'operator-write' and (r.target is not mapping
+                                                   or (app_secrets_rotate_hooks[r.hook] | reject('in', r.target.keys() | list) | list | length > 0)) -%}
+            {%- set _ = bad.append(cid ~ ': rotate.target of ' ~ r.hook ~ ' needs ' ~ (app_secrets_rotate_hooks[r.hook] | join(', '))) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- for wname, items in (app_secrets_registry.workloads | default({}, true)).items() -%}
+        {%- if items is string or items is not sequence or items | length == 0
+               or (items | rejectattr('namespace', 'defined') | list | length > 0)
+               or (items | rejectattr('name', 'defined') | list | length > 0)
+               or (items | rejectattr('kind', 'defined') | list | length > 0)
+               or (items | map(attribute='kind') | reject('in', app_secrets_workload_kinds) | list | length > 0) -%}
+          {%- set _ = bad.append('workloads ' ~ wname ~ ': a list of {namespace, kind (' ~ (app_secrets_workload_kinds | join(', ')) ~ '), name}') -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- for pid, p in app_secrets_platform_catalog.items() -%}
+        {%- if not (pid is match('^platform/[a-z0-9]+(-[a-z0-9]+)*$')) -%}
+          {%- set _ = bad.append(pid ~ ': platform id is not platform/<lower-kebab>') -%}
+        {%- elif pid in app_secrets_catalog -%}
+          {%- set _ = bad.append(pid ~ ': platform id is also a credential id') -%}
+        {%- elif p.owner_role is not defined or p.legacy is not defined -%}
+          {%- set _ = bad.append(pid ~ ': platform entry needs owner_role and legacy') -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ bad }}
+
+# probe works on the whole store when secret_ids is omitted.
+- name: "app_secrets | {{ app_secrets_op }} | Resolve secret_ids"
+  ansible.builtin.set_fact:
+    _app_secrets_ids: >-
+      {{ secret_ids if secret_ids is defined
+         else ((app_secrets_catalog.keys() | list) if app_secrets_op in app_secrets_all_ids_ops else none) }}
+
+- name: "app_secrets | {{ app_secrets_op }} | Validate secret_ids"
+  ansible.builtin.assert:
+    that:
+      - _app_secrets_ids is not none
+      - _app_secrets_ids is sequence
+      - _app_secrets_ids is not string
+      - _app_secrets_ids is not mapping
+      - _app_secrets_ids | length > 0
+      - _app_secrets_ids | reject('string') | list | length == 0
+    fail_msg: >-
+      app_secrets | {{ app_secrets_op }} | secret_ids must be a non-empty list
+      of credential IDs. Valid IDs: {{ _valid_ids | sort | join(', ') }}
+    quiet: true
+  vars:
+    _valid_ids: "{{ app_secrets_catalog.keys() | list + app_secrets_platform_catalog.keys() | list }}"
+
+- name: "app_secrets | {{ app_secrets_op }} | Fail on unknown credential IDs"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | unknown credential ID(s):
+      {{ _unknown | join(', ') }}. Valid IDs: {{ _valid_ids | sort | join(', ') }}
+  vars:
+    _valid_ids: "{{ app_secrets_catalog.keys() | list + app_secrets_platform_catalog.keys() | list }}"
+    _unknown: "{{ _app_secrets_ids | reject('in', _valid_ids) | list }}"
+  when: _unknown | length > 0
+
+- name: "app_secrets | {{ app_secrets_op }} | Fail on unknown ensure_phase"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | ensure | unknown ensure_phase '{{ ensure_phase }}'.
+      Valid phases: {{ app_secrets_ensure_phases | join(', ') }}
+  when:
+    - app_secrets_op == 'ensure'
+    - ensure_phase | default('before_deploy') not in app_secrets_ensure_phases
+
+- name: "app_secrets | {{ app_secrets_op }} | Fail on unknown import_phase"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | import | unknown import_phase '{{ import_phase }}'.
+      Valid phases: {{ app_secrets_import_phases | join(', ') }}
+  when:
+    - app_secrets_op == 'import'
+    - import_phase | default('import') not in app_secrets_import_phases
+
+- name: "app_secrets | {{ app_secrets_op }} | Fail on platform IDs outside ensure after_deploy"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | {{ _platform | join(', ') }}: platform
+      Secrets are only marked, with ensure and ensure_phase: after_deploy
+  vars:
+    _platform: "{{ _app_secrets_ids | select('in', app_secrets_platform_catalog.keys() | list) | list }}"
+  when:
+    - _platform | length > 0
+    - not (app_secrets_op == 'ensure' and ensure_phase | default('before_deploy') == 'after_deploy')
+
+- name: "app_secrets | {{ app_secrets_op }} | Fail on unknown secrets_backend"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | unknown secrets_backend '{{ secrets_backend }}'.
+      Valid backends: {{ app_secrets_backends | join(', ') }}
+  when: secrets_backend not in app_secrets_backends
+
+- name: "app_secrets | {{ app_secrets_op }} | Select requested credentials"
+  ansible.builtin.set_fact:
+    app_secrets_selected_ids: "{{ _app_secrets_ids | unique }}"
+
+# Tells the calling role how the registry Secrets are delivered: true when
+# the backend projects them (ESO ExternalSecrets from OpenBao). The role must
+# then not create those Secrets, nor put their values in Helm values, and
+# switches its charts to the externally managed Secrets. Set on every op, so
+# it is defined after the first port call of a run (app_pre_install probe).
+- name: "app_secrets | {{ app_secrets_op }} | Report how Secrets are delivered"
+  ansible.builtin.set_fact:
+    app_secrets_projected: "{{ secrets_backend in app_secrets_projecting_backends }}"

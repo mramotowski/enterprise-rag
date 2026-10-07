@@ -1,0 +1,312 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: delete (AD-12; app_pre_install teardown, after every erag
+# consumer is gone). The fail-fast for the whole teardown is the probe in
+# app_post_install teardown, which runs first; the checks here are the backstop
+# for OpenBao becoming unusable in between. In this order, so that an unusable
+# OpenBao stops this step before it changes anything, and a re-run finishes the job:
+#   1. setup (worker namespace, ServiceAccount, CA bundle);
+#   2. one worker Job: for each selected credential, delete its metadata and
+#      every version (bao kv metadata delete) and read it back. When the
+#      selection is the whole registry (a layer teardown), the plan ends with
+#      a purge of <cluster_id>/<layer>/: every entry left there (names the
+#      registry does not know, e.g. other erag/user/* entries) is deleted too,
+#      and the prefix must then list nothing;
+#   3. the ExternalSecrets app_secrets rendered, in every namespace: all of
+#      them for a layer teardown, else those that read a deleted credential.
+#      Foreground deletion with wait, so the Secrets they own (creationPolicy
+#      Owner) are gone too, also in namespaces erag does not delete (keycloak,
+#      monitoring, the model namespace);
+#   4. layer teardown only: the label secrets.ai-solutions/<layer> and the
+#      paths annotation come off every namespace that carries them, and the
+#      worker namespace is deleted when setup created it (marker label);
+#      otherwise only its ServiceAccount, CA bundle and erag-secrets Jobs and
+#      ConfigMaps are.
+# No value reaches Ansible: the worker reports results only.
+
+---
+- name: "app_secrets | delete | openbao | Is this a layer teardown?"
+  ansible.builtin.set_fact:
+    _app_secrets_delete_layer: "{{ app_secrets_catalog.keys() | list | difference(app_secrets_selected_ids) | length == 0 }}"
+    _app_secrets_delete_prefix: "{{ app_secrets_openbao_cluster_id }}/{{ app_secrets_openbao_layer }}"
+
+# erag_teardown_store_lost (story 17): the env's OpenBao is gone for good. Skip
+# everything that needs it (setup, worker, its checks); every cluster cleanup
+# below still runs.
+- name: "app_secrets | delete | openbao | Store lost: OpenBao entries are not deleted"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: erag_teardown_store_lost is set, so nothing is deleted from OpenBao. If that
+      store still exists somewhere (a restored backup, an external OpenBao), delete every entry
+      under {{ app_secrets_openbao_kv_mount }}/{{ _app_secrets_delete_prefix }}/ there by hand
+      (bao kv list, then bao kv metadata delete for each entry; erag/user/* included). The
+      ExternalSecrets that read the selected credentials and their Secrets are removed now
+      {{- ', and so are the layer label, the paths annotation, leftover RBAC and the worker namespace'
+          if _app_secrets_delete_layer | bool else '' }}. Pass this flag on the command line for
+      this one run only, never in config.erag.yaml: on a healthy OpenBao it would leave every
+      credential behind.
+  when: erag_teardown_store_lost | default(false) | bool
+
+- name: "app_secrets | delete | openbao | Delete the credentials from OpenBao"
+  when: not (erag_teardown_store_lost | default(false) | bool)
+  block:
+    - name: "app_secrets | delete | openbao | Set up the worker namespace"
+      ansible.builtin.include_tasks: setup.yaml
+      vars:
+        app_secrets_op: delete
+
+    - name: "app_secrets | delete | openbao | Build the worker plan"
+      ansible.builtin.set_fact:
+        app_secrets_worker_plan: >-
+          {%- set out = [] -%}
+          {%- for cid in app_secrets_selected_ids -%}
+            {%- set _ = out.append('delete ' ~ cid ~ ' ' ~ app_secrets_openbao_cluster_id ~ '/' ~ app_secrets_catalog[cid].path) -%}
+          {%- endfor -%}
+          {%- if _app_secrets_delete_layer | bool -%}
+            {%- set _ = out.append('purge ' ~ _app_secrets_delete_prefix) -%}
+          {%- endif -%}
+          {{ out }}
+
+    - name: "app_secrets | delete | openbao | Run the worker"
+      ansible.builtin.include_tasks: run_worker.yaml
+      vars:
+        app_secrets_op: delete
+        app_secrets_worker_op: delete
+
+    - name: "app_secrets | delete | openbao | Fail when OpenBao is not usable"
+      ansible.builtin.include_tasks: probe_fail.yaml
+      vars:
+        app_secrets_op: delete
+
+    - name: "app_secrets | delete | openbao | Fail on credentials that could not be deleted"
+      ansible.builtin.fail:
+        msg: >-
+          app_secrets | delete | {{ _bad | join('; ') if _bad | length > 0
+          else 'the worker failed: ' ~ (app_secrets_worker_result.done.error | default('no result')) }}.
+          Store entries reported removed before the failure are gone; the ExternalSecrets,
+          their Secrets and the namespace labels were not touched yet. Re-run the teardown
+          once fixed, or delete by hand: bao kv metadata delete -mount={{ app_secrets_openbao_kv_mount }} <path>
+      vars:
+        _results: "{{ app_secrets_worker_result.credentials }}"
+        _purge: "{{ app_secrets_worker_result.purge | default(none) }}"
+        _bad: >-
+          {%- set bad = [] -%}
+          {%- for cid in app_secrets_selected_ids -%}
+            {%- if cid not in _results -%}
+              {%- set _ = bad.append(cid ~ ': no result from the worker') -%}
+            {%- elif _results[cid].result not in ['removed', 'missing'] -%}
+              {%- set _ = bad.append(cid ~ ' (' ~ app_secrets_openbao_kv_mount ~ '/' ~ app_secrets_openbao_cluster_id
+                                     ~ '/' ~ app_secrets_catalog[cid].path ~ '): ' ~ _results[cid].result
+                                     ~ ((' - ' ~ _results[cid].error) if _results[cid].error else '')) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if _app_secrets_delete_layer | bool and bad | length == 0 -%}
+            {%- if _purge is none -%}
+              {%- set _ = bad.append(app_secrets_openbao_kv_mount ~ '/' ~ _app_secrets_delete_prefix ~ '/: no purge result from the worker') -%}
+            {%- elif _purge.state != 'ok' -%}
+              {%- set _ = bad.append(app_secrets_openbao_kv_mount ~ '/' ~ _app_secrets_delete_prefix ~ '/: ' ~ _purge.error) -%}
+            {%- endif -%}
+          {%- endif -%}
+          {{ bad }}
+      when: _bad | length > 0 or (app_secrets_worker_result.done.state | default('')) != 'ok'
+
+    - name: "app_secrets | delete | openbao | Report the credentials"
+      ansible.builtin.debug:
+        msg: >-
+          {{ app_secrets_selected_ids | select('in', _removed) | list | length }} credential(s) removed,
+          {{ app_secrets_selected_ids | reject('in', _removed) | list | length }} were not in the store
+          {{- (('; ' ~ app_secrets_worker_result.purge.removed ~ ' other entr'
+                ~ ('y' if (app_secrets_worker_result.purge.removed | int) == 1 else 'ies') ~ ' under '
+                ~ app_secrets_openbao_kv_mount ~ '/' ~ _app_secrets_delete_prefix ~ '/ removed; the prefix is empty')
+               if _app_secrets_delete_layer | bool else '') }}
+      vars:
+        _removed: >-
+          {{ app_secrets_worker_result.credentials | dict2items
+             | selectattr('value.result', 'equalto', 'removed') | map(attribute='key') | list }}
+
+- name: "app_secrets | delete | openbao | Find the ExternalSecrets"
+  kubernetes.core.k8s_info:
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+    label_selectors:
+      - "app.kubernetes.io/part-of=erag-secrets"
+      - "app.kubernetes.io/managed-by=app_secrets"
+  register: _app_secrets_es_found
+  no_log: true
+
+- name: "app_secrets | delete | openbao | Select the ExternalSecrets to delete"
+  ansible.builtin.set_fact:
+    _app_secrets_es_delete: >-
+      {%- set out = [] -%}
+      {%- for es in _app_secrets_es_found.resources | default([]) -%}
+        {%- set ids = ((es.metadata.annotations | default({}, true))['erag-secrets/credential-ids'] | default('')).split(',') -%}
+        {%- if _app_secrets_delete_layer | bool or (ids | select('in', app_secrets_selected_ids) | list | length > 0) -%}
+          {%- set _ = out.append({'name': es.metadata.name, 'namespace': es.metadata.namespace}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true
+
+- name: "app_secrets | delete | openbao | Delete the ExternalSecrets and the Secrets they own"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    delete_options:
+      propagationPolicy: Foreground
+    wait: true
+    wait_timeout: "{{ app_secrets_delete_wait_timeout | int }}"
+  loop: "{{ _app_secrets_es_delete }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  no_log: true
+
+- name: "app_secrets | delete | openbao | Remove the layer from the cluster"
+  when: _app_secrets_delete_layer | bool
+  block:
+    # Every namespace: one may carry the annotation without the label (or with
+    # another label value), and both must go.
+    - name: "app_secrets | delete | openbao | List the namespaces"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+      register: _app_secrets_all_ns
+      no_log: true
+
+    - name: "app_secrets | delete | openbao | Look up the worker namespace"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ app_secrets_worker_namespace }}"
+      register: _app_secrets_worker_ns_td
+      no_log: true
+
+    - name: "app_secrets | delete | openbao | Decide what happens to the worker namespace"
+      ansible.builtin.set_fact:
+        _app_secrets_delete_worker_ns: >-
+          {{ (_ns.metadata.labels | default({}, true)
+              | dict2items | selectattr('key', 'in', app_secrets_worker_namespace_marker.keys() | list)
+              | items2dict) == app_secrets_worker_namespace_marker }}
+      vars:
+        _ns: "{{ _app_secrets_worker_ns_td.resources | default([]) | first | default({'metadata': {}}) }}"
+
+    - name: "app_secrets | delete | openbao | Select the namespaces to unlabel"
+      ansible.builtin.set_fact:
+        _app_secrets_unlabel_ns: >-
+          {%- set out = [] -%}
+          {%- for ns in _app_secrets_all_ns.resources | default([])
+                if (app_secrets_namespace_label in (ns.metadata.labels | default({}, true))
+                    or app_secrets_paths_annotation in (ns.metadata.annotations | default({}, true)))
+                   and not (ns.metadata.name == app_secrets_worker_namespace and _app_secrets_delete_worker_ns | bool) -%}
+            {%- set _ = out.append(ns.metadata.name) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # A killed migration or rotation run (its always block never ran) leaves the
+    # importer's Roles/RoleBindings in the legacy namespaces and the rotator's in
+    # the Keycloak namespace. All of them carry part-of: erag-secrets.
+    - name: "app_secrets | delete | openbao | Find leftover importer and rotator RBAC"
+      kubernetes.core.k8s_info:
+        api_version: rbac.authorization.k8s.io/v1
+        kind: "{{ item }}"
+        label_selectors: ["app.kubernetes.io/part-of=erag-secrets"]
+      loop: ["RoleBinding", "Role"]
+      register: _app_secrets_left_rbac
+      no_log: true
+
+    - name: "app_secrets | delete | openbao | Delete leftover importer and rotator RBAC"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: rbac.authorization.k8s.io/v1
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      loop: >-
+        {%- set out = [] -%}
+        {%- for r in _app_secrets_left_rbac.results | default([]) -%}
+          {%- for o in r.resources | default([]) -%}
+            {%- set _ = out.append({'kind': r.item, 'name': o.metadata.name, 'namespace': o.metadata.namespace}) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {{ out }}
+      loop_control:
+        label: "{{ item.kind }} {{ item.namespace }}/{{ item.name }}"
+
+    # A null in the patch removes the key.
+    - name: "app_secrets | delete | openbao | Remove the layer label and paths annotation"
+      kubernetes.core.k8s:
+        state: patched
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+        definition:
+          metadata:
+            labels: "{{ {app_secrets_namespace_label: none} }}"
+            annotations: "{{ {app_secrets_paths_annotation: none} }}"
+      loop: "{{ _app_secrets_unlabel_ns }}"
+      no_log: true
+
+    - name: "app_secrets | delete | openbao | Delete the worker namespace"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ app_secrets_worker_namespace }}"
+        wait: true
+        wait_timeout: "{{ app_secrets_delete_wait_timeout | int }}"
+      when: _app_secrets_delete_worker_ns | bool
+      no_log: true
+
+    - name: "app_secrets | delete | openbao | Not created by app_secrets: delete only its objects in the worker namespace"
+      when: not (_app_secrets_delete_worker_ns | bool)
+      block:
+        - name: "app_secrets | delete | openbao | Find the erag-secrets Jobs and ConfigMaps"
+          kubernetes.core.k8s_info:
+            api_version: "{{ item.api_version }}"
+            kind: "{{ item.kind }}"
+            namespace: "{{ app_secrets_worker_namespace }}"
+            label_selectors:
+              - "app.kubernetes.io/part-of=erag-secrets"
+          loop:
+            - {api_version: batch/v1, kind: Job}
+            - {api_version: v1, kind: ConfigMap}
+          loop_control:
+            label: "{{ item.kind }}"
+          register: _app_secrets_worker_objs
+          no_log: true
+
+        - name: "app_secrets | delete | openbao | Delete them, the ServiceAccount and the CA bundle"
+          kubernetes.core.k8s:
+            state: absent
+            api_version: "{{ item.apiVersion | default('v1') }}"
+            kind: "{{ item.kind }}"
+            name: "{{ item.metadata.name }}"
+            namespace: "{{ app_secrets_worker_namespace }}"
+            delete_options:
+              propagationPolicy: Background
+          loop: >-
+            {{ _app_secrets_worker_objs.results | map(attribute='resources') | map('default', []) | flatten
+               + [{'apiVersion': 'v1', 'kind': 'ServiceAccount', 'metadata': {'name': app_secrets_worker_sa}},
+                  {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': app_secrets_openbao_ca_configmap}}] }}
+          loop_control:
+            label: "{{ item.kind }} {{ item.metadata.name }}"
+          no_log: true
+
+        - name: "app_secrets | delete | openbao | Report the worker namespace that stays"
+          ansible.builtin.debug:
+            msg: >-
+              Namespace {{ app_secrets_worker_namespace }} was not created by app_secrets
+              (no label {{ app_secrets_worker_namespace_marker.items() | map('join', '=') | join(',') }}),
+              so it stays; its erag-secrets objects, label and annotation were removed.
+
+- name: "app_secrets | delete | openbao | Report the cluster cleanup"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _app_secrets_es_delete | length }} ExternalSecret(s) and the Secrets they own deleted
+      {{- ('; label ' ~ app_secrets_namespace_label ~ ' and annotation ' ~ app_secrets_paths_annotation
+           ~ ' removed from ' ~ (_app_secrets_unlabel_ns | length) ~ ' namespace(s)'
+           ~ ('; namespace ' ~ app_secrets_worker_namespace ~ ' deleted' if _app_secrets_delete_worker_ns | bool else ''))
+          if _app_secrets_delete_layer | bool else '' }}

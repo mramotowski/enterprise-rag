@@ -1,0 +1,89 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+
+   vector_dims lookup as an in-cluster Job (projected Secrets only), rendered
+   by tasks/resolve_vector_dims_job.yaml: this ConfigMap (the unchanged
+   files/resolve_vector_dims.py) and Job. The HF token reaches the pod only
+   as the HF_TOKEN env var from the projected Secret hf-token (key token;
+   optional only when no token is in the store: anonymous lookup, as without
+   a token today); the
+   script reads it with --hf-token-env, so it is never in argv, the manifest
+   or the log. The Job prints the script's JSON result line only. #}
+{% set _labels = {
+     'app.kubernetes.io/part-of': 'erag-secrets',
+     'app.kubernetes.io/component': 'vector-dims',
+     'app.kubernetes.io/managed-by': 'app_pre_install'} %}
+{% set _args = ['--embedding-model-id', embedding_model_id | string]
+               + (['--offline'] if offline_model | default(false) | bool else [])
+               + ['--hf-token-env', 'HF_TOKEN',
+                  '--fallback-dims', (vector_databases_vector_dims | default(768, true) | int | string)] %}
+{% set _proxy = {'http_proxy': http_proxy | default(''), 'https_proxy': https_proxy | default(''),
+                 'no_proxy': no_proxy | default('')} %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ _vector_dims_job_name | to_json }}
+  namespace: {{ vector_dims_job_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  resolve_vector_dims.py: {{ lookup('ansible.builtin.file', role_path ~ '/files/resolve_vector_dims.py') | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _vector_dims_job_name | to_json }}
+  namespace: {{ vector_dims_job_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ vector_dims_job_timeout | int }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {{ _labels | to_json }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vector-dims
+          image: {{ vector_dims_job_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/etc/vector-dims/resolve_vector_dims.py"]
+          args: {{ _args | to_json }}
+          env:
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  # Required when the token is in the store (a missing projection
+                  # must not turn into an anonymous lookup and a wrong fallback).
+                  optional: {{ not (hugging_token_projected | default(false) | bool) }}
+{% for name, value in _proxy.items() if value | string | length > 0 %}
+            - {name: {{ name | to_json }}, value: {{ value | string | to_json }}}
+            - {name: {{ name | upper | to_json }}, value: {{ value | string | to_json }}}
+{% endfor %}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: script, mountPath: /etc/vector-dims, readOnly: true}
+      volumes:
+        - name: script
+          configMap:
+            name: {{ _vector_dims_job_name | to_json }}
+            defaultMode: 0444

@@ -30,13 +30,11 @@
 
 - name: "app_keycloak_config | Mark admin secret for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-    namespace: "{{ keycloak_namespace }}"
-    secret_name: "{{ keycloak_admin_secret_name }}"
-    password_mappings:
-      - { key: password, variable: KEYCLOAK_REALM_ADMIN_PASSWORD, user: "{{ keycloak_admin_user }}" }
+    secret_ids: [platform/keycloak-admin]
+    ensure_phase: after_deploy
 
 - name: "app_keycloak_config | Run Keycloak configurator Job"
   ansible.builtin.include_tasks: configure_keycloak.yaml

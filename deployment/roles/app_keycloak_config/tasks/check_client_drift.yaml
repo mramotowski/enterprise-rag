@@ -1,0 +1,36 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Keycloak client secret drift check (validate only). With projected Secrets, OpenBao
+# holds the client secrets erag manages and the configurator Job sets them in Keycloak
+# on install. A secret regenerated in the Keycloak admin console afterwards breaks that
+# client silently: the ESO projection stays SecretSynced and every pod still reads the
+# OpenBao value. Detect only, never heal: install erag re-applies the OpenBao values
+# (and rotating the id sets both sides), so validate reports which clients drifted.
+# Projected Secrets: secret values must not transit the installer host or Ansible facts
+# (ARCHITECTURE-SPINE AD-3, AD-11), so check_client_drift_job.yaml compares in a Job
+# next to the Secrets and reports only a verdict per client.
+# Local Secrets: the values live on the installer host and install re-applies them
+# anyway, so the check is skipped.
+# app_secrets_projected is set by any app_secrets port op earlier in the run; a run
+# that had none (validate) gets it from the configuration-only preflight.
+
+- name: "app_keycloak_config | Determine the credential delivery mode"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+  vars:
+    configuration_issues: []
+  when: app_secrets_projected is not defined
+
+- name: "app_keycloak_config | Report the skipped client secret drift check"
+  ansible.builtin.debug:
+    msg: >-
+      Skipping the Keycloak client secret drift check: credentials are local Secrets,
+      kept on the installer host, and install erag re-applies them to Keycloak.
+  when: not (app_secrets_projected | default(false) | bool)
+
+- name: "app_keycloak_config | Check Keycloak client secrets against OpenBao"
+  ansible.builtin.include_tasks: check_client_drift_job.yaml
+  when: app_secrets_projected | default(false) | bool

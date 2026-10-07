@@ -1,0 +1,39 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_role_calls.yaml: the SeaweedFS Secret writes of
+# app_edp/tasks/seaweedfs.yaml in local mode (shared by both sequences; the
+# role skips both writes when the port projects Secrets).
+
+---
+- name: "app_edp | Create SeaweedFS admin secret"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: seaweedfs-admin-secret
+        namespace: "{{ edp_seaweedfs_namespace }}"
+      type: Opaque
+      data:
+        adminUser: "{{ seaweedfs_admin_user | b64encode }}"
+        adminPassword: "{{ seaweedfs_admin_password | b64encode }}"
+  when: seaweedfs_admin_secret_check.resources | length == 0
+  no_log: true
+
+- name: "app_edp | Create SeaweedFS S3 secret"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: seaweedfs-s3-secret
+        namespace: "{{ edp_seaweedfs_namespace }}"
+      type: Opaque
+      data:
+        admin_access_key_id: "{{ EDP_MINIO_ACCESS_KEY | b64encode }}"
+        admin_secret_access_key: "{{ EDP_MINIO_SECRET_KEY | b64encode }}"
+        seaweedfs_s3_config: "{{ {'identities': []} | to_json | b64encode }}"
+  no_log: true

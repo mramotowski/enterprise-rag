@@ -75,3 +75,6 @@ istio_enabled: false                               # global
 observability_enabled: true                        # global
 edp_rbac_enabled: false                            # app_edp
 rag_log_dir: "{{ log_dir }}/rag"                   # app_pre_install
+
+# validate.yaml reads the GMConnector here (the other roles declare the same).
+pipeline_namespace: "{{ pipeline_type | default('chatqna') }}"

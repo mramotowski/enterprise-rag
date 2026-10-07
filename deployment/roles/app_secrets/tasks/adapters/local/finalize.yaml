@@ -1,0 +1,9 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter: import_phase finalize is a no-op (the local backend keeps its files).
+
+---
+- name: "app_secrets | import | finalize | No-op for the local backend"
+  ansible.builtin.debug:
+    msg: "app_secrets | import | local backend: nothing to finalize for {{ app_secrets_selected_ids | join(', ') }} (the local backend keeps its files)"

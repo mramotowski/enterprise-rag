@@ -1,0 +1,32 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for openbao_cases.yaml: patch one object of the fake cluster state
+# (patch: null deletes it), run one case (openbao_case.yaml), then restore the
+# object. Expects: patch_key, patch, case.
+
+---
+- name: "app_secrets | test | openbao | {{ case.name }} keep the original object"
+  ansible.builtin.set_fact:
+    _orig_object: "{{ _st[patch_key] }}"
+  no_log: true
+
+- name: "app_secrets | test | openbao | {{ case.name }} patch the fake cluster"
+  ansible.builtin.copy:
+    dest: "{{ state_file }}"
+    mode: "0600"
+    content: >-
+      {{ (_st | dict2items | rejectattr('key', 'equalto', patch_key) | items2dict
+          | combine({patch_key: _orig_object | combine(patch, recursive=true)} if patch is not none else {}))
+         | to_json }}
+  no_log: true
+
+- name: "app_secrets | test | openbao | {{ case.name }} run"
+  ansible.builtin.include_tasks: openbao_case.yaml
+
+- name: "app_secrets | test | openbao | {{ case.name }} restore the fake cluster"
+  ansible.builtin.copy:
+    dest: "{{ state_file }}"
+    mode: "0600"
+    content: "{{ _st | combine({patch_key: _orig_object}) | to_json }}"
+  no_log: true

@@ -1,0 +1,256 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Edge auth check with projected Secrets (ARCHITECTURE-SPINE AD-3, AD-11): the agent
+# client credentials may not reach the installer host, so files/verify_edge_auth.py runs
+# as a Job in the namespace of that Secret (templates/edge-auth-job.yaml.j2) and reads
+# them from env (secretKeyRef). hostAliases point the Keycloak and UI hostnames at the
+# Envoy gateway Service, so the token request and the probe go through the edge as an
+# agent's would. The Job log holds only the JSON result line; the verdict below follows
+# the host-side check in verify_edge_auth.yaml.
+# Included from verify_edge_auth.yaml when app_secrets_projected is true.
+
+- name: "app_mcp_gateway | Edge auth Job | Find the gateway data-plane Service"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    namespace: "{{ envoy_gateway_namespace }}"
+    label_selectors:
+      - "gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }}"
+      - "gateway.envoyproxy.io/owning-gateway-namespace={{ gateway_namespace }}"
+  register: _mcp_edge_auth_svc
+
+- name: "app_mcp_gateway | Edge auth Job | Set the gateway data-plane address"
+  ansible.builtin.set_fact:
+    _mcp_edge_auth_ip: >-
+      {{ _mcp_edge_auth_svc.resources | default([]) | map(attribute='spec')
+         | map(attribute='clusterIP', default='') | reject('in', ['', 'None'])
+         | first | default('') }}
+
+- name: "app_mcp_gateway | Edge auth Job | Report a gateway Service that was not found"
+  ansible.builtin.debug:
+    msg: >-
+      Skipping the MCP edge auth check: no Envoy Gateway data-plane Service with a
+      ClusterIP in '{{ envoy_gateway_namespace }}' for Gateway
+      '{{ gateway_namespace }}/{{ gateway_name }}', so the in-cluster check cannot reach
+      the edge.
+  when: _mcp_edge_auth_ip | length == 0
+
+- name: "app_mcp_gateway | Edge auth Job | Run the check"
+  when: _mcp_edge_auth_ip | length > 0
+  block:
+    - name: "app_mcp_gateway | Edge auth Job | Name the run"
+      ansible.builtin.set_fact:
+        _mcp_edge_auth_job_name: >-
+          mcp-edge-auth-{{ (mcp_resource_url ~ now(utc=true).isoformat()) | hash('sha1') | truncate(10, true, '') }}
+        # Token request (15s), every probe (10s each) and the waits between them, plus
+        # time for the image pull and pod start.
+        _mcp_edge_auth_job_timeout: >-
+          {{ 15 + (mcp_edge_auth_retries | int + 1) * 10
+             + mcp_edge_auth_retries | int * mcp_edge_auth_delay | int + 180 }}
+        _mcp_edge_auth_poll_delay: 5
+
+    - name: "app_mcp_gateway | Edge auth Job | Find previous runs"
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        namespace: "{{ keycloak_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/part-of=erag-mcp-gateway"
+          - "app.kubernetes.io/component=edge-auth-check"
+      loop:
+        - {api_version: batch/v1, kind: Job}
+        - {api_version: v1, kind: ConfigMap}
+      loop_control:
+        label: "{{ item.kind }}"
+      register: _mcp_edge_auth_old_runs
+
+    - name: "app_mcp_gateway | Edge auth Job | Delete previous runs"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.apiVersion | default('v1') }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ keycloak_namespace }}"
+        delete_options:
+          propagationPolicy: Background
+      loop: "{{ _mcp_edge_auth_old_runs.results | map(attribute='resources') | map('default', []) | flatten }}"
+      loop_control:
+        label: "{{ item.kind }} {{ item.metadata.name }}"
+
+    - name: "app_mcp_gateway | Note that early 401s are expected"
+      ansible.builtin.debug:
+        msg: >-
+          Probing {{ mcp_resource_url }} with an agent token from Job
+          {{ keycloak_namespace }}/{{ _mcp_edge_auth_job_name }} through the gateway at
+          {{ _mcp_edge_auth_ip }}. The Job retries 401s until the gateway picks up the
+          realm's signing keys (up to {{ mcp_jwks_cache_duration }} after the route is
+          programmed), for at most {{ _mcp_edge_auth_job_timeout }}s.
+
+    - name: "app_mcp_gateway | Edge auth Job | Start the Job"
+      block:
+        - name: "app_mcp_gateway | Edge auth Job | Create a private render directory"
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: mcp_edge_auth_job_
+          register: _mcp_edge_auth_dir
+
+        # Rendered to a file and applied with src: the script is applied verbatim,
+        # never re-read as a template.
+        - name: "app_mcp_gateway | Edge auth Job | Render the Job"
+          ansible.builtin.template:
+            src: edge-auth-job.yaml.j2
+            dest: "{{ _mcp_edge_auth_dir.path }}/edge-auth-job.yaml"
+            mode: "0600"
+
+        - name: "app_mcp_gateway | Edge auth Job | Apply the Job"
+          kubernetes.core.k8s:
+            state: present
+            src: "{{ _mcp_edge_auth_dir.path }}/edge-auth-job.yaml"
+            wait: false
+
+      always:
+        - name: "app_mcp_gateway | Edge auth Job | Remove the render directory"
+          ansible.builtin.file:
+            path: "{{ _mcp_edge_auth_dir.path }}"
+            state: absent
+          when: _mcp_edge_auth_dir.path is defined
+
+    - name: "app_mcp_gateway | Edge auth Job | Wait for the Job"
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ _mcp_edge_auth_job_name }}"
+        namespace: "{{ keycloak_namespace }}"
+      register: _mcp_edge_auth_job
+      # Done: a pod succeeded or failed, or the Job has a Failed condition (e.g.
+      # DeadlineExceeded with no pod ever started).
+      until: >-
+        (_mcp_edge_auth_job.resources | default([]) | length > 0) and
+        ((_mcp_edge_auth_job.resources[0].status.succeeded | default(0) | int) >= 1 or
+         (_mcp_edge_auth_job.resources[0].status.failed | default(0) | int) >= 1 or
+         (_mcp_edge_auth_job.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Failed') | selectattr('status', 'equalto', 'True') | list | length > 0))
+      retries: "{{ ((_mcp_edge_auth_job_timeout | int) / (_mcp_edge_auth_poll_delay | int)) | round(0, 'ceil') | int + 2 }}"
+      delay: "{{ _mcp_edge_auth_poll_delay | int }}"
+      failed_when: false
+
+    - name: "app_mcp_gateway | Edge auth Job | Read the Job log"
+      kubernetes.core.k8s_log:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ _mcp_edge_auth_job_name }}"
+        namespace: "{{ keycloak_namespace }}"
+      register: _mcp_edge_auth_log
+      failed_when: false
+      no_log: true
+
+    # The script prints exactly one JSON object; nothing else is expected in the log.
+    - name: "app_mcp_gateway | Edge auth Job | Parse the result"
+      ansible.builtin.set_fact:
+        _mcp_edge_auth_result: "{{ (_lines | last | default('{}')) | from_json }}"
+      vars:
+        _lines: >-
+          {{ _mcp_edge_auth_log.log_lines | default([]) | select('string')
+             | select('match', '^[{].*\"edge_http\": *-?[0-9]+') | list }}
+
+  always:
+    - name: "app_mcp_gateway | Edge auth Job | Delete the Job"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ _mcp_edge_auth_job_name }}"
+        namespace: "{{ keycloak_namespace }}"
+        delete_options:
+          propagationPolicy: Background
+      loop:
+        - {api_version: batch/v1, kind: Job}
+        - {api_version: v1, kind: ConfigMap}
+      loop_control:
+        label: "{{ item.kind }}"
+      when: _mcp_edge_auth_job_name is defined
+
+- name: "app_mcp_gateway | Edge auth Job | Report the result"
+  when: _mcp_edge_auth_ip | length > 0
+  vars:
+    _res: "{{ _mcp_edge_auth_result | default({}) }}"
+    _token_http: "{{ _res.token_http | default(-1) | int }}"
+    _edge_http: "{{ _res.edge_http | default(-1) | int }}"
+  block:
+    - name: "app_mcp_gateway | Report an edge auth Job that gave no result"
+      ansible.builtin.debug:
+        msg: >-
+          Skipping the MCP edge auth check: Job {{ keycloak_namespace }}/{{ _mcp_edge_auth_job_name }}
+          {{ _what }} (image {{ mcp_edge_auth_job_image }}),
+          so the edge was not probed. The image must be pullable in the cluster; the Job never
+          logs the credentials or the token.
+      vars:
+        _status: "{{ (_mcp_edge_auth_job.resources | default([]) | first | default({})).status | default({}) }}"
+        _failed: >-
+          {{ _status.conditions | default([]) | selectattr('type', 'equalto', 'Failed')
+             | selectattr('status', 'equalto', 'True') | first | default({}) }}
+        _what: >-
+          {{ ('failed (' ~ _failed.reason | default('') ~ ': ' ~ _failed.message | default('') ~ ')')
+             if _failed.reason is defined
+             else ('did not finish within ' ~ _mcp_edge_auth_job_timeout ~ 's'
+                   if (_status.succeeded | default(0) | int) == 0 and (_status.failed | default(0) | int) == 0
+                   else 'printed no result line') }}
+      when: _res.edge_http is not defined or _res.error | default(false) | bool
+
+    - name: "app_mcp_gateway | Assert the agent client credentials exist"
+      ansible.builtin.assert:
+        that: _res.credentials | bool
+        fail_msg: >-
+          Secret '{{ keycloak_namespace }}/{{ credentials_secret_name }}' carries no
+          MCP_CLIENT_ID / MCP_CLIENT_SECRET, so no agent can obtain a token for the MCP
+          gateway. It is projected from OpenBao: check
+          'kubectl -n {{ keycloak_namespace }} get externalsecret {{ credentials_secret_name }}'
+          (synced?) and that the OpenBao entry erag/keycloak/mcp-client exists; the keys
+          are projected only with mcp_enabled: true (re-run install erag).
+        success_msg: "app_mcp_gateway agent client: OK"
+        quiet: true
+      when:
+        - _res.edge_http is defined
+        - not (_res.error | default(false) | bool)
+
+    - name: "app_mcp_gateway | Report a token endpoint that is not reachable from the cluster"
+      ansible.builtin.debug:
+        msg: >-
+          Skipping the MCP edge auth check: no token from {{ mcp_jwt_issuer }}
+          (HTTP {{ _token_http if _token_http | int > 0 else 'no response' }}) through the
+          gateway at {{ _mcp_edge_auth_ip }}, from Job
+          {{ keycloak_namespace }}/{{ _mcp_edge_auth_job_name }}.
+      when:
+        - _res.credentials | default(false) | bool
+        - not (_res.token | default(false) | bool)
+
+    - name: "app_mcp_gateway | Report an edge that is not reachable from the cluster"
+      ansible.builtin.debug:
+        msg: >-
+          Skipping the MCP edge auth check: {{ mcp_resource_url }} is not reachable through
+          the gateway at {{ _mcp_edge_auth_ip }} from Job
+          {{ keycloak_namespace }}/{{ _mcp_edge_auth_job_name }}.
+      when:
+        - _res.token | default(false) | bool
+        - _edge_http | int < 0
+
+    - name: "app_mcp_gateway | Assert the edge accepts an agent token"
+      ansible.builtin.assert:
+        that: _edge_http | int not in [401, 403]
+        fail_msg: >-
+          The edge rejected a freshly issued agent token with
+          HTTP {{ _edge_http }} for
+          {{ mcp_edge_auth_retries | int * mcp_edge_auth_delay | int }}s
+          ({{ _res.attempts | default(0) }} attempts from Job
+          {{ keycloak_namespace }}/{{ _mcp_edge_auth_job_name }}), which is longer
+          than the JWKS cache. Check
+          'kubectl -n {{ envoy_gateway_namespace }} logs -l
+          gateway.envoyproxy.io/owning-gateway-name={{ gateway_name }} -c envoy
+          | grep -i jwks'; deleting those pods forces a refetch.
+        success_msg: "app_mcp_gateway edge auth: agent token accepted"
+        quiet: true
+      when:
+        - _res.token | default(false) | bool
+        - _edge_http | int > 0

@@ -2,6 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 hfToken: ""
+# true: the chart renders no audio-hf-token-secret (an ESO projection from
+# OpenBao owns it, set by app_audio with secrets_backend: openbao).
+externalSecrets: false
+# true: the pods reference audio-hf-token-secret although hfToken is empty
+# (the projected Secret carries the token).
+hfTokenSecret: false
 
 proxy:
   http_proxy: ""

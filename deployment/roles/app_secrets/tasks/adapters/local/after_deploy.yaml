@@ -1,0 +1,150 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter: ensure, ensure_phase after_deploy. Runs after the consuming
+# release created its Secrets, in this order:
+#   1. Mark each Secret of the selected IDs whose legacy item has
+#      secret.markup (app_password_mgmt markup.yaml: meta.erag/* label and
+#      password-mappings annotation). Mappings keep request order and, within
+#      an ID, registry legacy order. A Secret that does not exist yet is
+#      skipped: marking it would create it ahead of its Helm release.
+#   2. When a selected ID has local.refresh_file_after_deploy, re-render
+#      default_credentials.yaml from the marked Secrets (app_password_mgmt
+#      lookup.yaml), as legacy seaweedfs.yaml did.
+#   3. When selected IDs have legacy items with file: default_credentials.txt,
+#      write that file from their Secret (lines in request order), as legacy
+#      app_keycloak_config did; skipped when the Secret does not exist.
+
+---
+- name: "app_secrets | ensure | after_deploy | Resolve the local credential file paths"
+  ansible.builtin.set_fact:
+    app_secrets_local_password_file_path: "{{ app_secrets_local_password_file | trim }}"
+    app_secrets_local_txt_file_path: "{{ app_secrets_local_txt_file | trim }}"
+
+- name: "app_secrets | ensure | after_deploy | Map Secrets to mark and file lines"
+  ansible.builtin.set_fact:
+    _app_secrets_markups: "{{ _plan.markups }}"
+    _app_secrets_txt_items: "{{ _plan.txt }}"
+    _app_secrets_refresh: "{{ _plan.refresh }}"
+  vars:
+    _plan: >-
+      {%- set markups = [] -%}
+      {%- set index = {} -%}
+      {%- set txt = [] -%}
+      {%- set ns = namespace(refresh=false) -%}
+      {%- for cid in app_secrets_selected_ids -%}
+        {%- set e = app_secrets_catalog[cid] if cid in app_secrets_catalog else app_secrets_platform_catalog[cid] -%}
+        {%- if (e.local | default({})).refresh_file_after_deploy | default(false) -%}
+          {%- set ns.refresh = true -%}
+        {%- endif -%}
+        {%- for l in e.legacy if l.secret -%}
+          {%- if l.secret.markup | default(false) -%}
+            {%- set skey = l.secret.namespace ~ '/' ~ l.secret.name -%}
+            {%- if skey not in index -%}
+              {%- set _ = index.update({skey: markups | length}) -%}
+              {%- set _ = markups.append({'namespace': l.secret.namespace, 'name': l.secret.name, 'mappings': []}) -%}
+            {%- endif -%}
+            {%- set _ = markups[index[skey]].mappings.append({'key': l.secret.key, 'variable': l.secret.variable | default(l.file_var), 'user': l.secret.user}) -%}
+          {%- endif -%}
+          {%- if l.file | default('') == 'default_credentials.txt' -%}
+            {%- set _ = txt.append({'id': cid, 'namespace': l.secret.namespace, 'name': l.secret.name, 'key': l.secret.key, 'var': l.file_var, 'id_var': l.file_identifier.var, 'id_key': l.file_identifier.key, 'optional': l.file_optional | default(false)}) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ {'markups': markups, 'txt': txt, 'refresh': ns.refresh} }}
+
+# --- 1. Markup -----------------------------------------------------------------
+
+- name: "app_secrets | ensure | after_deploy | Look up the Secrets to mark"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+  register: _app_secrets_markup_lookup
+  until: _app_secrets_markup_lookup is succeeded
+  retries: 5
+  delay: 10
+  loop: "{{ _app_secrets_markups }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  no_log: true
+
+- name: "app_secrets | ensure | after_deploy | Skip Secrets that do not exist yet"
+  ansible.builtin.debug:
+    msg: "{{ item.item.namespace }}/{{ item.item.name }}: not found, not marked"
+  loop: "{{ _app_secrets_markup_lookup.results | default([]) | rejectattr('resources') | list }}"
+  loop_control:
+    label: "{{ item.item.namespace }}/{{ item.item.name }}"
+
+- name: "app_secrets | ensure | after_deploy | Mark Secrets for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+    apply:
+      no_log: true
+  vars:
+    namespace: "{{ item.item.namespace }}"
+    secret_name: "{{ item.item.name }}"
+    password_mappings: "{{ item.item.mappings }}"
+  loop: "{{ _app_secrets_markup_lookup.results | default([]) | selectattr('resources') | list }}"
+  loop_control:
+    label: "{{ item.item.namespace }}/{{ item.item.name }}"
+  no_log: true
+
+# --- 2. File refresh ----------------------------------------------------------------
+
+- name: "app_secrets | ensure | after_deploy | Refresh the password file from the marked Secrets"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: lookup.yaml
+    apply:
+      no_log: true
+  vars:
+    password_file: "{{ app_secrets_local_password_file_path }}"
+  when: _app_secrets_refresh | bool
+
+# --- 3. default_credentials.txt -------------------------------------------------------
+
+- name: "app_secrets | ensure | after_deploy | Write default_credentials.txt"
+  when: _app_secrets_txt_items | length > 0
+  block:
+    - name: "app_secrets | ensure | after_deploy | One Secret feeds default_credentials.txt"
+      ansible.builtin.assert:
+        that:
+          - _secrets | length == 1
+        fail_msg: >-
+          app_secrets | ensure | default_credentials.txt items must share one Secret,
+          got: {{ _secrets | join(', ') }}
+        quiet: true
+      vars:
+        _secrets: "{{ _app_secrets_txt_items | map(attribute='namespace') | zip(_app_secrets_txt_items | map(attribute='name')) | map('join', '/') | unique | list }}"
+
+    - name: "app_secrets | ensure | after_deploy | Read the default_credentials.txt Secret"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ _app_secrets_txt_items[0].name }}"
+        namespace: "{{ _app_secrets_txt_items[0].namespace }}"
+      register: _app_secrets_txt_secret
+      no_log: true
+
+    - name: "app_secrets | ensure | after_deploy | Write default_credentials.txt from the Secret"
+      ansible.builtin.copy:
+        dest: "{{ app_secrets_local_txt_file_path }}"
+        mode: '0600'
+        content: "{{ _lines | join(_nl) ~ _nl }}"
+      vars:
+        _nl: "\n"
+        _data: "{{ _app_secrets_txt_secret.resources[0].data }}"
+        _lines: >-
+          {%- set out = [] -%}
+          {%- for it in _app_secrets_txt_items -%}
+            {%- if not it.optional or _data[it.key] is defined -%}
+              {%- set _ = out.append(it.id_var ~ '=' ~ (_data[it.id_key] | b64decode)) -%}
+              {%- set _ = out.append(it.var ~ '="' ~ (_data[it.key] | b64decode) ~ '"') -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      when: _app_secrets_txt_secret.resources | length > 0
+      no_log: true

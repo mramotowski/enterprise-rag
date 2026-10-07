@@ -24,14 +24,79 @@ _LOG_DIR = os.environ.get("ERAG_LOG_DIR", _DEFAULT_LOG_DIR)
 
 DEFAULT_CREDENTIALS_PATH = os.path.normpath(os.path.join(_LOG_DIR, "default_credentials.txt"))
 
+# With secrets_backend: openbao no credentials file is written; ESO projects the same keys
+# (KEYCLOAK_ERAG_*, MCP_CLIENT_*) from OpenBao into this Secret.
+CREDENTIALS_SECRET_NAME = "erag-credentials"
+
 
 class CredentialsNotFound(Exception):
     pass
 
 
+def _credentials_secret_namespace():
+    return cfg.get("keycloak_namespace") or "keycloak"
+
+
+def parse_credentials_file(file_path):
+    """Parse a KEY="value" credentials file (default_credentials.txt) into a dictionary"""
+    credentials = {}
+    logger.info(f"opening credentials file {file_path}")
+    with open(file_path, "r") as file:
+        for line in file:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:  # Ignore empty lines and comments
+                key, value = line.split("=", 1)
+                credentials[key.strip()] = value.strip().strip('"')
+    return credentials
+
+
+def load_erag_credentials(credentials_file, k8s_helper):
+    """The ERAG credentials (KEYCLOAK_ERAG_*, MCP_CLIENT_*) as a dictionary.
+
+    Sources, in order: the given credentials file, default_credentials.txt (local secrets
+    backend), then the Secret keycloak/erag-credentials (the ESO projection of OpenBao with
+    secrets_backend: openbao). Raises CredentialsNotFound naming every source tried.
+    """
+    if credentials_file:
+        if os.path.exists(credentials_file):
+            logger.debug(f"Loading {credentials_file} in order to obtain ERAG credentials")
+            return parse_credentials_file(credentials_file)
+        if os.path.abspath(credentials_file) != os.path.abspath(DEFAULT_CREDENTIALS_PATH):
+            logger.warning(f"Provided credentials file (--credentials-file={credentials_file}) does not exist. "
+                           f"Trying {DEFAULT_CREDENTIALS_PATH}")
+
+    if os.path.exists(DEFAULT_CREDENTIALS_PATH):
+        logger.debug(f"Loading {DEFAULT_CREDENTIALS_PATH} in order to obtain ERAG credentials")
+        return parse_credentials_file(DEFAULT_CREDENTIALS_PATH)
+
+    namespace = _credentials_secret_namespace()
+    files = [f for f in (credentials_file, DEFAULT_CREDENTIALS_PATH) if f]
+    reason = "it does not exist"
+    if k8s_helper is not None:
+        logger.debug(f"No credentials file; reading the Secret {namespace}/{CREDENTIALS_SECRET_NAME}")
+        try:
+            data = k8s_helper.read_secret_data(CREDENTIALS_SECRET_NAME, namespace)
+        except Exception as e:  # cluster unreachable, no permission, ...
+            data = None
+            reason = f"reading it failed: {type(e).__name__}: {e}"
+        if data:
+            return data
+        if data is not None:
+            reason = "it holds no keys"
+    else:
+        reason = "no Kubernetes helper to read it"
+    message = (f"ERAG credentials not found: no credentials file ({', '.join(dict.fromkeys(files))}) "
+               f"and no Secret {namespace}/{CREDENTIALS_SECRET_NAME} ({reason}). With secrets_backend: local "
+               f"pass --credentials-file or set ERAG_LOG_DIR; with secrets_backend: openbao the Secret is "
+               f"the ESO projection of OpenBao <cluster_id>/erag/keycloak/*")
+    logger.error(message)
+    raise CredentialsNotFound(message)
+
+
 class KeycloakHelper:
 
     def __init__(self, credentials_file, k8s_helper):
+        self.k8s_helper = k8s_helper
         credentials = self.get_credentials(credentials_file)
         fqdn = cfg.get('base_domain_name')
         routing_mode = cfg.get('routing_mode', 'subdomain')
@@ -49,7 +114,6 @@ class KeycloakHelper:
         self.erag_sso_admin_password = os.getenv("KEYCLOAK_ERAG_SSO_ADMIN_PASSWORD", "")
         self.erag_sso_user_username = os.getenv("KEYCLOAK_ERAG_SSO_USER_USERNAME", "")
         self.erag_sso_user_password = os.getenv("KEYCLOAK_ERAG_SSO_USER_PASSWORD", "")
-        self.k8s_helper = k8s_helper
         self._access_token = None
         self._admin_access_token = None
         self._ci_username = None
@@ -527,32 +591,12 @@ class KeycloakHelper:
         return access_token
 
     def get_credentials(self, credentials_file):
-        if credentials_file:
-            if os.path.exists(credentials_file):
-                logger.debug(f"Loading {credentials_file} in order to obtain ERAG admin credentials")
-                return self._parse_credentials_file(credentials_file)
-            else:
-                logger.warning(f"Provided credentials file (--credentials-file={credentials_file}) does not exist. "
-                               f"Proceeding with default_credentials.txt")
-
-        if os.path.exists(DEFAULT_CREDENTIALS_PATH):
-            logger.debug("Loading default_credentials.txt in order to obtain ERAG admin credentials")
-            return self._parse_credentials_file(DEFAULT_CREDENTIALS_PATH)
-        else:
-            logger.error(f"Path to default credentials file not found: {DEFAULT_CREDENTIALS_PATH}")
-            raise CredentialsNotFound()
+        """The ERAG credentials from the credentials file, or from the projected Secret (OpenBao)"""
+        return load_erag_credentials(credentials_file, self.k8s_helper)
 
     def _parse_credentials_file(self, file_path):
         """Parse the credentials file and return a corresponding dictionary"""
-        credentials = {}
-        logger.info(f"opening credentials file {file_path}")
-        with open(file_path, "r") as file:
-            for line in file:
-                line = line.strip()
-                if line and not line.startswith("#"):  # Ignore empty lines and comments
-                    key, value = line.split("=", 1)
-                    credentials[key] = value.strip('"')
-        return credentials
+        return parse_credentials_file(file_path)
 
     def get_admin_access_token(self):
         """Get the access token for the admin user. It is needed in order to obtain erag-admin user_id"""

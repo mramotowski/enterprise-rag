@@ -1,0 +1,253 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Data services with projected Secrets, without a cluster: for every scenario
+# of fixtures/data_services_inventory.yaml (vector store engines, chat-history,
+# EDP storage types) the role values template is rendered and `helm template`d
+#   local      with the credential facts (placeholders): the Secrets the
+#              chart renders today, plus the ones the role creates, are written
+#              as the expected projections (expected.json);
+#   projected  with app_secrets_projected: true and no credential fact at all:
+#              the values hold no credential, the charts template no Secret,
+#              and (EDP) edp_secret_config equals the non-secret keys the chart
+#              renders in local mode.
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook \
+#     -i deployment/roles/app_secrets/tests/fixtures/data_services_inventory.yaml \
+#     deployment/roles/app_secrets/tests/test_data_services.yaml
+# Options (-e): out_dir=<dir> keeps the renders (default: a temp dir, removed);
+# render_root=<deployment dir> renders another tree (e.g. a baseline checkout,
+# with modes=local) so two trees can be diffed.
+# Needs helm (charts are copied to a temp dir; only file:// dependencies).
+
+---
+- name: "app_secrets | test | data services | Prepare the charts"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    render_root: "{{ playbook_dir }}/../../.."
+  tasks:
+    - name: "app_secrets | test | data services | Create a work dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_ds_
+      register: _work
+
+    - name: "app_secrets | test | data services | Copy the charts"
+      ansible.builtin.command:
+        argv: [cp, -a, "{{ render_root }}/components", "{{ _work.path }}/components"]
+      changed_when: true
+
+    - name: "app_secrets | test | data services | Build the chart dependencies"
+      ansible.builtin.command:
+        cmd: helm dependency build
+        chdir: "{{ _work.path }}/components/{{ item }}"
+      loop: [edp, chat_history]
+      changed_when: true
+
+    - name: "app_secrets | test | data services | Output dir"
+      ansible.builtin.file:
+        path: "{{ out_dir | default(_work.path ~ '/out') }}"
+        state: directory
+        mode: "0700"
+
+- name: "app_secrets | test | data services | Render each scenario"
+  hosts: all:!localhost
+  gather_facts: false
+  vars:
+    render_root: "{{ playbook_dir }}/../../.."
+    work: "{{ hostvars['localhost']._work.path }}"
+    out: "{{ (out_dir | default(work ~ '/out')) ~ '/' ~ inventory_hostname }}"
+    test_modes: "{{ (modes | default('local,projected')).split(',') }}"
+  tasks:
+    - name: "app_secrets | test | data services | Output dir of the scenario"
+      ansible.builtin.file:
+        path: "{{ out }}"
+        state: directory
+        mode: "0700"
+
+    - name: "app_secrets | test | data services | Load the role defaults"
+      ansible.builtin.include_vars:
+        file: "{{ render_root }}/roles/{{ values_role }}/defaults/main.yaml"
+      when: values_role | length > 0
+
+    # After the defaults, as config.erag.yaml would override them.
+    - name: "app_secrets | test | data services | Write the scenario settings"
+      ansible.builtin.copy:
+        dest: "{{ out }}/settings-vars.yaml"
+        content: "{{ settings | combine({'deployment_dir': work, 'tmp_dir': work, 'helm_version': 'v3'}) | to_nice_yaml }}"
+        mode: "0600"
+
+    - name: "app_secrets | test | data services | Load the scenario settings"
+      ansible.builtin.include_vars:
+        file: "{{ out }}/settings-vars.yaml"
+
+    - name: "app_secrets | test | data services | Render the values"
+      ansible.builtin.copy:
+        dest: "{{ out }}/values-{{ item }}.yaml"
+        content: >-
+          {{ lookup('ansible.builtin.template', render_root ~ '/roles/' ~ values_role ~ '/templates/values.yaml.j2',
+                    template_vars=((creds if item == 'local' else {}) | combine({'app_secrets_projected': item == 'projected'}))) }}
+        mode: "0600"
+      loop: "{{ test_modes }}"
+      when: values_role | length > 0
+
+    - name: "app_secrets | test | data services | helm template"
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          helm template {{ release }} {{ work }}/components/{{ chart }} -n {{ release_namespace }}
+          -f {{ work }}/components/{{ chart }}/values.yaml -f {{ out }}/values-{{ item }}.yaml
+          > {{ out }}/manifests-{{ item }}.yaml
+        executable: /bin/bash
+      loop: "{{ test_modes }}"
+      when: values_role | length > 0
+      changed_when: false
+
+    - name: "app_secrets | test | data services | Collect the chart Secrets"
+      ansible.builtin.set_fact:
+        _chart_secrets: "{{ _chart_secrets | default({}) | combine({item: _secrets}) }}"
+      vars:
+        _docs: "{{ lookup('ansible.builtin.file', out ~ '/manifests-' ~ item ~ '.yaml') | from_yaml_all | select('mapping') | list }}"
+        _secrets: >-
+          {%- set acc = {} -%}
+          {%- for d in _docs | selectattr('kind', 'defined') | selectattr('kind', 'equalto', 'Secret') -%}
+            {%- set data = {} -%}
+            {%- for k, v in (d.data | default({}, true)).items() -%}
+              {%- set _ = data.update({k: v | b64decode}) -%}
+            {%- endfor -%}
+            {%- for k, v in (d.stringData | default({}, true)).items() -%}
+              {%- set _ = data.update({k: '' if v is none else v | string}) -%}
+            {%- endfor -%}
+            {%- set _ = acc.update({(d.metadata.namespace | default(release_namespace)) ~ '/' ~ d.metadata.name: data}) -%}
+          {%- endfor -%}
+          {{ acc }}
+      loop: "{{ test_modes }}"
+      when: values_role | length > 0
+
+    # --- local: the expected projections ------------------------------------------------
+
+    - name: "app_secrets | test | data services | Expected projections (chart and role Secrets)"
+      ansible.builtin.copy:
+        dest: "{{ out }}/expected.json"
+        content: "{{ {'secret_ids': secret_ids, 'secrets': _expected} | to_nice_json }}"
+        mode: "0600"
+      vars:
+        # seaweedfs-s3-secret as app_edp tasks/seaweedfs.yaml builds it.
+        _s3_auth_config:
+          identities:
+            - name: "app_edp | Admin"
+              credentials:
+                - accessKey: "<<t1/erag/edp/object-store#access_key>>"
+                  secretKey: "<<t1/erag/edp/object-store#secret_key>>"
+              actions: ["Read", "Write", "List", "Tagging", "Admin"]
+        _seaweedfs: >-
+          {{ {'seaweedfs/seaweedfs-s3-secret': {'admin_access_key_id': '<<t1/erag/edp/object-store#access_key>>',
+                                                'admin_secret_access_key': '<<t1/erag/edp/object-store#secret_key>>',
+                                                'seaweedfs_s3_config': _s3_auth_config | to_json}}
+             if (settings.edp_storage_type | default('')) == 'seaweedfs' else {} }}
+        _expected: "{{ (_chart_secrets.local | default({})) | combine(role_secrets, _seaweedfs) }}"
+      when: "'local' in test_modes"
+
+    # --- projected ------------------------------------------------------------------------
+
+    - name: "app_secrets | test | data services | Projected: no credential in the values, no Secret in the chart"
+      ansible.builtin.assert:
+        that:
+          - "'<<' not in _values"
+          - _chart_secrets.projected | length == 0
+          - "(chart not in ['vector_databases', 'edp']) or ('externalSecrets: true' in _values)"
+          - (_chart_secrets.local.keys() | list) | difference(projected_secrets) | length == 0
+        fail_msg: >-
+          {{ inventory_hostname }}: placeholder in values: {{ '<<' in _values }};
+          projected chart Secrets: {{ _chart_secrets.projected.keys() | list }};
+          local chart Secrets not in projected_secrets: {{ (_chart_secrets.local.keys() | list) | difference(projected_secrets) }}
+        quiet: true
+      vars:
+        _values: "{{ lookup('ansible.builtin.file', out ~ '/values-projected.yaml') }}"
+      when:
+        - "'projected' in test_modes"
+        - values_role | length > 0
+
+    - name: "app_secrets | test | data services | Projected: resolve edp_secret_config like app_edp"
+      ansible.builtin.include_role:
+        name: app_edp
+        tasks_from: secret_config.yaml
+      when:
+        - "'projected' in test_modes"
+        - values_role == 'app_edp'
+
+    - name: "app_secrets | test | data services | Projected: edp_secret_config equals the keys the chart renders"
+      ansible.builtin.assert:
+        that: _diff | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ _diff }}"
+        quiet: true
+      vars:
+        _access: "{{ _chart_secrets.local['edp/edp-access-secret'] }}"
+        _aws: "{{ _chart_secrets.local['edp/edp-aws-access-secrets'] | default({}) }}"
+        # "<fact key> <chart Secret> <chart key>"
+        _pairs: >-
+          {%- set out = [] -%}
+          {%- for k in edp_secret_config.keys() if k != 'AWS_SQS_EVENT_QUEUE_URL' -%}
+            {%- set _ = out.append(k ~ ' access ' ~ k) -%}
+          {%- endfor -%}
+          {{ out + (['AWS_SQS_EVENT_QUEUE_URL aws AWS_SQS_EVENT_QUEUE_URL', 'EDP_BASE_REGION aws AWS_DEFAULT_REGION']
+                    if _aws | length > 0 else []) }}
+        _diff: >-
+          {%- set bad = [] -%}
+          {%- for p in _pairs -%}
+            {%- set f, sec, k = p.split(' ') -%}
+            {%- set want = (_access if sec == 'access' else _aws)[k] | default('<absent>') -%}
+            {%- if edp_secret_config[f] != want -%}
+              {%- set _ = bad.append(f ~ ': ' ~ edp_secret_config[f] ~ ' != chart ' ~ k ~ ' ' ~ want) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ bad }}
+      when:
+        - "'projected' in test_modes"
+        - values_role == 'app_edp'
+
+    - name: "app_secrets | test | data services | Projected: SeaweedFS RBAC fails before any credential work"
+      when:
+        - "'projected' in test_modes"
+        - inventory_hostname == 'edp-seaweedfs'
+      block:
+        - name: "app_secrets | test | data services | Projected: secret_config with edp_rbac_enabled"
+          ansible.builtin.include_role:
+            name: app_edp
+            tasks_from: secret_config.yaml
+          vars:
+            app_secrets_projected: true
+            edp_rbac_enabled: true
+
+        - name: "app_secrets | test | data services | Projected: RBAC was not refused"
+          ansible.builtin.fail:
+            msg: "edp_rbac_enabled with projected Secrets did not fail"
+      rescue:
+        - name: "app_secrets | test | data services | Projected: the RBAC refusal names the gap"
+          ansible.builtin.assert:
+            that: "'edp_rbac_enabled (SeaweedFS IAM configuration with Keycloak STS) is not supported yet' in ansible_failed_result.msg"
+            fail_msg: "{{ ansible_failed_result.msg }}"
+            quiet: true
+
+    # Read by the openbao test: the config the registry expressions use.
+    - name: "app_secrets | test | data services | Write the registry settings of the scenario"
+      ansible.builtin.copy:
+        dest: "{{ out }}/registry-vars.yaml"
+        content: >-
+          {{ {'edp_enabled': settings.edp_enabled | default(false),
+              'edp_storage_type': settings.edp_storage_type | default('seaweedfs'),
+              'edp_secret_storage': edp_secret_storage | default(settings.edp_storage_type | default('seaweedfs')),
+              'erag_keycloak_oidc_tenant_id': settings.erag_keycloak_oidc_tenant_id | default(''),
+              'edp_secret_config': edp_secret_config | default({})} | to_nice_yaml }}
+        mode: "0600"
+      when: "'projected' in test_modes"
+
+- name: "app_secrets | test | data services | Clean up"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "app_secrets | test | data services | Remove the work dir"
+      ansible.builtin.file:
+        path: "{{ _work.path }}"
+        state: absent

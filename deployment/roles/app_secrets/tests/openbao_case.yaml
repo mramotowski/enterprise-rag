@@ -1,0 +1,48 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for openbao_cases.yaml: run one port op with the openbao backend and
+# record {ok, msg, status, worker} in obcases[case.name] (msg on failure only).
+# Expects: case = {name, op, ids, phase, import_phase, role, addr, audience, registry, env, timeout}, the
+# play vars of openbao_cases.yaml.
+
+---
+- name: "app_secrets | test | openbao | {{ case.name }} reset results"
+  ansible.builtin.set_fact:
+    app_secrets_status: {}
+    app_secrets_worker_result: {}
+
+- name: "app_secrets | test | openbao | {{ case.name }}"
+  block:
+    - name: "app_secrets | test | openbao | {{ case.name }} via the port"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: "{{ case.op }}.yaml"
+        apply:
+          environment: "{{ case.env | default({}) }}"
+      vars:
+        secrets_backend: openbao
+        secret_ids: "{{ case.ids }}"
+        ensure_phase: "{{ case.phase | default('before_deploy') }}"
+        import_phase: "{{ case.import_phase | default('import') }}"
+        app_secrets_openbao_worker_role: "{{ case.role | default('erag-secrets-worker') }}"
+        app_secrets_openbao_address: "{{ case.addr | default(test_addr) }}"
+        openbao_auth_audience: "{{ case.audience | default('vault') }}"
+        app_secrets_registry_file: "{{ case.registry | default(default_registry) }}"
+        app_secrets_worker_timeout: "{{ case.timeout | default(60) }}"
+        erag_teardown_store_lost: "{{ case.store_lost | default(false) }}"
+
+    - name: "app_secrets | test | openbao | {{ case.name }} succeeded"
+      ansible.builtin.set_fact:
+        _case_result: {ok: true, msg: ""}
+  rescue:
+    - name: "app_secrets | test | openbao | {{ case.name }} failed"
+      ansible.builtin.set_fact:
+        _case_result: {ok: false, msg: "{{ ansible_failed_result.msg | default('') }}"}
+
+- name: "app_secrets | test | openbao | {{ case.name }} record"
+  ansible.builtin.set_fact:
+    obcases: >-
+      {{ obcases | default({}) | combine({case.name: _case_result | combine({
+           'status': app_secrets_status | default({}),
+           'worker': app_secrets_worker_result | default({})})}) }}

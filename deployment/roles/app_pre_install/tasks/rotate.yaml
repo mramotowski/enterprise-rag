@@ -1,0 +1,33 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Rotate-only run (erag_rotate set, AD-9): tasks/install.yaml includes this
+# after the credential store probe and skips everything else; components.yaml
+# disables the other erag components. app_secrets rotate does the work (the
+# local backend refuses it: rotation needs the OpenBao backend).
+
+---
+- name: "app_pre_install | Rotate | Fail when erag_rotate names no credential"
+  ansible.builtin.fail:
+    msg: >-
+      app_pre_install | erag_rotate ('{{ erag_rotate }}') names no credential id. Usage:
+      es_auto_installer.sh install erag --env <env> --only -- -e erag_rotate=[<component>/<credential>,...]
+  when: app_pre_install_rotate_ids | length == 0
+
+# A rotate-only install has no layer dependencies (components.yaml), so the
+# platform and inference layers did not run. Without --only the installer still
+# runs its infrastructure step on an installer-provisioned cluster.
+- name: "app_pre_install | Rotate | Hint"
+  ansible.builtin.debug:
+    msg: >-
+      app_pre_install | rotate-only run for {{ app_pre_install_rotate_ids | join(', ') }}: the platform and
+      inference layers and every other erag component are skipped. Add --only next time to skip the
+      installer's infrastructure step too.
+  when: _include_deps | default(true) | bool
+
+- name: "app_pre_install | Rotate | Rotate the requested credentials"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: rotate.yaml
+  vars:
+    secret_ids: "{{ app_pre_install_rotate_ids }}"

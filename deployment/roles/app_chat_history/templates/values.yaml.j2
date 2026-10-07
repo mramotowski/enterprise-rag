@@ -10,10 +10,14 @@ image:
 {% endif %}
     repository: "{{ registry }}"
 
+{# With projected Secrets (ESO) the password stays out of the values; the
+   chart reads it from mongo-database-secret only. #}
+{% if not (app_secrets_projected | default(false)) %}
 ferretdb:
   postgresql:
     auth:
       password: "{{ CHAT_HISTORY_POSTGRES_PASSWORD }}"
+{% endif %}
 {% if chat_history_additional_values is defined and chat_history_additional_values %}
 {{ chat_history_additional_values | to_nice_yaml }}
 {% endif %}

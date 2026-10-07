@@ -1,0 +1,20 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_local_adapter.yaml: the port call that replaces the legacy
+# calls, then record the file and facts as test_pass[pass_no].
+# Expects: test_dir, port_file, file_ids, noop_ids, pass_no.
+
+---
+- name: "app_secrets | test | Port ensure"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    log_dir: "{{ test_dir }}/port"
+    secret_ids: "{{ file_ids + noop_ids }}"
+
+- name: "app_secrets | test | Record port pass {{ pass_no }}"
+  ansible.builtin.include_tasks: record_pass.yaml
+  vars:
+    record_file: "{{ port_file }}"

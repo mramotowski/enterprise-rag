@@ -1,0 +1,147 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests the in-cluster vector_dims lookup (projected Secrets; ARCHITECTURE-SPINE
+# AD-3) without a cluster: the real tasks/resolve_vector_dims_job.yaml and
+# templates/vector-dims-job.yaml.j2 against the app_secrets fake
+# kubernetes.core, whose Job hook runs the Job's container command on this
+# host with the Job's env (the HF token only from the Secret hf-token, as the
+# kubelet resolves the secretKeyRef) and a fake HuggingFace API.
+# Checks: the token reaches the lookup only through the projected Secret (never
+# argv, the Job manifest or the ConfigMap), a missing Secret means an
+# anonymous lookup, the known-model table and the fallback apply as on the
+# host, proxies are passed, a failed Job fails the run naming it, and earlier
+# runs are deleted. The whole output is searched for the token.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_pre_install/tests/test_vector_dims_job.yaml
+
+---
+- name: "app_pre_install | test | vector_dims Job"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hosts_list: [token-api, no-token, known, fallback, proxy, fail, deadline, missing-projection]
+    # A random test token (never a real one); written only into the seeded
+    # Secret, base64-encoded as the API stores it.
+    token: "hf_test_{{ 1000000000 | random | string | hash('sha256') | truncate(24, true, '') }}"
+    old_run_labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/component: vector-dims}
+  tasks:
+    - name: "app_pre_install | test | vector_dims | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: vector_dims_job_test_
+      register: _tmp
+
+    - name: "app_pre_install | test | vector_dims | Run"
+      block:
+        - name: "app_pre_install | test | vector_dims | Fix the test token"
+          ansible.builtin.set_fact:
+            _token: "{{ token }}"
+          no_log: true
+
+        - name: "app_pre_install | test | vector_dims | Seed the fake clusters"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/{{ item }}.json"
+            mode: "0600"
+            content: "{{ _seed | combine(_secret if item in ['token-api', 'known'] else {}) | to_json }}"
+          vars:
+            _seed:
+              "Namespace//erag-secrets": {apiVersion: v1, kind: Namespace, metadata: {name: erag-secrets}}
+              # An earlier run, deleted by label before the new one.
+              "Job/erag-secrets/erag-vector-dims-old":
+                {apiVersion: batch/v1, kind: Job, metadata: {name: erag-vector-dims-old, namespace: erag-secrets, labels: "{{ old_run_labels }}"}}
+              "ConfigMap/erag-secrets/erag-vector-dims-old":
+                {apiVersion: v1, kind: ConfigMap, metadata: {name: erag-vector-dims-old, namespace: erag-secrets, labels: "{{ old_run_labels }}"}}
+            _secret:
+              "Secret/erag-secrets/hf-token":
+                {apiVersion: v1, kind: Secret, metadata: {name: hf-token, namespace: erag-secrets}, data: {token: "{{ _token | b64encode }}"}}
+          loop: "{{ hosts_list }}"
+          no_log: true
+
+        - name: "app_pre_install | test | vector_dims | Run the cases (nested playbook, output captured)"
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ansible_playbook_python | dirname }}/ansible-playbook -v -c local
+              -i {{ (hosts_list | join(',')) ~ ',' }}
+              {{ playbook_dir }}/vector_dims_cases.yaml -e out_dir={{ _tmp.path }}
+              > {{ _tmp.path }}/cases.log 2>&1
+          environment:
+            ANSIBLE_ROLES_PATH: "{{ playbook_dir | dirname | dirname }}"
+            ANSIBLE_COLLECTIONS_PATH: >-
+              {{ playbook_dir | dirname | dirname }}/app_secrets/tests/fake_collections:{{ lookup('ansible.builtin.env', 'HOME') }}/.ansible/collections:/usr/share/ansible/collections
+          register: _cases
+          changed_when: true
+          failed_when: _cases.rc != 0
+
+        - name: "app_pre_install | test | vector_dims | Read the results"
+          ansible.builtin.set_fact:
+            _r: "{{ _r | default({}) | combine({item: lookup('ansible.builtin.file', _tmp.path ~ '/' ~ item ~ '.result') | from_json}) }}"
+          loop: "{{ hosts_list }}"
+
+        - name: "app_pre_install | test | vector_dims | Results"
+          ansible.builtin.assert:
+            that:
+              # Token in the store: the lookup authenticates with it, read from the env.
+              - _r['token-api'].ok
+              - _r['token-api'].dims | int == 1536
+              - _r['token-api'].source == 'huggingface_api'
+              - _r['token-api'].run[0].auth == 'token-from-secret'
+              - "'HF_TOKEN' in _r['token-api'].run[0].env_names"
+              - "_r['token-api'].run[0].argv[0:2] == ['python3', '/etc/vector-dims/resolve_vector_dims.py']"
+              - "_r['token-api'].run[0].argv[2:] == ['--embedding-model-id', 'org/gated-embed', '--hf-token-env', 'HF_TOKEN', '--fallback-dims', '768']"
+              # The earlier run is gone; only this run's Job and ConfigMap exist.
+              - _r['token-api'].jobs | length == 2
+              - _r['token-api'].jobs | select('search', 'erag-vector-dims-old') | list == []
+              # No Secret: the optional ref is left out, the lookup is anonymous.
+              - _r['no-token'].ok
+              - _r['no-token'].dims | int == 384
+              - _r['no-token'].run[0].auth == 'none'
+              - "'HF_TOKEN' not in _r['no-token'].run[0].env_names"
+              # The table and the fallback work as on the host.
+              - _r['known'].ok
+              - _r['known'].dims | int == 1024
+              - _r['known'].source == 'known_models_table'
+              - _r['fallback'].ok
+              - _r['fallback'].dims | int == 768
+              - _r['fallback'].source == 'fallback_config_value'
+              - "'--offline' in _r['fallback'].run[0].argv"
+              - _r['proxy'].ok
+              - "['HTTP_PROXY', 'http_proxy'] | difference(_r['proxy'].run[0].env_names) == []"
+              - "'HTTPS_PROXY' not in _r['proxy'].run[0].env_names"
+              - not _r['fail'].ok
+              - "'the vector_dims Job erag-secrets/erag-vector-dims-' in _r['fail'].msg"
+              - "' failed (image docker.io/library/python:3.12-slim)' in _r['fail'].msg"
+              - _r['fail'].dims is none
+              # The ref is required exactly when the token is in the store.
+              - "_r['token-api'].run[0].optional == {'hf-token': false}"
+              - "_r['no-token'].run[0].optional == {'hf-token': true}"
+              - not _r['deadline'].ok
+              - "' failed (DeadlineExceeded: Job was active longer than specified deadline)' in _r['deadline'].msg"
+              - not _r['missing-projection'].ok
+              - _r['missing-projection'].run[0].unstarted
+              - "' did not finish within 3s' in _r['missing-projection'].msg"
+              - _r['missing-projection'].dims is none
+            fail_msg: "{{ _r | to_json }}"
+            quiet: true
+
+        # The token is base64 in the seeded Secret only; the Job, its ConfigMap,
+        # the results and the whole output must not contain it.
+        - name: "app_pre_install | test | vector_dims | The token appears nowhere"
+          ansible.builtin.shell:
+            cmd: "set -o pipefail; cat {{ _tmp.path }}/*.log {{ _tmp.path }}/*.result {{ _tmp.path }}/*.json | grep -c -F -e \"$T\""
+            executable: /bin/bash
+          environment:
+            T: "{{ _token }}"
+          register: _leaks
+          changed_when: false
+          failed_when: _leaks.rc != 1 or _leaks.stdout | int != 0
+          no_log: true
+
+      always:
+        - name: "app_pre_install | test | vector_dims | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

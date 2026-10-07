@@ -1,0 +1,34 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: the erag Helm releases, matched to the erag charts as the
+# deployment manifest matches them (app_deployment_manifest finalize.yaml).
+# helm list prints release metadata only (no values).
+# Expects: app_secrets_op.
+# Sets: _app_secrets_erag_releases = [{name, namespace, revision}].
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Find the erag charts"
+  ansible.builtin.command:
+    argv: ["{{ app_secrets_discover_components_script }}", "{{ app_secrets_erag_charts_dir }}"]
+  register: _app_secrets_components
+  changed_when: false
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | List the Helm releases"
+  ansible.builtin.command:
+    argv: [helm, list, --all-namespaces, --all, --max, "10000", --output, json]
+  register: _app_secrets_helm_list
+  changed_when: false
+
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Select the erag releases"
+  ansible.builtin.set_fact:
+    _app_secrets_erag_releases: >-
+      {%- set out = [] -%}
+      {%- for r in (_app_secrets_helm_list.stdout | from_json if _app_secrets_helm_list.stdout | trim else []) -%}
+        {%- for c in _app_secrets_components.stdout | from_json if (r.chart | default('')) is match('^' ~ (c.name | regex_escape) ~ '-') -%}
+          {%- if out | selectattr('name', 'equalto', r.name) | selectattr('namespace', 'equalto', r.namespace) | list | length == 0 -%}
+            {%- set _ = out.append({'name': r.name, 'namespace': r.namespace, 'revision': r.revision | int}) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}

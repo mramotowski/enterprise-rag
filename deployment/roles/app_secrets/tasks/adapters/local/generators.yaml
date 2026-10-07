@@ -1,0 +1,44 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter helper: run the legacy generator of one role_managed credential
+# (app_secrets_generator_id) and set its facts. Generator types:
+#   lookup_password  ansible.builtin.password lookup on /dev/null with the
+#                    registry length and chars (one kv_key)
+#   gen_nkey         files/gen_nkey.py, which prints the seed then the public key
+
+---
+- name: "app_secrets | ensure | Select generator for {{ app_secrets_generator_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_generator: "{{ app_secrets_catalog[app_secrets_generator_id].local.generator }}"
+
+- name: "app_secrets | ensure | Generate password for {{ app_secrets_generator_id }}"
+  ansible.builtin.set_fact:
+    "{{ _app_secrets_generator.facts.values() | first }}": >-
+      {{ lookup('ansible.builtin.password', '/dev/null length=' ~ _app_secrets_generator.length
+                ~ ' chars=' ~ _app_secrets_generator.chars) }}
+  when: _app_secrets_generator.type == 'lookup_password'
+  no_log: true
+
+- name: "app_secrets | ensure | Generate NKey pair for {{ app_secrets_generator_id }}"
+  when: _app_secrets_generator.type == 'gen_nkey'
+  block:
+    - name: "app_secrets | ensure | Run gen_nkey.py for {{ app_secrets_generator_id }}"
+      ansible.builtin.command:
+        cmd: python3 {{ role_path }}/files/gen_nkey.py
+      register: _app_secrets_nkey
+      changed_when: true
+      no_log: true
+
+    - name: "app_secrets | ensure | Set NKey facts for {{ app_secrets_generator_id }}"
+      ansible.builtin.set_fact:
+        "{{ _app_secrets_generator.facts.seed }}": "{{ _app_secrets_nkey.stdout_lines[0] }}"
+        "{{ _app_secrets_generator.facts.public_key }}": "{{ _app_secrets_nkey.stdout_lines[1] }}"
+      no_log: true
+
+- name: "app_secrets | ensure | Fail on unknown generator for {{ app_secrets_generator_id }}"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | ensure | {{ app_secrets_generator_id }}: unknown local.generator
+      type '{{ _app_secrets_generator.type }}' (lookup_password, gen_nkey)
+  when: _app_secrets_generator.type not in ['lookup_password', 'gen_nkey']

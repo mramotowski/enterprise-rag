@@ -23,11 +23,15 @@ It measures:
 - HuggingFace tokenizer cached locally (or `HF_TOKEN` for download)
 - Keycloak credentials: both `KEYCLOAK_ERAG_ADMIN_PASSWORD` and `KEYCLOAK_REALM_ADMIN_PASSWORD`
 
-Export credentials from deployment defaults (if not changed after install):
+Export the credentials (if not changed after install). Both commands read Kubernetes Secrets, so they work with either secrets backend:
 ```bash
-source ../../../../../deployment/ansible-logs/default_credentials.txt && export KEYCLOAK_ERAG_ADMIN_PASSWORD=$KEYCLOAK_ERAG_ADMIN_PASSWORD
-export KEYCLOAK_REALM_ADMIN_PASSWORD=$(cat ../../../../../deployment/ansible-logs/default_credentials.yaml | grep KEYCLOAK_REALM_ADMIN_PASSWORD | awk '{print $2}')
+# erag-admin: Secret written by the Keycloak configurator (local) or projected from OpenBao (openbao)
+export KEYCLOAK_ERAG_ADMIN_PASSWORD=$(kubectl get secret -n keycloak erag-credentials -o jsonpath='{.data.KEYCLOAK_ERAG_ADMIN_PASSWORD}' | base64 -d)
+# Keycloak admin (master realm): the platform Secret
+export KEYCLOAK_REALM_ADMIN_PASSWORD=$(kubectl get secret -n keycloak keycloak-admin-secret -o jsonpath='{.data.password}' | base64 -d)
 ```
+
+With `secrets_backend: local` the same values are also in `env/<name>/logs/rag/default_credentials.txt` (`KEYCLOAK_ERAG_ADMIN_PASSWORD`) and `default_credentials.yaml` (`KEYCLOAK_REALM_ADMIN_PASSWORD`). With `secrets_backend: openbao` there are no such files ([Credentials in OpenBao](../../../../../docs/deploy/openbao.md#first-login-credentials)).
 
 ## Setup
 

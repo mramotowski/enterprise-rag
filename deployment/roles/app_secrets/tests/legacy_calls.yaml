@@ -1,0 +1,67 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_local_adapter.yaml: today's app_generate_password calls, in
+# component-role order, then record the file and facts as test_pass[pass_no].
+# Expects: password_file, pass_no.
+
+---
+- name: "app_secrets | test | Legacy chat-history password (app_chat_history)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - {name: "CHAT_HISTORY_POSTGRES", user: "chat_history"}
+
+- name: "app_secrets | test | Legacy fingerprint password (app_fingerprint)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - {name: "FINGERPRINT_POSTGRES", user: "fingerprint"}
+
+- name: "app_secrets | test | Legacy EDP keys (app_edp)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_key
+  loop:
+    - {name: EDP_MINIO_ACCESS_KEY}
+    - {name: EDP_MINIO_SECRET_KEY}
+
+- name: "app_secrets | test | Legacy EDP passwords (app_edp)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password
+  loop:
+    - {name: EDP_REDIS, user: "default"}
+    - {name: EDP_POSTGRESQL, user: "edp"}
+    - {name: EDP_POSTGRESQL_ADMIN, user: "admin"}
+
+# app_vector_databases runs one engine per deployment; all three are called
+# here to cover every vector-db variant.
+- name: "app_secrets | test | Legacy Redis password (app_vector_databases)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - {name: 'REDIS', user: "default"}
+  when: REDIS_PASSWORD is not defined
+
+- name: "app_secrets | test | Legacy pgvector password (app_vector_databases)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - {name: 'POSTGRES', user: "edp"}
+
+- name: "app_secrets | test | Legacy MSSQL password (app_vector_databases)"
+  ansible.builtin.include_role:
+    name: app_generate_password
+    tasks_from: generate_password.yaml
+  loop:
+    - {name: 'MSSQL', user: "default"}
+
+- name: "app_secrets | test | Record legacy pass {{ pass_no }}"
+  ansible.builtin.include_tasks: record_pass.yaml
+  vars:
+    record_file: "{{ password_file }}"

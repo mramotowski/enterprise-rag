@@ -1,0 +1,70 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: status. A worker Job reads the KV v2 metadata of each
+# selected credential (never its data) and sets
+#   app_secrets_status = {<id>: {exists, version, deleted, mechanism: openbao, tracked: true}}
+# exists: the current version is live; deleted: it is soft-deleted or destroyed;
+# path: <mount>/<cluster_id>/<registry path> (for messages; no value).
+
+---
+- name: "app_secrets | status | openbao | Set up the worker namespace"
+  ansible.builtin.include_tasks: setup.yaml
+  vars:
+    app_secrets_op: status
+
+- name: "app_secrets | status | openbao | Build the worker plan"
+  ansible.builtin.include_tasks: plan.yaml
+  vars:
+    app_secrets_op: status
+    app_secrets_plan_write_ids: []
+    app_secrets_plan_check_ids: "{{ app_secrets_selected_ids }}"
+
+- name: "app_secrets | status | openbao | Run the worker"
+  ansible.builtin.include_tasks: run_worker.yaml
+  vars:
+    app_secrets_op: status
+    app_secrets_worker_op: status
+
+- name: "app_secrets | status | openbao | Fail when OpenBao is not usable"
+  ansible.builtin.include_tasks: probe_fail.yaml
+  vars:
+    app_secrets_op: status
+
+- name: "app_secrets | status | openbao | Fail on unreadable credentials"
+  ansible.builtin.fail:
+    msg: "app_secrets | status | cannot read the metadata of: {{ _bad | join('; ') }}"
+  vars:
+    _results: "{{ app_secrets_worker_result.credentials }}"
+    _bad: >-
+      {%- set bad = [] -%}
+      {%- for cid in app_secrets_selected_ids -%}
+        {%- if cid not in _results -%}
+          {%- set _ = bad.append(cid ~ ': no result') -%}
+        {%- elif _results[cid].result == 'error' -%}
+          {%- set _ = bad.append(cid ~ ': ' ~ _results[cid].error) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ bad }}
+  when: _bad | length > 0
+
+- name: "app_secrets | status | openbao | Set credential status"
+  ansible.builtin.set_fact:
+    app_secrets_status: "{{ _status }}"
+  vars:
+    _status: >-
+      {%- set out = {} -%}
+      {%- for cid in app_secrets_selected_ids -%}
+        {%- set r = app_secrets_worker_result.credentials[cid] -%}
+        {%- set _ = out.update({cid: {'exists': r.result == 'exists', 'version': r.version | int,
+                                       'deleted': r.result == 'deleted', 'mechanism': 'openbao',
+                                       'tracked': true,
+                                       'path': app_secrets_openbao_kv_mount ~ '/' ~ app_secrets_openbao_cluster_id
+                                               ~ '/' ~ app_secrets_catalog[cid].path}}) -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true
+
+- name: "app_secrets | status | openbao | Report credential status"
+  ansible.builtin.debug:
+    var: app_secrets_status

@@ -7,6 +7,12 @@ proxy:
   no_proxy: {{ no_proxy | default('') | quote }}
 
 hfToken: {{ hugging_token | quote }}
+{# Projected Secrets: audio-hf-token-secret is an ESO projection of
+   erag/user/hf-token (only when the operator wrote it); the chart renders none. #}
+{% if app_secrets_projected | default(false) %}
+externalSecrets: true
+hfTokenSecret: {{ hugging_token_projected | default(false) | bool | to_json }}
+{% endif %}
 
 asr:
   image:

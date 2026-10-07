@@ -74,6 +74,10 @@ mcp_edge_hostnames: >-
      else [ui_domain_name,
            edp_s3_api_domain | default((edp_s3_domain_prefix | default('s3')) ~ '.' ~ ui_domain_name)] }}
 
+# Image of the in-cluster edge auth Job (projected Secrets): Python 3 standard
+# library only, the image of the vector-dims Job.
+mcp_edge_auth_job_image: "{{ vector_dims_job_image | default('docker.io/library/python:3.12-slim') }}"
+
 # --- Cross-role shared defaults - Owned by other roles; declared here so this role is standalone-runnable. ---
 mcp_enabled: false                                 # pipelines/<flavour>/config.yaml
 edp_enabled: false                                 # app_edp

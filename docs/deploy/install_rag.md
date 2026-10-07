@@ -46,7 +46,7 @@ Edit `env/<name>/config.erag.yaml`:
 | `mcp_enabled` | `true` \| `false` | `false` |
 | `hpa_enabled` | `true` \| `false` | `true` |
 
-Gated models: `export HF_TOKEN="hf_..."`. Minimum hardware (≤60 cores / 128 GB): [Prerequisites - Deploying on Minimum Hardware](../quickstart/prerequisites.md#deploying-on-minimum-hardware).
+Gated models: `export HF_TOKEN="hf_..."` (with `secrets_backend: openbao`, write the token to OpenBao instead, and leave `HF_TOKEN` unset: [Operator-supplied secrets](openbao.md#operator-supplied-secrets-eraguser)). Minimum hardware (≤60 cores / 128 GB): [Prerequisites - Deploying on Minimum Hardware](../quickstart/prerequisites.md#deploying-on-minimum-hardware).
 
 ### Step 3 - Deploy
 
@@ -89,22 +89,28 @@ URLs: `https://solutions.ai` (RAG UI), `https://keycloak.solutions.ai`, `https:/
 
 ### Credentials
 
-All in `env/<name>/logs/rag/default_credentials.yaml` (one-time passwords; change after first login):
+Where the generated credentials are depends on `secrets_backend` in `env/<name>/global_config.yaml`.
 
-| Service | Username | Location |
+**`secrets_backend: openbao`:** no credential file is written. Read the values from OpenBao with `bao kv get`, as described in [Credentials in OpenBao - First-login credentials](openbao.md#first-login-credentials).
+
+**`secrets_backend: local` (default):** two files in `env/<name>/logs/rag/`, plus Kubernetes Secrets. The UI passwords are one-time passwords: change them at the first login.
+
+| Service | Username | Where the password is |
 |---------|----------|----------|
-| UI admin/user | (in file) | default_credentials.yaml |
-| Keycloak | admin | default_credentials.yaml |
-| Grafana | admin | default_credentials.yaml |
-| Vector store | (varies) | default_credentials.yaml |
-| SeaweedFS S3 | (access/secret keys) | default_credentials.yaml |
-| SeaweedFS Admin | (user/pass) | default_credentials.yaml |
-| EDP Redis | default | default_credentials.yaml |
-| EDP Postgres | edp | default_credentials.yaml |
-| System Fingerprint Postgres | fingerprint / system_fingerprint | `fingerprint-postgresql-secret` K8s secret |
+| UI admin / user / maintainer | `erag-admin`, `erag-user`, `erag-maintainer` | `default_credentials.txt` (`KEYCLOAK_ERAG_*_PASSWORD`); Secret `keycloak/erag-credentials` |
+| MCP client (with `mcp_enabled`) | mcp-client (`mcp_keycloak_client_id`) | `default_credentials.txt` (`MCP_CLIENT_SECRET`); Secret `keycloak/erag-credentials` |
+| Keycloak admin console | admin | `default_credentials.yaml` (`KEYCLOAK_REALM_ADMIN_PASSWORD`), copied from the platform Secret `keycloak/keycloak-admin-secret` |
+| Grafana | admin | not written by this layer: platform Secret `monitoring/grafana-admin-credentials` ([platform docs](https://github.com/intel/enterprise-ai-solutions/blob/main/docs/customize/configuration.md#admin-passwords)) |
+| Vector store | the `*_USERNAME` line in `default_credentials.yaml` | `default_credentials.yaml` (`REDIS_PASSWORD`, `POSTGRES_PASSWORD` or `MSSQL_PASSWORD`) |
+| Chat history Postgres | the `*_USERNAME` line in `default_credentials.yaml` | `default_credentials.yaml` (`CHAT_HISTORY_POSTGRES_PASSWORD`) |
+| System Fingerprint Postgres | fingerprint (database `system_fingerprint`) | `default_credentials.yaml` (`FINGERPRINT_POSTGRES_PASSWORD`); Secret `fingerprint/fingerprint-postgresql-secret` |
+| EDP Postgres | edp | `default_credentials.yaml` (`EDP_POSTGRESQL_PASSWORD`, `EDP_POSTGRESQL_ADMIN_PASSWORD`) |
+| EDP Redis | default | `default_credentials.yaml` (`EDP_REDIS_PASSWORD`) |
+| SeaweedFS S3 | (access/secret keys) | `default_credentials.yaml` (`EDP_SEAWEEDFS_ACCESS_KEY`, `EDP_SEAWEEDFS_SECRET_KEY`) |
+| SeaweedFS Admin | admin | `default_credentials.yaml` (`SEAWEEDFS_ADMIN_PASSWORD`) |
 | NATS | NKey | `nats-auth` secret (auto-mounted) |
 
-Secure credentials: `ansible-vault encrypt env/<name>/logs/rag/default_credentials.yaml`, then pass `-- --ask-vault-pass` on next install.
+Every install re-writes both files from the Kubernetes Secrets, so deleting them after the first login is safe. Do not encrypt them with `ansible-vault`: the next install reads the file as plain YAML and writes it again in plaintext. To keep credentials out of files altogether, use [OpenBao](openbao.md).
 
 ## Configure the deployment
 
@@ -128,13 +134,15 @@ erag_keycloak_oidc_tenant_id: ""      # additionally enables SharePoint
 
 All empty = disabled. Partial config rejected. Apply: `./es_auto_installer.sh install erag --env <name>`. Full procedure: [Single Sign-On and SharePoint Integration](../customize/sharepoint.md).
 
+With `secrets_backend: openbao`, leave `erag_keycloak_oidc_client_secret` empty and write the client secret to OpenBao `erag/user/keycloak-oidc` and `erag/user/sharepoint` instead: [Operator-supplied secrets](openbao.md#operator-supplied-secrets-eraguser).
+
 ## Remove the installation
 
 ```bash
 ./es_auto_installer.sh teardown erag --env <name>
 ```
 
-Removes components in reverse order; models undeployed automatically.
+Removes components in reverse order; models undeployed automatically. With `secrets_backend: openbao` it also deletes everything under `<cluster_id>/erag/` in OpenBao, including the `erag/user/*` entries you wrote: see [Credentials in OpenBao - Teardown](openbao.md#teardown).
 
 > [!WARNING]
 > Teardown is environment-scoped. Tear down with the same `--env` you installed with: running it against another environment silently does nothing to the one you meant. `teardown erag` keeps the cluster, platform, and inference layers; `teardown infrastructure` removes the cluster and everything on it.
@@ -147,7 +155,8 @@ Removes components in reverse order; models undeployed automatically.
 | **Debug tool** | [Debug Tool Guide](../operate/troubleshooting.md) collects diagnostics. |
 | **Status check** | `./es_auto_installer.sh status --env <name>` |
 | **Pods stuck pending** | `kubectl describe pod <name> -n <namespace>`. Minimum hardware: verify [tuning steps](../quickstart/prerequisites.md#deploying-on-minimum-hardware). |
-| **Models not deploying** | Gated models: `export HF_TOKEN="hf_..."` before install. |
+| **Models not deploying** | Gated models: `export HF_TOKEN="hf_..."` before install (`secrets_backend: openbao`: write `erag/user/hf-token` instead, see [Credentials in OpenBao](openbao.md#operator-supplied-secrets-eraguser)). |
+| **Install stops at an OpenBao check** | See [Credentials in OpenBao - Install failures](openbao.md#install-failures-and-their-fixes). |
 | **Connection test fails** | Wait for all pods `Running` in pipeline namespace. |
 | **Install fails** | Check `env/<name>/logs/install-erag-*.log`, then re-run (idempotent). |
 

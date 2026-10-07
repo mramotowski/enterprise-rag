@@ -83,7 +83,9 @@ def pytest_addoption(parser):
     parser.addoption("--credentials-file", action="store",
                      default=os.path.join(_LOG_DIR, "default_credentials.txt"),
                      help="Path to credentials file. Required fields: "
-                          "KEYCLOAK_ERAG_ADMIN_USERNAME and KEYCLOAK_ERAG_ADMIN_PASSWORD")
+                          "KEYCLOAK_ERAG_ADMIN_USERNAME and KEYCLOAK_ERAG_ADMIN_PASSWORD. "
+                          "When no credentials file exists (secrets_backend: openbao), the "
+                          "credentials are read from the Secret keycloak/erag-credentials")
     parser.addoption("--build-config-dir", action="store",
                      default="../../../../env/local",
                      help="Path to directory containing global_config.yaml, config.erag.yaml, config.inference.yaml")
@@ -541,10 +543,10 @@ def guard_helper(chatqa_api_helper, fingerprint_api_helper):
 
 
 @pytest.fixture(scope="session")
-def mcp_helper(request):
+def mcp_helper(request, k8s_helper):
     if not cfg.get("mcp_enabled"):
         pytest.skip("MCP gateway is not deployed")
-    helper = McpHelper(credentials_file=request.config.getoption("--credentials-file"))
+    helper = McpHelper(credentials_file=request.config.getoption("--credentials-file"), k8s_helper=k8s_helper)
     yield helper
     helper.close()
 

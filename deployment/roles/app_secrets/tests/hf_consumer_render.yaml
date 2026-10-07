@@ -1,0 +1,18 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_hf_token_consumers.yaml: render one role's values template
+# for one case. Expects: render_role (its defaults already loaded), case, out_dir.
+
+---
+- name: "app_secrets | test | HF token consumers | Set the case vars"
+  ansible.builtin.set_fact:
+    hugging_token: "{{ case.vars.hugging_token }}"
+    app_secrets_projected: "{{ case.vars.app_secrets_projected | default(false) }}"
+    hugging_token_projected: "{{ case.vars.hugging_token_projected | default(false) }}"
+
+- name: "app_secrets | test | HF token consumers | Render {{ render_role }} values for {{ case.name }}"
+  ansible.builtin.template:
+    src: "{{ roles_dir }}/{{ render_role }}/templates/values.yaml.j2"
+    dest: "{{ out_dir }}/{{ case.name }}-{{ render_role }}.yaml"
+    mode: "0600"

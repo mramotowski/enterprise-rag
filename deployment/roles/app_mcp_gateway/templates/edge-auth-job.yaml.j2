@@ -1,0 +1,89 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+
+   MCP edge auth check as an in-cluster Job (projected Secrets only, AD-3),
+   rendered by tasks/verify_edge_auth_job.yaml: this ConfigMap (the unchanged
+   files/verify_edge_auth.py) and Job, in the namespace of the agent client
+   Secret. The client id and secret reach the pod only as env vars from that
+   Secret (secretKeyRef), so they are never in argv, the manifest, Ansible or
+   the log. hostAliases send the Keycloak and UI hostnames to the Envoy
+   gateway Service, so the token request and the probe take the agent's path
+   through the edge. The Job prints the script's JSON result line only. #}
+{% set _labels = {
+     'app.kubernetes.io/part-of': 'erag-mcp-gateway',
+     'app.kubernetes.io/component': 'edge-auth-check',
+     'app.kubernetes.io/managed-by': 'app_mcp_gateway'} %}
+{% set _hosts = [mcp_jwt_issuer | trim | urlsplit('hostname'),
+                 mcp_resource_url | trim | urlsplit('hostname')] | unique %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ _mcp_edge_auth_job_name | to_json }}
+  namespace: {{ keycloak_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  verify_edge_auth.py: {{ lookup('ansible.builtin.file', role_path ~ '/files/verify_edge_auth.py') | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _mcp_edge_auth_job_name | to_json }}
+  namespace: {{ keycloak_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ _mcp_edge_auth_job_timeout | int }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {{ _labels | to_json }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      hostAliases:
+        - ip: {{ _mcp_edge_auth_ip | to_json }}
+          hostnames: {{ _hosts | to_json }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: edge-auth-check
+          image: {{ mcp_edge_auth_job_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-I", "/etc/mcp-edge-auth/verify_edge_auth.py"]
+          env:
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - {name: MCP_TOKEN_URL, value: {{ (mcp_jwt_issuer | trim ~ '/protocol/openid-connect/token') | to_json }}}
+            - {name: MCP_RESOURCE_URL, value: {{ (mcp_resource_url | trim ~ '/') | to_json }}}
+            - {name: MCP_EDGE_AUTH_RETRIES, value: {{ mcp_edge_auth_retries | int | string | to_json }}}
+            - {name: MCP_EDGE_AUTH_DELAY, value: {{ mcp_edge_auth_delay | int | string | to_json }}}
+{% for key in ['MCP_CLIENT_ID', 'MCP_CLIENT_SECRET'] %}
+            - name: {{ key | to_json }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ credentials_secret_name | to_json }}
+                  key: {{ key | to_json }}
+                  # A missing key starts the pod anyway, so the script can report
+                  # it instead of the pod waiting out the deadline.
+                  optional: true
+{% endfor %}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: script, mountPath: /etc/mcp-edge-auth, readOnly: true}
+      volumes:
+        - name: script
+          configMap:
+            name: {{ _mcp_edge_auth_job_name | to_json }}
+            defaultMode: 0444

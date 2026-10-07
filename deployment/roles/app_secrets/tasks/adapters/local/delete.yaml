@@ -1,0 +1,9 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter: delete is a no-op (app_pre_install teardown already removes the local files).
+
+---
+- name: "app_secrets | delete | No-op for the local backend"
+  ansible.builtin.debug:
+    msg: "app_secrets | delete | local backend: nothing to do for {{ app_secrets_selected_ids | join(', ') }} (app_pre_install teardown already removes the local files)"

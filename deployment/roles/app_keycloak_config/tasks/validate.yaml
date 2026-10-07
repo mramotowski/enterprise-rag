@@ -50,3 +50,8 @@
     success_msg: "app_keycloak_config: identity provider '{{ erag_keycloak_oidc_alias }}' configured"
     quiet: true
   when: erag_keycloak_oidc_endpoint | default('', true) | string | trim | length > 0
+
+# A client secret regenerated in Keycloak after install breaks that client while
+# every projection still looks synced; validate reports it (projected Secrets only).
+- name: "app_keycloak_config | Check client secrets for drift from OpenBao"
+  ansible.builtin.include_tasks: check_client_drift.yaml

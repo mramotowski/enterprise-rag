@@ -16,7 +16,7 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        checksum/access-secret: {{ include (print $.Template.BasePath "/edp-access-secret.yaml") . | sha256sum }}
+        checksum/access-secret: {{ if .Values.externalSecrets }}{{ pick .Values "edpInternalUrl" "edpInternalCertVerify" "edpExternalUrl" "edpExternalCertVerify" "edpBaseRegion" "edpOidcConfigUrl" "minioBrowserDomain" "seaweedfsPathPrefix" "sharepointTenantId" "sharepointClientId" "keycloakBrokerIdpAlias" | toJson | sha256sum }}{{ else }}{{ include (print $.Template.BasePath "/edp-access-secret.yaml") . | sha256sum }}{{ end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

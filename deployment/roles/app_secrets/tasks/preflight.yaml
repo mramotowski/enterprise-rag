@@ -1,0 +1,67 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Port operation 'preflight': configuration checks before anything touches the
+# cluster. Usage (app_pre_install, after configuration_issues is initialized):
+#   - ansible.builtin.include_role:
+#       name: app_secrets
+#       tasks_from: preflight.yaml
+#     vars:
+#       secret_ids: [<component>/<credential>, ...]   # optional: default every credential ID
+#
+# With projected Secrets (openbao) an operator-supplied credential (registry
+# user_supplied, erag/user/*) is read only from its KV entry. Every config var
+# of its user_supplied map that is set (non-empty), and every environment
+# variable of its user_supplied_env map that is set, is appended to
+# configuration_issues, naming the var and the KV path and key (SPEC CAP-5).
+# Never reads a value into a message: only names are reported.
+# Local mode: no check (the config and environment are the sources there).
+# Also sets app_secrets_projected (every port op does), so the caller can
+# branch on it before the store is opened.
+
+---
+- name: "app_secrets | preflight | Validate request"
+  ansible.builtin.include_tasks: common/validate.yaml
+  vars:
+    app_secrets_op: preflight
+
+- name: "app_secrets | preflight | Report operator secrets that are also set outside the store"
+  ansible.builtin.set_fact:
+    configuration_issues: "{{ configuration_issues | default([]) + _issues }}"
+  vars:
+    _base: "{{ app_secrets_openbao_kv_mount }}/{{ app_secrets_openbao_cluster_id }}"
+    _issues: >-
+      {%- set out = [] -%}
+      {%- for cid in app_secrets_selected_ids if app_secrets_catalog[cid].user_supplied is defined -%}
+        {%- set e = app_secrets_catalog[cid] -%}
+        {%- set where = _base ~ '/' ~ e.path -%}
+        {%- for kv_key, names in (e.user_supplied | default({}, true)).items() -%}
+          {%- for name in names
+                if lookup('ansible.builtin.vars', name, default='') | default('', true) | string | trim | length > 0 -%}
+            {%- set _ = out.append(name ~ ' is set in the configuration (config.erag.yaml or an extra var), but with '
+                                   ~ 'secrets_backend: openbao it is read only from OpenBao ' ~ where ~ ' key ' ~ kv_key
+                                   ~ '. Remove ' ~ name ~ ' from the configuration and write the value there: bao kv patch -mount='
+                                   ~ app_secrets_openbao_kv_mount ~ ' ' ~ app_secrets_openbao_cluster_id ~ '/' ~ e.path
+                                   ~ ' ' ~ kv_key ~ '=- (value on stdin without a trailing newline: printf %s "$V" | bao kv patch ...; kv put for a new entry; docs/deploy/openbao.md "Log in to OpenBao").') -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- for kv_key, names in (e.user_supplied_env | default({}, true)).items() -%}
+          {%- for name in names if lookup('ansible.builtin.env', name) | string | trim | length > 0 -%}
+            {%- set _ = out.append('The environment variable ' ~ name ~ ' is set, but with secrets_backend: openbao '
+                                   ~ 'it is read only from OpenBao ' ~ where ~ ' key ' ~ kv_key
+                                   ~ '. Unset ' ~ name ~ ' before the install and write the value there: bao kv patch -mount='
+                                   ~ app_secrets_openbao_kv_mount ~ ' ' ~ app_secrets_openbao_cluster_id ~ '/' ~ e.path
+                                   ~ ' ' ~ kv_key ~ '=- (value on stdin without a trailing newline: printf %s "$V" | bao kv patch ...; kv put for a new entry; docs/deploy/openbao.md "Log in to OpenBao").') -%}
+          {%- endfor -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+  when: app_secrets_projected | bool
+  no_log: true
+
+- name: "app_secrets | preflight | Report"
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'operator-supplied secrets are read from OpenBao ' ~ app_secrets_openbao_kv_mount ~ '/'
+         ~ app_secrets_openbao_cluster_id ~ '/erag/user/*'
+         if app_secrets_projected | bool else 'secrets_backend ' ~ secrets_backend ~ ': nothing to check' }}

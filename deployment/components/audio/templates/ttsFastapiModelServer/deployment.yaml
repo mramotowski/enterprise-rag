@@ -36,7 +36,7 @@ spec:
           image: {{ .Values.ttsFastapiModelServer.image.repository }}/{{ .Values.ttsFastapiModelServer.image.name }}:{{ .Values.ttsFastapiModelServer.image.tag }}
           imagePullPolicy: {{ .Values.ttsFastapiModelServer.image.pullPolicy }}
           env:
-          {{- if .Values.hfToken }}
+          {{- if or .Values.hfToken .Values.hfTokenSecret }}
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

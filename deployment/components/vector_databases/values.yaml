@@ -1,6 +1,12 @@
 # Copyright (C) 2024-2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+# true: the Secrets of this chart (redis-cluster-secret, pgvector-secret,
+# mssql-secret) are managed outside Helm with the same names and keys (ESO
+# projections, secrets_backend: openbao); the chart then templates none of
+# them. Consumers reference them by these fixed names.
+externalSecrets: false
+
 # Set on the command line:
 vector_database_password:
 vector_database_name:

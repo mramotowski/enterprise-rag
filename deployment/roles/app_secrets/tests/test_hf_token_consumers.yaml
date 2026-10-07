@@ -1,0 +1,173 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# The HF token consumers outside app_secrets, in local and projected mode,
+# without a cluster (needs helm):
+#   - app_pipeline and app_audio: the real values templates (role defaults plus
+#     the case) rendered through the gmc and audio charts (helm template): which
+#     chart Secret is rendered and whether the pods reference it;
+#   - app_inference_models: the real environment of the "Deploy models" task
+#     (model-manager), run as `env`.
+# Local mode must stay as before (chart Secret from the values token, no
+# model-manager opt-in); projected mode renders no chart Secret, references the
+# ESO projection only when the token is in the store, and runs model-manager
+# with MM_HF_TOKEN_FROM_SECRET=true and an empty HF_TOKEN.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_hf_token_consumers.yaml
+
+---
+- name: "app_secrets | test | HF token consumers"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    roles_dir: "{{ playbook_dir }}/../.."
+    components_dir: "{{ playbook_dir }}/../../../components"
+    # Non-secret placeholder: only its presence is checked.
+    tok: hf_placeholder_token
+    # What the installer and earlier roles provide to the values templates.
+    pipeline_namespace: chatqna
+    tag: t
+    registry: r
+    llm_model_name: m
+    embedding_model_name: e
+    reranking_model_name: rr
+    rag_log_dir: /tmp
+    deployment_dir: "{{ playbook_dir | dirname | dirname | dirname }}"
+    cases:
+      - {name: local-none, vars: {hugging_token: ""}}
+      - {name: local-token, vars: {hugging_token: "{{ tok }}"}}
+      - {name: projected-token, vars: {hugging_token: "", app_secrets_projected: true, hugging_token_projected: true}}
+      - {name: projected-none, vars: {hugging_token: "", app_secrets_projected: true, hugging_token_projected: false}}
+  tasks:
+    - name: "app_secrets | test | HF token consumers | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: hf_token_consumers_test_
+      register: _tmp
+
+    - name: "app_secrets | test | HF token consumers | Run"
+      block:
+        - name: "app_secrets | test | HF token consumers | Load the app_pipeline defaults"
+          ansible.builtin.include_vars:
+            file: "{{ roles_dir }}/app_pipeline/defaults/main.yaml"
+
+        - name: "app_secrets | test | HF token consumers | Render the app_pipeline values"
+          ansible.builtin.include_tasks: hf_consumer_render.yaml
+          vars:
+            render_role: app_pipeline
+            out_dir: "{{ _tmp.path }}"
+          loop: "{{ cases }}"
+          loop_control:
+            loop_var: case
+
+        - name: "app_secrets | test | HF token consumers | Load the app_audio defaults"
+          ansible.builtin.include_vars:
+            file: "{{ roles_dir }}/app_audio/defaults/main.yaml"
+
+        - name: "app_secrets | test | HF token consumers | Render the app_audio values"
+          ansible.builtin.include_tasks: hf_consumer_render.yaml
+          vars:
+            render_role: app_audio
+            out_dir: "{{ _tmp.path }}"
+          loop: "{{ cases }}"
+          loop_control:
+            loop_var: case
+
+        - name: "app_secrets | test | HF token consumers | Render the charts"
+          ansible.builtin.command:
+            argv: >-
+              {{ ['helm', 'template', 't', components_dir ~ '/' ~ item.1.chart,
+                  '-f', _tmp.path ~ '/' ~ item.0.name ~ '-' ~ item.1.role ~ '.yaml'] + item.1.extra }}
+          loop: >-
+            {{ cases | product([{'role': 'app_pipeline', 'chart': 'gmc', 'extra': ['--set', 'chat_history.enabled=false']},
+                                {'role': 'app_audio', 'chart': 'audio', 'extra': []}]) | list }}
+          loop_control:
+            label: "{{ item.0.name }} {{ item.1.chart }}"
+          register: _helm
+          changed_when: false
+
+        # Per case and chart: Secrets of that name rendered, and HF_TOKEN refs to it
+        # (gmc: in the llm-usvc manifest of the controller ConfigMap).
+        - name: "app_secrets | test | HF token consumers | Summarize the renders"
+          ansible.builtin.set_fact:
+            _charts: "{{ _charts | default({}) | combine({item.item.0.name ~ '/' ~ item.item.1.chart: _summary}) }}"
+          vars:
+            _secret: "{{ 'hf-token-secret' if item.item.1.chart == 'gmc' else 'audio-hf-token-secret' }}"
+            _docs: "{{ item.stdout | from_yaml_all | select | list }}"
+            _summary:
+              secrets: "{{ _docs | selectattr('kind', 'equalto', 'Secret') | selectattr('metadata.name', 'equalto', _secret) | list | length }}"
+              refs: "{{ item.stdout | regex_findall('name: ' ~ _secret ~ '\\n\\s+key: HF_TOKEN') | length }}"
+              token_in_render: "{{ tok in item.stdout or (tok | b64encode) in item.stdout }}"
+          loop: "{{ _helm.results }}"
+          loop_control:
+            label: "{{ item.item.0.name }} {{ item.item.1.chart }}"
+
+        - name: "app_secrets | test | HF token consumers | Chart results"
+          ansible.builtin.assert:
+            that:
+              # Local: as before (Secret and ref only with a token in the values;
+              # the audio chart always renders its Secret).
+              - "_charts['local-none/gmc'] == {'secrets': 0, 'refs': 0, 'token_in_render': false}"
+              - "_charts['local-token/gmc'] == {'secrets': 1, 'refs': 1, 'token_in_render': true}"
+              - "_charts['local-none/audio'] == {'secrets': 1, 'refs': 0, 'token_in_render': false}"
+              - "_charts['local-token/audio'] == {'secrets': 1, 'refs': 2, 'token_in_render': true}"
+              # Projected: never a chart Secret; refs only when the token is in the store.
+              - "_charts['projected-token/gmc'] == {'secrets': 0, 'refs': 1, 'token_in_render': false}"
+              - "_charts['projected-none/gmc'] == {'secrets': 0, 'refs': 0, 'token_in_render': false}"
+              - "_charts['projected-token/audio'] == {'secrets': 0, 'refs': 2, 'token_in_render': false}"
+              - "_charts['projected-none/audio'] == {'secrets': 0, 'refs': 0, 'token_in_render': false}"
+            fail_msg: "{{ _charts | to_json }}"
+            quiet: true
+
+        # The real Deploy models task, its command replaced by `env`.
+        - name: "app_secrets | test | HF token consumers | Extract the model-manager deploy environment"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/mm-env.yaml"
+            mode: "0600"
+            content: >-
+              {{ [{'name': 'app_secrets | test | model-manager env',
+                   'ansible.builtin.command': {'argv': ['env']},
+                   'environment': _deploy_task.environment, 'vars': _deploy_task.vars,
+                   'register': '_mm_env_run', 'changed_when': false},
+                  {'name': 'app_secrets | test | model-manager env record',
+                   'ansible.builtin.set_fact': {'_mm_runs': _record}}] | to_nice_yaml }}
+          vars:
+            # Kept as text: rendered when the generated task runs.
+            _record: "{{ '{{' }} _mm_runs | default([]) + [_mm_env_run.stdout_lines | select('match', '^(MM_|HF_TOKEN=|ES_ENV=|KUBECONFIG=)') | sort | list] {{ '}}' }}"
+            _deploy_task: >-
+              {{ lookup('ansible.builtin.file', roles_dir ~ '/app_inference_models/tasks/install.yaml') | from_yaml
+                 | selectattr('name', 'equalto', 'app_inference_models | Deploy models') | first }}
+
+        - name: "app_secrets | test | HF token consumers | Run the deploy environment"
+          ansible.builtin.include_tasks: "{{ _tmp.path }}/mm-env.yaml"
+          vars:
+            app_secrets_projected: "{{ mm_projected }}"
+            env_dir: /tmp/envs/e1
+            inference_accelerator_profiles: {cpu: {}}
+          loop: [false, true]
+          loop_control:
+            loop_var: mm_projected
+
+        - name: "app_secrets | test | HF token consumers | model-manager results"
+          ansible.builtin.assert:
+            that:
+              # Local: exactly the old keys (an HF_TOKEN of the test runner passes through, as before).
+              - "_local | reject('match', '^HF_TOKEN=') | map('regex_replace', '=.*$', '') | sort(case_sensitive=true) | list == ['ES_ENV', 'KUBECONFIG', 'MM_ACCELERATOR', 'MM_ACCEL_RENDER_GID', 'MM_ACCEL_RESOURCE', 'MM_CONFIG', 'MM_CPU_POLICY', 'MM_VLLM_RUNTIME']"
+              - "'MM_CONFIG=/tmp/envs/e1/models-rag.yaml' in _local"
+              # Projected: the opt-in and an empty HF_TOKEN, the rest unchanged.
+              - "'MM_HF_TOKEN_FROM_SECRET=true' in _projected"
+              - _projected | select('match', '^HF_TOKEN=') | list == ['HF_TOKEN=']
+              - _projected | reject('match', '^(HF_TOKEN|MM_HF_TOKEN_FROM_SECRET)=') | list == _local | reject('match', '^HF_TOKEN=') | list
+            fail_msg: "local {{ _local | to_json }} projected {{ _projected | to_json }}"
+            quiet: true
+          vars:
+            _local: "{{ _mm_runs[0] }}"
+            _projected: "{{ _mm_runs[1] }}"
+
+      always:
+        - name: "app_secrets | test | HF token consumers | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

@@ -67,6 +67,17 @@
     - not (data_consistency_no_fail | default(false) | bool)
     - not (force_install_mode | default(false) | bool)
 
+# After the gate, so a blocked upgrade keeps its Helm history for a rollback
+# (see install.yaml): a migration's local copies go.
+- name: "app_post_install | Upgrade — remove the local credential copies after a migration"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: import.yaml
+  vars:
+    secret_ids: "{{ app_post_install_import_secret_ids }}"
+    import_phase: finalize
+  when: app_secrets_projected | default(false)
+
 - name: "app_post_install | Upgrade complete"
   ansible.builtin.debug:
     msg: "[UPGRADE] Application upgrade complete — manifest finalized, data consistency reported"

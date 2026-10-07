@@ -9,6 +9,19 @@
     name: app_check_pods
     tasks_from: teardown.yaml
 
+# Now that no erag workload is left: the credentials leave the credential store
+# (with OpenBao: every version and the metadata under <cluster_id>/erag/,
+# operator entries under erag/user/ included, then the ExternalSecrets and their
+# Secrets in every namespace and the worker namespace; AD-12, no retain option).
+# Before the manifest, so a failure leaves the teardown visibly unfinished; a
+# re-run picks up where it stopped. The local backend has nothing to delete here.
+- name: "app_pre_install | Remove the erag credentials from the credential store"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: delete.yaml
+  vars:
+    secret_ids: "{{ app_pre_install_teardown_secret_ids }}"
+
 # Last, because teardown runs the components in reverse: this role is the final
 # one, so by now everything the manifest inventories is gone. app_post_install
 # marked it as deleting on the way in.

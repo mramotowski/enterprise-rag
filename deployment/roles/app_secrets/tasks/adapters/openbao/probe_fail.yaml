@@ -1,0 +1,38 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: turn the worker's probe result (every op probes first) into
+# a clear failure. Expects app_secrets_op and app_secrets_worker_result
+# (run_worker.yaml). Messages carry states and OpenBao error text only.
+
+---
+- name: "app_secrets | {{ app_secrets_op }} | openbao | Fail when OpenBao is not usable"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} |
+      {{ _messages[_state] | default('the worker failed before reaching OpenBao') }}
+      ({{ _error }})
+  vars:
+    _probe: "{{ app_secrets_worker_result.probe | default({}, true) }}"
+    _state: "{{ _probe.state | default('none') }}"
+    _error: >-
+      {{ _probe.error | default('', true) or (app_secrets_worker_result.done | default({}, true)).error | default('') }}
+    _addr: "{{ app_secrets_openbao_address | trim }}"
+    _messages:
+      unreachable: >-
+        OpenBao at {{ _addr }} is unreachable from namespace {{ app_secrets_worker_namespace }}.
+        Check that the platform openbao component is installed and unsealed (in internal
+        mode the openbao-active Service has no endpoint while every pod is sealed), that its
+        NetworkPolicy admits {{ app_secrets_worker_namespace }}, and that the CA bundle matches.
+      uninitialized: >-
+        OpenBao at {{ _addr }} is not initialized. Run the platform install with
+        secrets_backend: openbao first.
+      sealed: >-
+        OpenBao at {{ _addr }} is sealed. Unseal it (enterprise-ai-solutions
+        docs/deploy/openbao.md, "Unseal after a restart"), then re-run.
+      login_failed: >-
+        the worker could not log in to OpenBao as role {{ app_secrets_openbao_worker_role }}
+        on auth/{{ app_secrets_openbao_auth_mount }}. The role must bind ServiceAccount
+        {{ app_secrets_worker_sa }} in {{ app_secrets_worker_namespace }} with audience
+        {{ app_secrets_openbao_audience }}, and OpenBao must reach the Kubernetes TokenReview API.
+  when: _state != 'ok'

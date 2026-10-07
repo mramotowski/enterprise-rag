@@ -1,0 +1,66 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests the switch-back guard of the local adapter's probe (story 16): with
+# secrets_backend local, a cluster that still has erag ExternalSecrets or
+# namespaces with the erag layer label (projected from OpenBao) stops the probe
+# before anything is generated, unless erag_secrets_switch_to_local_confirmed
+# is true. A cluster that cannot be read also refuses (fail closed). Uses the
+# fake kubernetes.core (one JSON state file per case).
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_switch_guard.yaml
+
+---
+- name: "app_secrets | test | switch-back guard"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    secrets_backend: local
+    secure_logs: false
+    labelled_ns:
+      "Namespace//edp": {apiVersion: v1, kind: Namespace, metadata: {name: edp, labels: {"secrets.ai-solutions/erag": "true"}}}
+    eso_only:
+      "ExternalSecret/edp/edp-redis-secret":
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata: {name: edp-redis-secret, namespace: edp, labels: {"secrets.ai-solutions/erag": "true", "app.kubernetes.io/managed-by": app_secrets}}
+    other_label:
+      "Namespace//edp": {apiVersion: v1, kind: Namespace, metadata: {name: edp, labels: {"secrets.ai-solutions/other": "true"}}}
+    cases:
+      - {name: labelled-namespace, state: "{{ labelled_ns }}", confirmed: false, expect_fail: true}
+      - {name: externalsecret-only, state: "{{ eso_only }}", confirmed: false, expect_fail: true}
+      - {name: labelled-namespace-confirmed, state: "{{ labelled_ns }}", confirmed: true, expect_fail: false}
+      - {name: clean-cluster, state: "{{ other_label }}", confirmed: false, expect_fail: false}
+      # The cluster cannot be read (the fake fails like an API error): fail closed.
+      - {name: unreadable-cluster, state: {}, unreadable: true, confirmed: false, expect_fail: true}
+      - {name: unreadable-cluster-confirmed, state: {}, unreadable: true, confirmed: true, expect_fail: false}
+  tasks:
+    - name: "app_secrets | test | switch-back guard | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_switch.
+      register: _tmp
+
+    - name: "app_secrets | test | switch-back guard | Run the cases"
+      block:
+        - name: "app_secrets | test | switch-back guard | Case {{ item.name }}"
+          ansible.builtin.include_tasks: switch_guard_case.yaml
+          loop: "{{ cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "app_secrets | test | switch-back guard | Results"
+          ansible.builtin.assert:
+            that:
+              - _switch_results | length == cases | length
+              - _switch_results | selectattr('ok', 'equalto', false) | list | length == 0
+            fail_msg: "{{ _switch_results | selectattr('ok', 'equalto', false) | list | to_json }}"
+            success_msg: "switch-back guard: {{ _switch_results | length }} cases OK"
+      always:
+        - name: "app_secrets | test | switch-back guard | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

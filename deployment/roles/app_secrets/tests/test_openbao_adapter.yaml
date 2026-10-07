@@ -1,0 +1,135 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests the app_secrets openbao adapter without a cluster: probe, ensure,
+# status and the ExternalSecret rendering against a real OpenBao 2.7.0 (Docker
+# image quay.io/openbao/openbao:2.7.0, dev-tls mode on 127.0.0.1) set up like
+# the platform bootstrap, with Kubernetes auth through a fake TokenReview API.
+# The fake kubernetes.core runs each worker Job spec in Docker and plays ESO
+# (files/fake_openbao_cluster.py).
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_openbao_adapter.yaml
+#
+# The cases run in a nested ansible-playbook (openbao_cases.yaml, -v) whose
+# whole output, and every worker Job log, is then searched for every value
+# stored in OpenBao: none may appear (the fake cluster state itself holds the
+# ESO-made Secrets, as a cluster does). Each run uses its own temp dir and container, both removed at the end.
+# The data service cases compare the ESO-made Secrets with what the charts and
+# roles render today (test_data_services.yaml, run first; needs helm).
+
+---
+- name: "app_secrets | test | openbao adapter"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    harness: "{{ playbook_dir }}/files/fake_openbao_cluster.py"
+  tasks:
+    - name: "app_secrets | test | openbao | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_openbao_test_
+      register: _tmp
+
+    - name: "app_secrets | test | openbao | Run"
+      block:
+        - name: "app_secrets | test | openbao | Start OpenBao and the fake TokenReview API"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", start, "{{ _tmp.path }}/openbao"]
+          register: _env
+          changed_when: true
+
+        - name: "app_secrets | test | openbao | Write the test registry (templates, test-only credentials)"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", test-registry,
+                   "{{ playbook_dir }}/../files/registry.yaml", "{{ _tmp.path }}/registry.yaml"]
+          changed_when: true
+
+        # The Secrets the data service charts and roles render today, with
+        # placeholders for the values (no value involved).
+        - name: "app_secrets | test | openbao | Render the data service scenarios"
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python | dirname }}/ansible-playbook"
+              - -i
+              - "{{ playbook_dir }}/fixtures/data_services_inventory.yaml"
+              - "{{ playbook_dir }}/test_data_services.yaml"
+              - -e
+              - "out_dir={{ _tmp.path }}/ds"
+          environment:
+            ANSIBLE_ROLES_PATH: "{{ playbook_dir | dirname | dirname }}"
+          changed_when: true
+
+        - name: "app_secrets | test | openbao | Run the cases (nested playbook, output captured)"
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ansible_playbook_python | dirname }}/ansible-playbook -v -i localhost, -c local
+              {{ playbook_dir }}/openbao_cases.yaml > {{ _tmp.path }}/cases.log 2>&1
+          environment:
+            FAKE_OPENBAO_DIR: "{{ _tmp.path }}/openbao"
+            FAKE_K8S_STATE: "{{ _tmp.path }}/cluster.json"
+            FAKE_K8S_ON_APPLY: "{{ ansible_playbook_python }} {{ harness }} hook"
+            FAKE_OPENBAO_ADDR: "{{ (_env.stdout | from_json).addr }}"
+            TEST_REGISTRY: "{{ _tmp.path }}/registry.yaml"
+            DS_OUT: "{{ _tmp.path }}/ds"
+            VALUES_FILE: "{{ _tmp.path }}/values.txt"
+            ANSIBLE_ROLES_PATH: "{{ playbook_dir | dirname | dirname }}"
+            ANSIBLE_COLLECTIONS_PATH: >-
+              {{ playbook_dir }}/fake_collections:{{ lookup('ansible.builtin.env', 'HOME') }}/.ansible/collections:/usr/share/ansible/collections
+          register: _cases
+          changed_when: true
+          failed_when: false
+
+        - name: "app_secrets | test | openbao | Show the result of the cases"
+          ansible.builtin.shell:
+            cmd: "set -o pipefail; grep -E '^fatal: |^localhost  ' {{ _tmp.path }}/cases.log | tail -n 3"
+            executable: /bin/bash
+          register: _tail
+          changed_when: false
+          when: _cases.rc != 0
+
+        - name: "app_secrets | test | openbao | The cases passed"
+          ansible.builtin.assert:
+            that: _cases.rc == 0
+            fail_msg: "{{ _tail.stdout_lines | default([]) }}"
+            quiet: true
+
+        - name: "app_secrets | test | openbao | Count the stored values"
+          ansible.builtin.command:
+            argv: [wc, -l, "{{ _tmp.path }}/values.txt"]
+          register: _values
+          changed_when: false
+
+        - name: "app_secrets | test | openbao | Collect the worker Job logs"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", joblogs, "{{ _tmp.path }}/cluster.json", "{{ _tmp.path }}/joblogs.txt"]
+          changed_when: false
+
+        - name: "app_secrets | test | openbao | No stored value appears in the output of the cases or the worker logs"
+          ansible.builtin.command:
+            argv: [grep, -c, -F, -f, "{{ _tmp.path }}/values.txt", "{{ _tmp.path }}/cases.log", "{{ _tmp.path }}/joblogs.txt"]
+          register: _leaks
+          changed_when: false
+          failed_when: _leaks.rc > 1
+          # grep -c with two files prints "<file>:<count>" per file.
+
+        - name: "app_secrets | test | openbao | Assert no value leaked and every kind of value was checked"
+          ansible.builtin.assert:
+            that:
+              - (_values.stdout.split()[0] | int) >= 8
+              - _leaks.stdout_lines | map('regex_replace', '^.*:', '') | map('int') | sum == 0
+            fail_msg: "{{ _leaks.stdout }} line(s) of the cases output contain a stored value ({{ _values.stdout.split()[0] }} values)"
+            quiet: true
+
+      always:
+        - name: "app_secrets | test | openbao | Stop OpenBao and the fake TokenReview API"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", stop, "{{ _tmp.path }}/openbao"]
+          changed_when: true
+
+        - name: "app_secrets | test | openbao | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

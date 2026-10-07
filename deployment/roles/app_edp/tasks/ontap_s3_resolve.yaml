@@ -46,7 +46,10 @@
       Storage backend is netapp-trident but EDP keeps using '{{ edp_storage_type }}'. To
       serve documents from ONTAP S3, set ontap_s3_data_lif plus
       edp_s3_compatible_access_key_id / edp_s3_compatible_secret_access_key; everything
-      else is derived. See docs/netapp_ontap_s3.md.
+      else is derived. See docs/netapp_ontap_s3.md.{{ ' With projected Secrets (OpenBao) the
+      keys go to OpenBao erag/user/edp-s3 (access_key_id, secret_access_key) instead, and
+      edp_storage_type: s3compatible must be set explicitly (the derivation keys on the
+      config access key).' if app_secrets_projected | default(false) else '' }}
   when:
     - not (_edp_ontap_s3_active | bool)
     - _edp_storage_backend == 'netapp-trident'
@@ -122,6 +125,9 @@
           'vserver object-store-server user create'.
         success_msg: "app_edp: ONTAP S3 credentials present"
         quiet: true
+      # Projected Secrets: the keys are read from the store (erag/user/edp-s3,
+      # whose ensure in install.yaml fails naming the path), not config.
+      when: not (app_secrets_projected | default(false))
 
     - name: "app_edp | ONTAP S3 | Assert the CA certificate file exists"
       ansible.builtin.assert:

@@ -1,0 +1,91 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+
+   Keycloak client secret drift check as an in-cluster Job (projected Secrets
+   only, AD-3), rendered by tasks/check_client_drift_job.yaml: this ConfigMap
+   (the unchanged files/check_client_drift.py) and Job, in the Keycloak
+   namespace. The admin credentials and the projected client secrets reach the
+   pod only as env vars from their Secrets (secretKeyRef), so they are never in
+   argv, the manifest, Ansible or the log. The Job prints the script's JSON
+   result line only: one verdict per client, no value. #}
+{% set _labels = {
+     'app.kubernetes.io/part-of': 'erag-keycloak-config',
+     'app.kubernetes.io/component': 'client-drift-check',
+     'app.kubernetes.io/managed-by': 'app_keycloak_config'} %}
+{% set _plan = [] %}
+{% for c in _kc_drift_clients %}
+{%   set _ = _plan.append({'client_id': c.client_id, 'realm': c.realm, 'env': c.env}) %}
+{% endfor %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ _kc_drift_job_name | to_json }}
+  namespace: {{ keycloak_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  check_client_drift.py: {{ lookup('ansible.builtin.file', role_path ~ '/files/check_client_drift.py') | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _kc_drift_job_name | to_json }}
+  namespace: {{ keycloak_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ keycloak_drift_job_timeout | int }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {{ _labels | to_json }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: client-drift-check
+          image: {{ keycloak_drift_job_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-I", "/etc/keycloak-client-drift/check_client_drift.py"]
+          env:
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - {name: KEYCLOAK_URL, value: {{ keycloak_drift_keycloak_url | trim | to_json }}}
+            # The configurator's admin user (configurator-job.yaml.j2): same source.
+            - {name: KEYCLOAK_ADMIN_USER, value: {{ keycloak_admin_user | string | to_json }}}
+            - {name: DRIFT_TIMEOUT, value: "15"}
+            - {name: DRIFT_CLIENTS, value: {{ _plan | to_json | to_json }}}
+{% set _refs = [
+     {'env': 'KEYCLOAK_ADMIN_PASSWORD', 'secret': keycloak_admin_secret_name, 'key': 'password'}]
+   + _kc_drift_clients %}
+{% for ref in _refs %}
+            - name: {{ ref.env | to_json }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ ref.secret | to_json }}
+                  key: {{ ref.key | to_json }}
+                  # A missing key starts the pod anyway, so the script can report
+                  # it instead of the pod waiting out the deadline.
+                  optional: true
+{% endfor %}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: script, mountPath: /etc/keycloak-client-drift, readOnly: true}
+      volumes:
+        - name: script
+          configMap:
+            name: {{ _kc_drift_job_name | to_json }}
+            defaultMode: 0444

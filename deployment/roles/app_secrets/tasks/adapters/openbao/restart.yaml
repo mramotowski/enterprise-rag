@@ -1,0 +1,104 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: restart the registry workloads of one rotated credential
+# (rotate_one.yaml), after its ExternalSecrets synced. Expects:
+# _app_secrets_rotate_id. Each workload of the registry workloads: entries named
+# in rotate.restart that exists gets kubectl.kubernetes.io/restartedAt on its
+# pod template (what kubectl rollout restart sets); a workload that is not
+# deployed (its component is disabled) is skipped. Then every rollout must
+# finish within app_secrets_rotate_rollout_timeout.
+# Sets: _app_secrets_restarted, _app_secrets_restart_skipped (<ns>/<kind>/<name>).
+
+---
+- name: "app_secrets | rotate | openbao | List the consumers of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_restart_targets: >-
+      {%- set out = [] -%}
+      {%- for wname in app_secrets_catalog[_app_secrets_rotate_id].rotate.restart | default([]) -%}
+        {%- for w in app_secrets_registry.workloads[wname] -%}
+          {%- set item = {'namespace': w.namespace | string, 'kind': w.kind, 'name': w.name | string} -%}
+          {%- if item not in out -%}
+            {%- set _ = out.append(item) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "app_secrets | rotate | openbao | Find the consumers of {{ _app_secrets_rotate_id }}"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+  loop: "{{ _app_secrets_restart_targets }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.kind }}/{{ item.name }}"
+  register: _app_secrets_restart_found
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Note the deployed consumers of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_restart_deployed: >-
+      {{ _app_secrets_restart_found.results | default([]) | selectattr('resources', 'defined')
+         | selectattr('resources') | map(attribute='item') | list }}
+    _app_secrets_restart_skipped: >-
+      {{ _app_secrets_restart_found.results | default([]) | rejectattr('resources')
+         | map(attribute='item') | map('dict2items') | map('map', attribute='value') | map('join', '/') | list }}
+    _app_secrets_restart_stamp: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: "app_secrets | rotate | openbao | Restart the consumers of {{ _app_secrets_rotate_id }}"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: apps/v1
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ _app_secrets_restart_stamp }}"
+  loop: "{{ _app_secrets_restart_deployed }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.kind }}/{{ item.name }}"
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Wait for the rollouts of {{ _app_secrets_rotate_id }}"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+  loop: "{{ _app_secrets_restart_deployed }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.kind }}/{{ item.name }}"
+  register: _app_secrets_rollout
+  until: app_secrets_rollout_done | bool
+  retries: "{{ ((app_secrets_rotate_rollout_timeout | int) / (app_secrets_rotate_rollout_delay | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ app_secrets_rotate_rollout_delay | int }}"
+  vars:
+    _rollout_w: "{{ _app_secrets_rollout.resources | default([]) | first | default({}) }}"
+  # Failed = not finished in time; reported together below.
+  failed_when: not (app_secrets_rollout_done | bool)
+  ignore_errors: true
+  no_log: true
+
+- name: "app_secrets | rotate | openbao | Fail when a rollout of {{ _app_secrets_rotate_id }} did not finish"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | rotate | {{ _app_secrets_rotate_id }} was rotated (the server and OpenBao hold the
+      new value and the ExternalSecrets synced), but the restart of {{ _stuck | join(', ') }} did not
+      finish within {{ app_secrets_rotate_rollout_timeout }}s. Check: kubectl -n <namespace> rollout status
+      <kind>/<name> (the restart is already requested; a new erag_rotate run would rotate again).
+  vars:
+    _stuck: >-
+      {{ _app_secrets_rollout.results | default([]) | selectattr('failed', 'defined') | selectattr('failed')
+         | map(attribute='item') | map('dict2items') | map('map', attribute='value') | map('join', '/') | list }}
+  when: _stuck | length > 0
+
+- name: "app_secrets | rotate | openbao | Note the restarted consumers of {{ _app_secrets_rotate_id }}"
+  ansible.builtin.set_fact:
+    _app_secrets_restarted: >-
+      {{ _app_secrets_restart_deployed | map('dict2items') | map('map', attribute='value') | map('join', '/') | list }}

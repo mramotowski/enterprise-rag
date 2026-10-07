@@ -1,0 +1,99 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+
+   openbao adapter: one worker run = this ConfigMap (script + plan) and Job.
+   Rendered by tasks/adapters/openbao/run_worker.yaml. Non-secret input only:
+   the op name (the only arg), the plan (credential ids, KV paths, generator
+   specs from the registry) and the settings in env. The worker logs in with
+   the projected ServiceAccount token; the CA comes from a ConfigMap. #}
+{% set _labels = {
+     'app.kubernetes.io/part-of': 'erag-secrets',
+     'app.kubernetes.io/component': 'worker',
+     'app.kubernetes.io/managed-by': 'app_secrets',
+     'erag-secrets/op': app_secrets_worker_op} %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ _app_secrets_job_name | to_json }}
+  namespace: {{ app_secrets_worker_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  secrets_worker.sh: {{ lookup('ansible.builtin.file', role_path ~ '/files/secrets_worker.sh') | to_json }}
+  plan: {{ (app_secrets_worker_plan | join('\n') ~ '\n') | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _app_secrets_job_name | to_json }}
+  namespace: {{ app_secrets_worker_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ app_secrets_worker_timeout | int }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {{ _labels | to_json }}
+    spec:
+      serviceAccountName: {{ app_secrets_worker_sa | to_json }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: {{ app_secrets_worker_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/etc/erag-secrets/secrets_worker.sh"]
+          args: [{{ app_secrets_worker_op | to_json }}]
+          env:
+            - {name: BAO_ADDR, value: {{ app_secrets_openbao_address | trim | to_json }}}
+            - {name: BAO_CACERT, value: "/etc/openbao-ca/ca.crt"}
+            - {name: BAO_CLIENT_TIMEOUT, value: {{ app_secrets_worker_bao_timeout | to_json }}}
+            - {name: OB_AUTH_MOUNT, value: {{ app_secrets_openbao_auth_mount | to_json }}}
+            - {name: OB_ROLE, value: {{ app_secrets_openbao_worker_role | to_json }}}
+            - {name: OB_JWT_FILE, value: "/var/run/secrets/openbao/token"}
+            - {name: OB_KV_MOUNT, value: {{ app_secrets_openbao_kv_mount | to_json }}}
+            - {name: OB_PLAN_FILE, value: "/etc/erag-secrets/plan"}
+            - {name: OB_WORK_DIR, value: "/work"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: worker, mountPath: /etc/erag-secrets, readOnly: true}
+            - {name: openbao-ca, mountPath: /etc/openbao-ca, readOnly: true}
+            - {name: openbao-token, mountPath: /var/run/secrets/openbao, readOnly: true}
+            - {name: work, mountPath: /work}
+      volumes:
+        - name: worker
+          configMap:
+            name: {{ _app_secrets_job_name | to_json }}
+            defaultMode: 0444
+        - name: openbao-ca
+          configMap:
+            name: {{ app_secrets_openbao_ca_configmap | to_json }}
+            items:
+              - {key: ca.crt, path: ca.crt}
+        - name: openbao-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ app_secrets_openbao_audience | to_json }}
+                  expirationSeconds: 600
+                  path: token
+        - name: work
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

@@ -1,0 +1,15 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+galaxy_info:
+  role_name: app_secrets
+  author: Intel Corporation
+  description: >-
+    Credential port. Takes credential IDs from the registry
+    (files/registry.yaml) and runs one operation on them through the adapter
+    selected by secrets_backend (local | openbao). Helper role: include it with
+    tasks_from (probe | ensure | status | delete | import | rotate) and
+    vars {secret_ids: [...]}, not as a component.
+  license: Apache-2.0
+  min_ansible_version: "2.14"
+dependencies: []

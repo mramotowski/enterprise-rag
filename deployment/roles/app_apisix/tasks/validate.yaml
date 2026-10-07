@@ -3,12 +3,16 @@
   kubernetes.core.helm_info:
     name: "{{ apisix_helm_release_name }}"
     release_namespace: "{{ apisix_namespace }}"
+    release_state: [all]
   register: _apisix_release
 
 - name: "app_apisix | Assert installed"
   ansible.builtin.assert:
-    that: _apisix_release.status is defined
-    fail_msg: "APISIX Helm release '{{ apisix_helm_release_name }}' not found in {{ apisix_namespace }}"
+    that: ((_apisix_release.status | default({}, true)).status | default('')) == 'deployed'
+    fail_msg: >-
+      APISIX Helm release '{{ apisix_helm_release_name }}' in {{ apisix_namespace }} is
+      '{{ (_apisix_release.status | default({}, true)).status | default('not found') }}', not deployed
+      (helm -n {{ apisix_namespace }} history {{ apisix_helm_release_name }})
     success_msg: "app_apisix: OK"
     quiet: true
 

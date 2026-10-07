@@ -1,5 +1,9 @@
 # Copyright (C) 2024-2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
+{# Projected Secrets (app_secrets_projected): the Job reads every value from the
+    ESO projections erag-credentials and keycloak-configurator-sensitive, sets
+    them in Keycloak, and has no Kubernetes API access; this file holds no value. #}
+{% set _projected = app_secrets_projected | default(false) | bool %}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -12,10 +16,14 @@ kind: Role
 metadata:
   name: keycloak-configurator
   namespace: {{ keycloak_namespace }}
+{% if _projected %}
+rules: []
+{% else %}
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "create", "update", "patch"]
+{% endif %}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -39,8 +47,8 @@ metadata:
 data:
   configurator.sh: |
 {{ lookup('file', role_path + '/files/keycloak_configurator_job.sh') | indent(4, first=True) }}
-{% if (erag_keycloak_oidc_endpoint is defined and erag_keycloak_oidc_endpoint) or
-      (erag_keycloak_federation_endpoint is defined and erag_keycloak_federation_endpoint) %}
+{% if not _projected and ((erag_keycloak_oidc_endpoint is defined and erag_keycloak_oidc_endpoint) or
+      (erag_keycloak_federation_endpoint is defined and erag_keycloak_federation_endpoint)) %}
 ---
 apiVersion: v1
 kind: Secret
@@ -76,6 +84,9 @@ spec:
         app.kubernetes.io/name: keycloak-configurator
     spec:
       serviceAccountName: keycloak-configurator
+{% if _projected %}
+      automountServiceAccountToken: false
+{% endif %}
       restartPolicy: OnFailure
       securityContext:
         runAsNonRoot: true
@@ -120,7 +131,13 @@ spec:
             - name: GRAFANA_PATH_PREFIX
               value: "{{ grafana_oauth_path_prefix }}"
 {% endif %}
-{% if grafana_oauth_client_secret is defined and grafana_oauth_client_secret %}
+{% if _projected %}
+            - name: GRAFANA_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-configurator-sensitive
+                  key: grafana-oauth-client-secret
+{% elif grafana_oauth_client_secret is defined and grafana_oauth_client_secret %}
             - name: GRAFANA_OAUTH_CLIENT_SECRET
               value: "{{ grafana_oauth_client_secret }}"
 {% endif %}
@@ -139,6 +156,29 @@ spec:
               value: "{{ credentials_secret_name }}"
             - name: CREDENTIALS_SECRET_NAMESPACE
               value: "{{ keycloak_namespace }}"
+{% if _projected %}
+            - name: CREDENTIALS_SOURCE
+              value: "projection"
+{% for _user in ['ADMIN', 'USER', 'MAINTAINER'] %}
+            - name: KEYCLOAK_ERAG_{{ _user }}_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ credentials_secret_name }}
+                  key: KEYCLOAK_ERAG_{{ _user }}_PASSWORD
+{% endfor %}
+{% if mcp_enabled | default(false) | bool %}
+            - name: MCP_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ credentials_secret_name }}
+                  key: MCP_CLIENT_SECRET
+{% endif %}
+            - name: EDP_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-configurator-sensitive
+                  key: edp-oidc-client-secret
+{% endif %}
 {% if erag_keycloak_oidc_endpoint is defined and erag_keycloak_oidc_endpoint %}
             - name: OIDC_ENDPOINT
               value: "{{ erag_keycloak_oidc_endpoint }}"

@@ -1,0 +1,662 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Proves that the app_secrets local adapter is equivalent to today's
+# app_generate_password calls, without a cluster.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_local_adapter.yaml
+#
+# Each run works in its own temp dir (removed at the end) and does both passes:
+# a fresh pass on empty files and an existing-file pass that must change
+# nothing. The legacy helper calls and the port run on two separate in-memory
+# hosts (both local connections), so their facts cannot leak into each other;
+# a third host runs the edge and error cases.
+
+---
+- name: "app_secrets | test | Setup and registry checks"
+  hosts: localhost
+  gather_facts: false
+  vars: &test_vars
+    registry_file: "{{ playbook_dir }}/../files/registry.yaml"
+    # Same order as the legacy calls below.
+    file_ids:
+      - chat-history/postgres
+      - fingerprint/postgres
+      - edp/object-store
+      - edp/redis
+      - edp/postgresql
+      - vector-db/redis
+      - vector-db/pgvector
+      - vector-db/mssql
+    # nats/auth is role_managed with a local generator (ensure sets facts), so
+    # it is only used in the status check.
+    noop_ids: [keycloak/erag-admin, user/hf-token]
+    password_vars:
+      - CHAT_HISTORY_POSTGRES_PASSWORD
+      - FINGERPRINT_POSTGRES_PASSWORD
+      - EDP_REDIS_PASSWORD
+      - EDP_POSTGRESQL_PASSWORD
+      - EDP_POSTGRESQL_ADMIN_PASSWORD
+      - REDIS_PASSWORD
+      - POSTGRES_PASSWORD
+      - MSSQL_PASSWORD
+    key_vars: [EDP_MINIO_ACCESS_KEY, EDP_MINIO_SECRET_KEY]
+    # The expected erag credential IDs, one per credential (vector-db/<engine>
+    # is one entry that expands to one ID per engine).
+    inventory_registry_ids:
+      - keycloak/erag-admin
+      - keycloak/erag-user
+      - keycloak/erag-maintainer
+      - keycloak/mcp-client
+      - keycloak/grafana-oauth
+      - keycloak/edp-oidc
+      - nats/auth
+      - vector-db/<engine>
+      - chat-history/postgres
+      - fingerprint/postgres
+      - edp/postgresql
+      - edp/redis
+      - edp/object-store
+      - seaweedfs/admin
+      - user/edp-s3
+      - user/sharepoint
+      - user/keycloak-oidc
+      - user/ldap-bind
+      - user/hf-token
+    expected_lines:
+      - CHAT_HISTORY_POSTGRES_USERNAME: chat_history
+      - CHAT_HISTORY_POSTGRES_PASSWORD: null
+      - FINGERPRINT_POSTGRES_USERNAME: fingerprint
+      - FINGERPRINT_POSTGRES_PASSWORD: null
+      - EDP_MINIO_ACCESS_KEY: null
+      - EDP_MINIO_SECRET_KEY: null
+      - EDP_REDIS_USERNAME: default
+      - EDP_REDIS_PASSWORD: null
+      - EDP_POSTGRESQL_USERNAME: edp
+      - EDP_POSTGRESQL_PASSWORD: null
+      - EDP_POSTGRESQL_ADMIN_USERNAME: admin
+      - EDP_POSTGRESQL_ADMIN_PASSWORD: null
+      - REDIS_USERNAME: default
+      - REDIS_PASSWORD: null
+      - POSTGRES_USERNAME: edp
+      - POSTGRES_PASSWORD: null
+      - MSSQL_USERNAME: default
+      - MSSQL_PASSWORD: null
+    # Parse default_credentials.yaml content into ordered [name, value] pairs.
+    parse_lines: >-
+      {{ _content.splitlines() | select | map('regex_findall', '^([^:]+): (.*)$') | map('first') | map('list') | list }}
+
+  tasks:
+    - name: "app_secrets | test | Create per-run temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_test.
+      register: _test_tmp
+
+    - name: "app_secrets | test | Registry checks"
+      block:
+        - name: "app_secrets | test | Load registry"
+          ansible.builtin.include_vars:
+            file: "{{ registry_file }}"
+            name: test_registry
+
+        - name: "app_secrets | test | Registry has exactly the expected credential IDs"
+          ansible.builtin.assert:
+            that:
+              - test_registry.credentials.keys() | sort == inventory_registry_ids | sort
+              - test_registry.credentials | length == 19
+            fail_msg: >-
+              missing: {{ inventory_registry_ids | difference(test_registry.credentials.keys() | list) }},
+              extra: {{ test_registry.credentials.keys() | list | difference(inventory_registry_ids) }}
+
+        - name: "app_secrets | test | Credential entries carry no projections"
+          ansible.builtin.assert:
+            that: test_registry.credentials | dict2items | selectattr('value.projections', 'defined') | list | length == 0
+
+        # Builds app_secrets_catalog (the expanded credential IDs) via the port.
+        - name: "app_secrets | test | Load the catalog through the port"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: status.yaml
+          vars:
+            log_dir: "{{ _test_tmp.path }}/catalog"
+            secret_ids: [chat-history/postgres]
+
+        - name: "app_secrets | test | The local backend does not project Secrets"
+          ansible.builtin.assert:
+            that:
+              - app_secrets_projected is defined
+              - not (app_secrets_projected | bool)
+            quiet: true
+
+        # YAML silently keeps the last of two equal keys, so check the raw file.
+        - name: "app_secrets | test | Read the secrets: keys"
+          ansible.builtin.set_fact:
+            raw_secret_keys: >-
+              {{ lookup('ansible.builtin.file', registry_file)
+                 | regex_search('(?ms)^secrets:[ ]*$(.*)', '\1') | first
+                 | regex_findall('(?m)^  ([^#\s].*):\s*$') }}
+            # Reading the keys into a list resolves their namespace refs.
+            resolved_secret_keys: "{{ test_registry.secrets.keys() | list }}"
+
+        - name: "app_secrets | test | Every Secret appears exactly once"
+          ansible.builtin.assert:
+            that:
+              - raw_secret_keys | length == test_registry.secrets | length
+              - raw_secret_keys | unique | length == raw_secret_keys | length
+              - resolved_secret_keys | unique | length == resolved_secret_keys | length
+              - resolved_secret_keys | reject('match', '^[a-z0-9-]+/[a-z0-9.-]+$') | list | length == 0
+            fail_msg: "raw: {{ raw_secret_keys }}; resolved: {{ resolved_secret_keys }}"
+
+        - name: "app_secrets | test | Every Secret data ref resolves to a credential key or identifier"
+          ansible.builtin.assert:
+            that:
+              - _bad | length == 0
+              - (app_secrets_catalog.keys() | list) | difference(_used) | length == 0
+            fail_msg: "bad refs: {{ _bad }}; credentials in no Secret: {{ (app_secrets_catalog.keys() | list) | difference(_used) }}"
+          vars:
+            _checked: >-
+              {%- set bad = [] -%}
+              {%- set used = [] -%}
+              {%- for skey, s in test_registry.secrets.items() -%}
+                {%- if (s.data is defined) == (s.variants is defined) -%}
+                  {%- set _ = bad.append(skey ~ ': needs exactly one of data, variants') -%}
+                {%- endif -%}
+                {%- set datas = [s.data] if s.data is defined else (s.variants | default({}) | dict2items | map(attribute='value.data') | list) -%}
+                {%- for d in datas -%}
+                  {%- for k, src in d.items() -%}
+                    {%- set forms = ['from', 'identifier', 'value', 'value_from', 'template'] | select('in', src.keys() | list) | list -%}
+                    {%- if forms | length != 1 -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': needs exactly one of from, identifier, value, value_from, template') -%}
+                    {%- endif -%}
+                    {%- if src.enabled is defined and not (src.enabled is string or src.enabled is boolean) -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': enabled must be a config expression or a boolean') -%}
+                    {%- endif -%}
+                    {%- if src.value_from is defined and not (src.value_from is match('^[a-z_][a-z0-9_]*[.][A-Za-z0-9_]+$')) -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': value_from must be <fact>.<key>') -%}
+                    {%- endif -%}
+                    {%- if src.template is defined and src.template not in (test_registry.templates | default({}, true)) -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': template ' ~ src.template ~ ' is not defined') -%}
+                    {%- endif -%}
+                    {%- set key_refs = ([src['from']] if src['from'] is defined else []) + (src.sources if src.template is defined else []) -%}
+                    {%- if src.template is defined and src.sources is not defined -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': template needs sources') -%}
+                    {%- endif -%}
+                    {%- for ref in key_refs -%}
+                      {%- set cid, kv = (ref ~ '.').split('.', 1)[0], ref.split('.', 1)[1] | default('') -%}
+                      {%- if cid not in app_secrets_catalog or kv not in app_secrets_catalog[cid]['keys'] -%}
+                        {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': ' ~ ref) -%}
+                      {%- else -%}
+                        {%- set _ = used.append(cid) -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {%- if src.identifier is defined -%}
+                      {%- set cid, name = (src.identifier ~ '.').split('.', 1)[0], src.identifier.split('.', 1)[1] | default('') -%}
+                      {%- if cid not in app_secrets_catalog or name not in (app_secrets_catalog[cid].identifiers | default({})) -%}
+                        {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': identifier ' ~ src.identifier) -%}
+                      {%- endif -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ {'bad': bad, 'used': used | unique | list} }}
+            _bad: "{{ _checked.bad }}"
+            _used: "{{ _checked.used }}"
+
+        - name: "app_secrets | test | nats/auth has one nkey_user generator for both keys"
+          ansible.builtin.assert:
+            that:
+              - _k.seed.generate.type == 'nkey_user'
+              - _k.seed.generate.writes | sort == ['public_key', 'seed']
+              - _k.public_key.generate is not defined
+              - _k.public_key.generated_by == 'seed'
+          vars:
+            _k: "{{ test_registry.credentials['nats/auth']['keys'] }}"
+
+      rescue:
+        - name: "app_secrets | test | Remove temp dir after a failed registry check"
+          ansible.builtin.file:
+            path: "{{ _test_tmp.path }}"
+            state: absent
+
+        - name: "app_secrets | test | Registry check failed"
+          ansible.builtin.fail:
+            msg: "registry check failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+
+    - name: "app_secrets | test | Add the legacy, port and edge hosts"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        test_dir: "{{ _test_tmp.path }}"
+      loop: [app_secrets_test_legacy, app_secrets_test_port, app_secrets_test_edge]
+      changed_when: false
+
+# --- Legacy calls (as the component roles make them today), both passes ----------
+
+- name: "app_secrets | test | Legacy helper"
+  hosts: app_secrets_test_legacy
+  gather_facts: false
+  vars:
+    <<: *test_vars
+    password_file: "{{ test_dir }}/legacy/rag/default_credentials.yaml"
+  tasks:
+    - name: "app_secrets | test | Legacy calls, pass {{ pass_no }}"
+      ansible.builtin.include_tasks: legacy_calls.yaml
+      loop: [1, 2]
+      loop_control:
+        loop_var: pass_no
+
+# --- Port, both passes ---------------------------------------------------------------
+
+- name: "app_secrets | test | Port"
+  hosts: app_secrets_test_port
+  gather_facts: false
+  vars:
+    <<: *test_vars
+    port_file: "{{ test_dir }}/port/rag/default_credentials.yaml"
+  tasks:
+    - name: "app_secrets | test | Port ensure, pass {{ pass_no }}"
+      ansible.builtin.include_tasks: port_calls.yaml
+      loop: [1, 2]
+      loop_control:
+        loop_var: pass_no
+
+# --- Equivalence ----------------------------------------------------------------------
+
+- name: "app_secrets | test | Compare legacy and port"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    <<: *test_vars
+    legacy_host: "{{ hostvars['app_secrets_test_legacy'] }}"
+    port_host: "{{ hostvars['app_secrets_test_port'] }}"
+  tasks:
+    - name: "app_secrets | test | Compare"
+      block:
+        - name: "app_secrets | test | Parse the legacy file"
+          ansible.builtin.set_fact:
+            legacy_lines: "{{ parse_lines }}"
+          vars:
+            _content: "{{ legacy_host.test_pass[1].content }}"
+          no_log: true
+
+        - name: "app_secrets | test | Parse the port file"
+          ansible.builtin.set_fact:
+            port_lines: "{{ parse_lines }}"
+          vars:
+            _content: "{{ port_host.test_pass[1].content }}"
+          no_log: true
+
+        - name: "app_secrets | test | Files have identical line names, order, usernames and mode"
+          ansible.builtin.assert:
+            that:
+              - legacy_lines | map('first') | list == _expected_names
+              - port_lines | map('first') | list == _expected_names
+              - _legacy_users == _expected_users
+              - _port_users == _expected_users
+              - legacy_host.test_pass[1].mode == '0600'
+              - port_host.test_pass[1].mode == '0600'
+            quiet: true
+          vars:
+            _expected_names: "{{ expected_lines | map('dict2items') | map('first') | map(attribute='key') | list }}"
+            _expected_users: "{{ expected_lines | map('dict2items') | map('first') | selectattr('key', 'search', '_USERNAME$') | items2dict }}"
+            _legacy_users: "{{ legacy_lines | selectattr('0', 'search', '_USERNAME$') | items2dict(key_name=0, value_name=1) }}"
+            _port_users: "{{ port_lines | selectattr('0', 'search', '_USERNAME$') | items2dict(key_name=0, value_name=1) }}"
+
+        - name: "app_secrets | test | Values have the legacy formats"
+          ansible.builtin.assert:
+            that:
+              - item.1 | length == (16 if item.0 in key_vars else 12)
+              - (item.1 is match('^[A-Za-z0-9]{16}$')) if item.0 in key_vars else (item.1 is match('^[A-Za-z0-9_()]{12}$'))
+              - item.0 in key_vars or (item.1 | regex_findall('[a-z]') | length >= 2)
+              - item.0 in key_vars or (item.1 | regex_findall('[A-Z]') | length >= 2)
+              - item.0 in key_vars or (item.1 | regex_findall('[0-9]') | length >= 2)
+              - item.0 in key_vars or (item.1 | regex_findall('[_()]') | length >= 2)
+            quiet: true
+          loop: "{{ (legacy_lines + port_lines) | rejectattr('0', 'search', '_USERNAME$') | list }}"
+          loop_control:
+            label: "{{ item.0 }}"
+          no_log: true
+
+        - name: "app_secrets | test | Facts equal the stored values on both passes"
+          ansible.builtin.assert:
+            that:
+              - port_host.test_pass[1].facts == _port_stored
+              - port_host.test_pass[2].facts == _port_stored
+              - legacy_host.test_pass[1].facts == _legacy_stored
+              - legacy_host.test_pass[2].facts == _legacy_stored
+            quiet: true
+          vars:
+            _port_stored: "{{ port_lines | selectattr('0', 'in', password_vars + key_vars) | items2dict(key_name=0, value_name=1) }}"
+            _legacy_stored: "{{ legacy_lines | selectattr('0', 'in', password_vars + key_vars) | items2dict(key_name=0, value_name=1) }}"
+          no_log: true
+
+        - name: "app_secrets | test | The existing-file pass changed nothing"
+          ansible.builtin.assert:
+            that:
+              - port_host.test_pass[2].checksum == port_host.test_pass[1].checksum
+              - port_host.test_pass[2].mode == '0600'
+              - legacy_host.test_pass[2].checksum == legacy_host.test_pass[1].checksum
+            quiet: true
+
+      rescue:
+        - name: "app_secrets | test | Remove temp dir after a failed comparison"
+          ansible.builtin.file:
+            path: "{{ hostvars['localhost']['_test_tmp']['path'] }}"
+            state: absent
+
+        - name: "app_secrets | test | Comparison failed"
+          ansible.builtin.fail:
+            msg: "comparison failed: {{ ansible_failed_result.msg | default('see above') }}"
+
+# --- Status, no-op ops, edge and error cases -------------------------------------------
+
+- name: "app_secrets | test | Edge cases"
+  hosts: app_secrets_test_edge
+  gather_facts: false
+  vars:
+    <<: *test_vars
+    port_log_dir: "{{ test_dir }}/port"
+    port_file: "{{ test_dir }}/port/rag/default_credentials.yaml"
+  tasks:
+    - name: "app_secrets | test | Edge and error cases"
+      block:
+        # --- status ------------------------------------------------------------------
+
+        - name: "app_secrets | test | Port status"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: status.yaml
+          vars:
+            log_dir: "{{ port_log_dir }}"
+            secret_ids: "{{ file_ids + noop_ids + ['nats/auth'] }}"
+            hugging_token: "hf_test_token"
+            REDIS_PASSWORD: "operator-set"   # status ignores skip_if_defined
+
+        - name: "app_secrets | test | Status reports existence without values"
+          ansible.builtin.assert:
+            that:
+              - app_secrets_status.keys() | sort == (file_ids + noop_ids + ['nats/auth']) | sort
+              - file_ids | map('extract', app_secrets_status) | map(attribute='exists') | unique == [true]
+              - "app_secrets_status['nats/auth'] == {'exists': false, 'mechanism': 'role_managed', 'tracked': false}"
+              - "app_secrets_status['user/hf-token'] == {'exists': true, 'mechanism': 'user_supplied', 'tracked': true}"
+              - "'hf_test_token' not in (app_secrets_status | to_json)"
+              - "'operator-set' not in (app_secrets_status | to_json)"
+            quiet: true
+
+        - name: "app_secrets | test | Status on an empty log dir"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: status.yaml
+          vars:
+            log_dir: "{{ test_dir }}/empty"
+            secret_ids: [chat-history/postgres, edp/object-store, user/ldap-bind]
+
+        - name: "app_secrets | test | Status reports missing credentials"
+          ansible.builtin.assert:
+            that:
+              - app_secrets_status | dict2items | map(attribute='value.exists') | unique == [false]
+            quiet: true
+
+        - name: "app_secrets | test | Create the partial log dir"
+          ansible.builtin.file:
+            path: "{{ test_dir }}/partial/rag"
+            state: directory
+            mode: '0700'
+
+        - name: "app_secrets | test | Password file with only one of two object-store lines"
+          ansible.builtin.copy:
+            dest: "{{ test_dir }}/partial/rag/default_credentials.yaml"
+            content: "EDP_MINIO_ACCESS_KEY: abcdefghijklmnop\n"
+            mode: '0600'
+
+        - name: "app_secrets | test | Status on a half-written edp/object-store"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: status.yaml
+          vars:
+            log_dir: "{{ test_dir }}/partial"
+            secret_ids: [edp/object-store]
+
+        - name: "app_secrets | test | A credential exists only when all its lines are present"
+          ansible.builtin.assert:
+            that: "not app_secrets_status['edp/object-store'].exists"
+            quiet: true
+
+        # --- No-op ops -----------------------------------------------------------------
+
+        - name: "app_secrets | test | Stat port file before the no-op ops"
+          ansible.builtin.stat:
+            path: "{{ port_file }}"
+          register: _before_noop
+
+        # probe opens the local store (needs the marked Secrets): test_role_calls.yaml.
+        - name: "app_secrets | test | import and delete succeed as no-ops"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: "{{ item }}.yaml"
+          vars:
+            log_dir: "{{ port_log_dir }}"
+            secret_ids: "{{ file_ids }}"
+          loop: [import, delete]
+
+        - name: "app_secrets | test | import finalize succeeds as a no-op"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: import.yaml
+          vars:
+            log_dir: "{{ port_log_dir }}"
+            secret_ids: "{{ file_ids }}"
+            import_phase: finalize
+
+
+        - name: "app_secrets | test | No-op ops left the port file unchanged"
+          ansible.builtin.stat:
+            path: "{{ port_file }}"
+          register: _after_noop
+          failed_when: _after_noop.stat.checksum != _before_noop.stat.checksum
+
+        # --- Overridden username vars and an explicit password_file --------------------
+
+        - name: "app_secrets | test | ensure with overridden usernames and an explicit password_file"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: ensure.yaml
+          vars:
+            log_dir: "{{ test_dir }}/override-logdir"
+            password_file: "{{ test_dir }}/explicit/creds.yaml"
+            chat_history_db_user: ch_custom
+            fingerprint_db_user: fp_custom
+            edp_redis_username: redis_custom
+            edp_postgresql_user_username: edp_custom
+            edp_postgresql_admin_username: admin_custom
+            secret_ids: [chat-history/postgres, fingerprint/postgres, edp/redis, edp/postgresql]
+
+        - name: "app_secrets | test | Read the explicit password_file"
+          ansible.builtin.slurp:
+            src: "{{ test_dir }}/explicit/creds.yaml"
+          register: _explicit
+          no_log: true
+
+        - name: "app_secrets | test | Stat explicit file and log_dir file"
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ test_dir }}/explicit/creds.yaml"
+            - "{{ test_dir }}/override-logdir/rag/default_credentials.yaml"
+          register: _explicit_stats
+
+        - name: "app_secrets | test | Overridden usernames land in the explicit password_file"
+          ansible.builtin.assert:
+            that:
+              - _users == _expected_users
+              - _lines | map('first') | list == _expected_names
+              - _explicit_stats.results[0].stat.mode == '0600'
+              - not _explicit_stats.results[1].stat.exists
+            quiet: true
+          vars:
+            _content: "{{ _explicit.content | b64decode }}"
+            _lines: "{{ parse_lines }}"
+            _users: "{{ _lines | selectattr('0', 'search', '_USERNAME$') | items2dict(key_name=0, value_name=1) }}"
+            _expected_users:
+              CHAT_HISTORY_POSTGRES_USERNAME: ch_custom
+              FINGERPRINT_POSTGRES_USERNAME: fp_custom
+              EDP_REDIS_USERNAME: redis_custom
+              EDP_POSTGRESQL_USERNAME: edp_custom
+              EDP_POSTGRESQL_ADMIN_USERNAME: admin_custom
+            _expected_names:
+              - CHAT_HISTORY_POSTGRES_USERNAME
+              - CHAT_HISTORY_POSTGRES_PASSWORD
+              - FINGERPRINT_POSTGRES_USERNAME
+              - FINGERPRINT_POSTGRES_PASSWORD
+              - EDP_REDIS_USERNAME
+              - EDP_REDIS_PASSWORD
+              - EDP_POSTGRESQL_USERNAME
+              - EDP_POSTGRESQL_PASSWORD
+              - EDP_POSTGRESQL_ADMIN_USERNAME
+              - EDP_POSTGRESQL_ADMIN_PASSWORD
+          no_log: true
+
+        # --- REDIS_PASSWORD skip, duplicate IDs ----------------------------------------
+
+        - name: "app_secrets | test | Operator sets REDIS_PASSWORD"
+          ansible.builtin.set_fact:
+            REDIS_PASSWORD: "operator-set"
+          no_log: true
+
+        - name: "app_secrets | test | ensure with REDIS_PASSWORD defined and duplicate IDs"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: ensure.yaml
+          vars:
+            log_dir: "{{ test_dir }}/skip"
+            secret_ids: [vector-db/redis, chat-history/postgres, chat-history/postgres, vector-db/redis]
+
+        - name: "app_secrets | test | Read the skip file"
+          ansible.builtin.slurp:
+            src: "{{ test_dir }}/skip/rag/default_credentials.yaml"
+          register: _skip
+          no_log: true
+
+        - name: "app_secrets | test | REDIS lines skipped, REDIS_PASSWORD kept, duplicates written once"
+          ansible.builtin.assert:
+            that:
+              - parse_lines | map('first') | list == ['CHAT_HISTORY_POSTGRES_USERNAME', 'CHAT_HISTORY_POSTGRES_PASSWORD']
+              - REDIS_PASSWORD == 'operator-set'
+              - app_secrets_selected_ids == ['vector-db/redis', 'chat-history/postgres']
+            quiet: true
+          vars:
+            _content: "{{ _skip.content | b64decode }}"
+          no_log: true
+
+        # --- Error cases ------------------------------------------------------------------
+
+        - name: "app_secrets | test | Collect failures"
+          ansible.builtin.set_fact:
+            test_failures: {}
+
+        - name: "app_secrets | test | Run the failing cases"
+          ansible.builtin.include_tasks: expect_failure.yaml
+          loop: "{{ _cases + _openbao_cases }}"
+          loop_control:
+            loop_var: case
+            label: "{{ case.name }}"
+          vars:
+            _cases:
+              - {name: unknown-id, op: ensure, ids: [chat-history/postgres, foo/bar]}
+              - {name: base-id, op: ensure, ids: [chat-history/postgres, "vector-db/<engine>"]}
+              - {name: ids-string, op: ensure, ids: chat-history/postgres}
+              - {name: ids-mapping, op: ensure, ids: {chat-history/postgres: true}}
+              - {name: ids-empty, op: ensure, ids: []}
+              - {name: unknown-backend, op: ensure, ids: [chat-history/postgres], backend: vault}
+              - {name: local-rotate, op: rotate, ids: [chat-history/postgres]}
+              - {name: invalid-registry, op: ensure, ids: [chat-history/postgres], registry: "{{ playbook_dir }}/fixtures/invalid_registry.yaml"}
+              - {name: ensure-no-ids, op: ensure, ids: null}
+              - {name: import-no-ids, op: import, ids: null}
+              - {name: delete-no-ids, op: delete, ids: null}
+              - {name: delete-empty-ids, op: delete, ids: []}
+              - {name: unknown-phase, op: ensure, ids: [chat-history/postgres], phase: during_deploy}
+              - {name: unknown-import-phase, op: import, ids: [chat-history/postgres], import_phase: migrate}
+              - {name: platform-before-deploy, op: ensure, ids: [platform/keycloak-admin]}
+              - {name: platform-status, op: status, ids: [platform/keycloak-admin]}
+            _openbao_cases: >-
+              {{ ['probe', 'ensure', 'status', 'delete', 'import', 'rotate']
+                 | map('regex_replace', '^(.*)$', '{"name": "openbao-\1", "op": "\1", "ids": ["chat-history/postgres"], "backend": "openbao"}')
+                 | map('from_json') | list }}
+
+        - name: "app_secrets | test | No failing case wrote a file"
+          ansible.builtin.assert:
+            that: test_failures | dict2items | selectattr('value.wrote_file') | list | length == 0
+            fail_msg: "{{ test_failures | to_json }}"
+
+        - name: "app_secrets | test | Failure messages"
+          ansible.builtin.assert:
+            that:
+              - "'foo/bar' in _m['unknown-id']"
+              - "'Valid IDs:' in _m['unknown-id']"
+              - "'chat-history/postgres' in _m['unknown-id']"
+              - "'vector-db/mssql' in _m['unknown-id']"
+              - "'unknown credential ID(s): vector-db/<engine>' in _m['base-id']"
+              - "'secret_ids must be a non-empty list' in _m['ids-string']"
+              - "'secret_ids must be a non-empty list' in _m['ids-mapping']"
+              - "'secret_ids must be a non-empty list' in _m['ids-empty']"
+              - "\"unknown secrets_backend 'vault'\" in _m['unknown-backend']"
+              - "'rotation requires secrets_backend: openbao' in _m['local-rotate']"
+              - "'invalid registry entries' in _m['invalid-registry']"
+              - "'Bad_Id/x: id is not lower-kebab' in _m['invalid-registry']"
+              - "'bad/mechanism: local.mechanism must be one of' in _m['invalid-registry']"
+              - "'bad/no-rotate: missing rotate' in _m['invalid-registry']"
+              - "'bad/hook: unknown rotate.hook vector-db-password-change' in _m['invalid-registry']"
+              - "'bad/restart: rotate.restart must list names of the registry workloads' in _m['invalid-registry']"
+              - "'bad/keys: rotate.keys must name exactly one kv_key with a password or hex generator' in _m['invalid-registry']"
+              - "'bad/target: rotate.target of postgres-alter-user needs host, port, database, user' in _m['invalid-registry']"
+              - "'bad/operator: rotate.hook operator-write is for erag/user/* entries' in _m['invalid-registry']"
+              - "'workloads bad-kind: a list of {namespace, kind' in _m['invalid-registry']"
+              - "'workloads ok' not in _m['invalid-registry']"
+              - "'secret_ids must be a non-empty list' in _m['ensure-no-ids']"
+              - "'secret_ids must be a non-empty list' in _m['import-no-ids']"
+              - "'secret_ids must be a non-empty list' in _m['delete-no-ids']"
+              - "'secret_ids must be a non-empty list' in _m['delete-empty-ids']"
+              - "\"unknown ensure_phase 'during_deploy'\" in _m['unknown-phase']"
+              - "'platform/keycloak-admin: platform Secrets are only marked' in _m['platform-before-deploy']"
+              - "'platform/keycloak-admin: platform Secrets are only marked' in _m['platform-status']"
+              - "'platform/keycloak-admin' in _m['unknown-id']"
+              # openbao probe/ensure/status/delete check their settings before any cluster
+              # access (no env_name here, so no cluster id); test_openbao_adapter.yaml
+              # covers them against OpenBao.
+              - _openbao | length == 6
+              - _m['openbao-probe'] is search('openbao settings are invalid')
+              - _m['openbao-ensure'] is search('openbao settings are invalid')
+              - _m['openbao-status'] is search('openbao settings are invalid')
+              - _m['openbao-delete'] is search('openbao settings are invalid')
+              - _m['openbao-import'] is search('openbao settings are invalid')
+              - "\"unknown import_phase 'migrate'\" in _m['unknown-import-phase']"
+              - _m['openbao-rotate'] is search('openbao settings are invalid')
+            fail_msg: "{{ _m | to_json }}"
+          vars:
+            _m: "{{ dict(test_failures.keys() | zip(test_failures.values() | map(attribute='msg'))) }}"
+            _openbao: "{{ test_failures | dict2items | selectattr('key', 'match', '^openbao-') | map(attribute='value.msg') | list }}"
+
+      rescue:
+        - name: "app_secrets | test | Remove temp dir after a failed edge case"
+          ansible.builtin.file:
+            path: "{{ test_dir }}"
+            state: absent
+
+        - name: "app_secrets | test | Edge case failed"
+          ansible.builtin.fail:
+            msg: "edge case failed: {{ ansible_failed_result.msg | default('see above') }}"
+
+# --- Cleanup -----------------------------------------------------------------------------
+
+- name: "app_secrets | test | Cleanup"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "app_secrets | test | Remove per-run temp dir"
+      ansible.builtin.file:
+        path: "{{ _test_tmp.path }}"
+        state: absent

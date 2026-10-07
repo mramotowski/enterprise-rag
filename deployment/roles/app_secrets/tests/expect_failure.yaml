@@ -1,0 +1,40 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_local_adapter.yaml: run one port op that must fail and
+# record {msg, wrote_file} in test_failures[case.name].
+# Expects: case = {name, op, ids, backend (default local), phase (default
+# before_deploy), registry (default
+# the role's registry)}, test_dir.
+
+---
+- name: "app_secrets | test | {{ case.name }}"
+  block:
+    - name: "app_secrets | test | {{ case.name }} via the port"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: "{{ case.op }}.yaml"
+      vars:
+        secrets_backend: "{{ case.backend | default('local') }}"
+        log_dir: "{{ test_dir }}/fail/{{ case.name }}"
+        secret_ids: "{{ case.ids }}"
+        ensure_phase: "{{ case.phase | default('before_deploy') }}"
+        import_phase: "{{ case.import_phase | default('import') }}"
+        app_secrets_registry_file: "{{ case.registry | default(playbook_dir ~ '/../files/registry.yaml') }}"
+
+    - name: "app_secrets | test | {{ case.name }} unexpectedly succeeded"
+      ansible.builtin.set_fact:
+        _case_msg: "UNEXPECTED SUCCESS"
+  rescue:
+    - name: "app_secrets | test | {{ case.name }} failed as expected"
+      ansible.builtin.set_fact:
+        _case_msg: "{{ ansible_failed_result.msg }}"
+
+- name: "app_secrets | test | {{ case.name }} check for written files"
+  ansible.builtin.stat:
+    path: "{{ test_dir }}/fail/{{ case.name }}/rag/default_credentials.yaml"
+  register: _case_stat
+
+- name: "app_secrets | test | {{ case.name }} record result"
+  ansible.builtin.set_fact:
+    test_failures: "{{ test_failures | combine({case.name: {'msg': _case_msg, 'wrote_file': _case_stat.stat.exists}}) }}"

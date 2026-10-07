@@ -19,6 +19,27 @@ post_install_store_result: false
 data_consistency_no_fail: false
 data_consistency_install_report: true
 
+# --- Migration to the OpenBao backend: the IDs app_pre_install imported
+#     (app_pre_install_import_secret_ids, the same list; app_secrets
+#     tests/test_migration.yaml checks both against the registry). ---
+app_post_install_import_secret_ids:
+  - keycloak/erag-admin
+  - keycloak/erag-user
+  - keycloak/erag-maintainer
+  - keycloak/mcp-client
+  - keycloak/grafana-oauth
+  - keycloak/edp-oidc
+  - nats/auth
+  - vector-db/redis
+  - vector-db/pgvector
+  - vector-db/mssql
+  - chat-history/postgres
+  - fingerprint/postgres
+  - edp/postgresql
+  - edp/redis
+  - edp/object-store
+  - seaweedfs/admin
+
 # --- Cross-role shared defaults - Owned by other roles; declared here so this role is standalone-runnable. ---
 edp_minio_domain_name: "seaweedfs.{{ base_domain_name | default('solutions.ai') }}"     # app_edp
 erag_keycloak_domain_name: "auth.solutions.ai"  # app_keycloak_config

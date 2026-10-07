@@ -15,11 +15,10 @@
 
 - name: "app_fingerprint | Generate password"
   ansible.builtin.include_role:
-    name: app_generate_password
-    tasks_from: generate_password.yaml
-  loop:
-    - name: "FINGERPRINT_POSTGRES"
-      user: "{{ fingerprint_db_user }}"
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [fingerprint/postgres]
 
 - name: "app_fingerprint | Ensure namespaces exist"
   kubernetes.core.k8s:
@@ -71,6 +70,8 @@
         namespace: "{{ item }}"
       data:
         password: "{{ FINGERPRINT_POSTGRES_PASSWORD | b64encode }}"
+  # With projected Secrets the port's ensure above rendered it (ESO).
+  when: not (app_secrets_projected | default(false))
   no_log: "{{ secure_logs }}"
   loop:
     - "{{ fingerprint_namespace }}"
@@ -106,10 +107,8 @@
 
 - name: "app_fingerprint | Mark secret for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-      namespace: "{{ fingerprint_namespace }}"
-      secret_name: "{{ fingerprint_db_password_secret_name }}"
-      password_mappings:
-        - {key: password, variable: FINGERPRINT_POSTGRES_PASSWORD, user: "{{ fingerprint_db_user }}"}
+    secret_ids: [fingerprint/postgres]
+    ensure_phase: after_deploy

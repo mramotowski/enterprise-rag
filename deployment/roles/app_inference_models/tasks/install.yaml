@@ -455,6 +455,15 @@
 # Under nri-balloons / kubelet-static, the pinning plugin gives each pod an
 # exclusive cpuset — we leave OMP env alone rather than fighting the plugin.
 
+# Projected Secrets (OpenBao): model-manager reads the HF token from the
+# projected Secret hf-token in the model namespace, so it must exist before the
+# deploy. This role runs before app_pre_install, whose shared task file checks
+# the delivery mode and the operator-secret conflicts first.
+- name: "app_inference_models | Project the operator HF token"
+  ansible.builtin.include_role:
+    name: app_pre_install
+    tasks_from: project_hf_token.yaml
+
 - name: "app_inference_models | debug | model-manager deploy commands"
   ansible.builtin.debug:
     msg: >-
@@ -495,24 +504,32 @@
         )
         + ['--wait', '--wait-timeout', '1200']
       }}
-  environment:
-    KUBECONFIG: "{{ lookup('env', 'KUBECONFIG') }}"
-    MM_CONFIG: "{{ env_dir }}/models-rag.yaml"
-    # The wrapper prompts for an env when several exist under env/ and hard-fails
-    # with no tty. Pass the env the installer already resolved from --env.
-    ES_ENV: "{{ env_dir | basename }}"
-    MM_CPU_POLICY: "{{ kubernetes_cpu_policy | default('nri-balloons') }}"
-    # Accelerator plumbing (see defaults/main.yaml). On intel-gpu: MM_VLLM_RUNTIME
-    # swaps the logical `vllm` runtime for vllm-xpu and MM_ACCEL_RESOURCE
-    # (gpu.intel.com/xe) is requested per pod; MM_ACCEL_RENDER_GID adds the host
-    # `render` group as a pod supplementalGroup so the non-root vLLM-XPU pod can
-    # enumerate the GPU. All empty on CPU (and whenever the profile leaves them
-    # unset), so model-manager emits none of the GPU wiring. A model's per-entry
-    # accelerator: (passed as --accelerator above) overrides MM_ACCELERATOR.
-    MM_ACCELERATOR: "{{ kubernetes_accelerator | default('cpu') }}"
-    MM_VLLM_RUNTIME: "{{ (inference_accelerator_profiles[kubernetes_accelerator | default('cpu')] | default({})).vllm_runtime | default('') }}"
-    MM_ACCEL_RESOURCE: "{{ (inference_accelerator_profiles[kubernetes_accelerator | default('cpu')] | default({})).k8s_resource | default('') }}"
-    MM_ACCEL_RENDER_GID: "{{ (inference_accelerator_profiles[kubernetes_accelerator | default('cpu')] | default({})).render_group_gid | default('') }}"
+  # With projected Secrets the HF token never reaches this host (preflight fails
+  # on an exported HF_TOKEN; it is also emptied here): model-manager reads the
+  # ESO-projected Secret hf-token (key token) in the model namespace instead
+  # (MM_HF_TOKEN_FROM_SECRET, enterprise-inference model-manager; projected by
+  # the include above). Local mode passes exactly the environment below.
+  environment: "{{ _mm_deploy_env | combine({'MM_HF_TOKEN_FROM_SECRET': 'true', 'HF_TOKEN': ''}
+                   if app_secrets_projected | default(false) else {}) }}"
+  vars:
+    _mm_deploy_env:
+      KUBECONFIG: "{{ lookup('env', 'KUBECONFIG') }}"
+      MM_CONFIG: "{{ env_dir }}/models-rag.yaml"
+      # The wrapper prompts for an env when several exist under env/ and hard-fails
+      # with no tty. Pass the env the installer already resolved from --env.
+      ES_ENV: "{{ env_dir | basename }}"
+      MM_CPU_POLICY: "{{ kubernetes_cpu_policy | default('nri-balloons') }}"
+      # Accelerator plumbing (see defaults/main.yaml). On intel-gpu: MM_VLLM_RUNTIME
+      # swaps the logical `vllm` runtime for vllm-xpu and MM_ACCEL_RESOURCE
+      # (gpu.intel.com/xe) is requested per pod; MM_ACCEL_RENDER_GID adds the host
+      # `render` group as a pod supplementalGroup so the non-root vLLM-XPU pod can
+      # enumerate the GPU. All empty on CPU (and whenever the profile leaves them
+      # unset), so model-manager emits none of the GPU wiring. A model's per-entry
+      # accelerator: (passed as --accelerator above) overrides MM_ACCELERATOR.
+      MM_ACCELERATOR: "{{ kubernetes_accelerator | default('cpu') }}"
+      MM_VLLM_RUNTIME: "{{ (inference_accelerator_profiles[kubernetes_accelerator | default('cpu')] | default({})).vllm_runtime | default('') }}"
+      MM_ACCEL_RESOURCE: "{{ (inference_accelerator_profiles[kubernetes_accelerator | default('cpu')] | default({})).k8s_resource | default('') }}"
+      MM_ACCEL_RENDER_GID: "{{ (inference_accelerator_profiles[kubernetes_accelerator | default('cpu')] | default({})).render_group_gid | default('') }}"
   loop: "{{ inference_models }}"
   loop_control:
     label: "{{ item.name }} ({{ item.role }})"

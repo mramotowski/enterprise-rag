@@ -458,8 +458,10 @@ def validate_config_files_exists(args):
     if args.auth_file:
         auth_path = Path(args.auth_file)
         if not auth_path.exists():
-            logger.error(f"Auth file does not exist: {args.auth_file}")
-            raise FileNotFoundError(f"Auth file not found: {args.auth_file}")
+            # secrets_backend: openbao writes no credentials file; KeycloakHelper then
+            # reads the Secret keycloak/erag-credentials (the ESO projection of OpenBao).
+            logger.warning(f"Auth file does not exist: {args.auth_file}; "
+                           f"the Secret keycloak/erag-credentials will be tried instead")
 
     if args.cluster_config_file:
         config_dir = Path(args.cluster_config_file)

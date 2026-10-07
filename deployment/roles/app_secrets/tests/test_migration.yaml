@@ -1,0 +1,140 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests the migration of a local-mode env to the OpenBao backend (story 11,
+# AD-12) end to end without a cluster: the local adapter writes the credential
+# file, the harness seeds the Secrets a local install leaves (marked, Helm-owned,
+# a platform Secret, Helm release history, a tmp render, an old env log), then
+# app_secrets import runs the real importer Job (files/secrets_importer.py,
+# run on this host against a fake Kubernetes API that enforces its Role) against
+# a real OpenBao 2.7.0 (Docker), every credential is ensured as the roles do
+# (the fake ESO adopts the Secrets), a Helm upgrade drops the chart Secrets, and
+# import_phase finalize scrubs. Passwords must be unchanged throughout.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_migration.yaml
+#
+# The cases run in a nested ansible-playbook (migration_cases.yaml, -v). Its
+# whole output, every Job log, every Job plan and, after finalize, every file
+# left in the env dir are then searched for every seeded or stored value: none
+# may appear. A fake helm (files/fake_openbao_cluster.py fake-helm) is first on PATH.
+
+---
+- name: "app_secrets | test | migration"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    harness: "{{ playbook_dir }}/files/fake_openbao_cluster.py"
+  tasks:
+    - name: "app_secrets | test | migration | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_migration_test_
+      register: _tmp
+
+    - name: "app_secrets | test | migration | Run"
+      block:
+        - name: "app_secrets | test | migration | Start OpenBao and the fake TokenReview API"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", start, "{{ _tmp.path }}/openbao"]
+          register: _env
+          changed_when: true
+
+        - name: "app_secrets | test | migration | Create the bin dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}/bin"
+            state: directory
+            mode: "0700"
+
+        - name: "app_secrets | test | migration | Put a fake helm first on PATH"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/bin/helm"
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              exec "{{ ansible_playbook_python }}" "{{ harness }}" fake-helm "$@"
+
+        - name: "app_secrets | test | migration | Run the cases (nested playbook, output captured)"
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ansible_playbook_python | dirname }}/ansible-playbook -v -i localhost, -c local
+              {{ playbook_dir }}/migration_cases.yaml > {{ _tmp.path }}/cases.log 2>&1
+          environment:
+            PATH: "{{ _tmp.path }}/bin:{{ lookup('ansible.builtin.env', 'PATH') }}"
+            FAKE_OPENBAO_DIR: "{{ _tmp.path }}/openbao"
+            FAKE_K8S_STATE: "{{ _tmp.path }}/cluster.json"
+            FAKE_K8S_ON_APPLY: "{{ ansible_playbook_python }} {{ harness }} hook"
+            FAKE_OPENBAO_ADDR: "{{ (_env.stdout | from_json).addr }}"
+            ENV_DIR: "{{ _tmp.path }}/env"
+            OUT_DIR: "{{ _tmp.path }}/out"
+            VALUES_FILE: "{{ _tmp.path }}/values.txt"
+            ANSIBLE_ROLES_PATH: "{{ playbook_dir | dirname | dirname }}"
+            ANSIBLE_COLLECTIONS_PATH: >-
+              {{ playbook_dir }}/fake_collections:{{ lookup('ansible.builtin.env', 'HOME') }}/.ansible/collections:/usr/share/ansible/collections
+          register: _cases
+          changed_when: true
+          failed_when: false
+
+        - name: "app_secrets | test | migration | Show the result of the cases"
+          ansible.builtin.shell:
+            cmd: "set -o pipefail; grep -E '^fatal: |^localhost  ' {{ _tmp.path }}/cases.log | tail -n 3"
+            executable: /bin/bash
+          register: _tail
+          changed_when: false
+          when: _cases.rc != 0
+
+        - name: "app_secrets | test | migration | The cases passed"
+          ansible.builtin.assert:
+            that: _cases.rc == 0
+            fail_msg: "{{ _tail.stdout_lines | default([]) }}"
+            quiet: true
+
+        - name: "app_secrets | test | migration | Count the seeded and stored values"
+          ansible.builtin.command:
+            argv: [wc, -l, "{{ _tmp.path }}/values.txt"]
+          register: _values
+          changed_when: false
+
+        - name: "app_secrets | test | migration | Collect the Job logs"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", joblogs, "{{ _tmp.path }}/cluster.json", "{{ _tmp.path }}/joblogs.txt"]
+          changed_when: false
+
+        - name: "app_secrets | test | migration | List the files left in the env dir"
+          ansible.builtin.find:
+            paths: "{{ _tmp.path }}/env"
+            recurse: true
+            file_type: file
+          register: _env_files
+
+        - name: "app_secrets | test | migration | No value appears in the output, the Job logs and plans, or the env dir"
+          ansible.builtin.command:
+            argv: >-
+              {{ ['grep', '-c', '-F', '-f', _tmp.path ~ '/values.txt', _tmp.path ~ '/cases.log', _tmp.path ~ '/joblogs.txt',
+                  _tmp.path ~ '/out/plans.txt'] + (_env_files.files | map(attribute='path') | list) }}
+          register: _leaks
+          changed_when: false
+          failed_when: _leaks.rc > 1
+
+        - name: "app_secrets | test | migration | Assert no value leaked and enough values were checked"
+          ansible.builtin.assert:
+            that:
+              - (_values.stdout.split()[0] | int) >= 20
+              # The env dir still holds the current run's log only.
+              - _env_files.files | length >= 1
+              - _leaks.stdout_lines | map('regex_replace', '^.*:', '') | map('int') | sum == 0
+            fail_msg: "{{ _leaks.stdout }} ({{ _values.stdout.split()[0] }} values, env files {{ _env_files.files | map(attribute='path') | list }})"
+            quiet: true
+
+      always:
+        - name: "app_secrets | test | migration | Stop OpenBao and the fake TokenReview API"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", stop, "{{ _tmp.path }}/openbao"]
+          changed_when: true
+
+        - name: "app_secrets | test | migration | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

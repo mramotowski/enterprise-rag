@@ -1,0 +1,1230 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Inner playbook of test_openbao_adapter.yaml (run by it, never alone): the
+# openbao adapter against a real OpenBao 2.7.0 (files/fake_openbao_cluster.py)
+# and the fake kubernetes.core, whose Job hook runs the real worker Job spec in
+# Docker and whose ExternalSecret hook plays ESO. Its whole output is grepped
+# for every value in OpenBao afterwards, so no task here may print one: value
+# checks run in the harness, which prints only ok/mismatch.
+#
+# Environment (set by test_openbao_adapter.yaml): FAKE_OPENBAO_DIR,
+# FAKE_K8S_STATE, FAKE_K8S_ON_APPLY, FAKE_OPENBAO_ADDR, TEST_REGISTRY,
+# VALUES_FILE (every stored value is written there before OpenBao is sealed),
+# DS_OUT (the renders of test_data_services.yaml).
+
+---
+- name: "app_secrets | test | openbao adapter cases"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # No Grafana in this test cluster unless a case sets it (app_secrets now
+    # declares grafana_oauth_domain as a cross-role default).
+    grafana_oauth_domain: ""
+    env_name: t1
+    openbao_kv_mount: intel-ai
+    eso_refresh_interval: 1h
+    test_addr: "{{ lookup('ansible.builtin.env', 'FAKE_OPENBAO_ADDR') }}"
+    obdir: "{{ lookup('ansible.builtin.env', 'FAKE_OPENBAO_DIR') }}"
+    state_file: "{{ lookup('ansible.builtin.env', 'FAKE_K8S_STATE') }}"
+    default_registry: "{{ playbook_dir }}/../files/registry.yaml"
+    test_registry: "{{ lookup('ansible.builtin.env', 'TEST_REGISTRY') }}"
+    ds_out: "{{ lookup('ansible.builtin.env', 'DS_OUT') }}"
+    harness: "{{ ansible_playbook_python }} {{ playbook_dir }}/files/fake_openbao_cluster.py"
+    app_secrets_worker_poll_delay: 1
+    app_secrets_worker_timeout: 60
+    app_secrets_eso_wait_retries: 3
+    app_secrets_eso_wait_delay: 1
+    _st: "{{ lookup('ansible.builtin.file', state_file) | from_json }}"
+    _runs: "{{ (_st['FakeJobRuns//all'] | default({'names': []})).names }}"
+    # Namespaces with the erag layer label or paths annotation (label keys hold
+    # dots, so no selectattr paths).
+    _ns_with_erag: >-
+      {%- set o = [] -%}
+      {%- for k, v in _st.items() if k.startswith('Namespace//')
+            and ('secrets.ai-solutions/erag' in (v.metadata.labels | default({}, true))
+                 or 'secrets.ai-solutions/erag-paths' in (v.metadata.annotations | default({}, true))) -%}
+        {%- set _ = o.append(k) -%}
+      {%- endfor -%}
+      {{ o }}
+    obcases: {}
+  tasks:
+    - name: "app_secrets | test | openbao | Seed the platform side of the fake cluster"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: "{{ _seed | to_json }}"
+      vars:
+        _seed:
+          "Namespace//openbao": {apiVersion: v1, kind: Namespace, metadata: {name: openbao}}
+          "ConfigMap/openbao/openbao-ca-bundle":
+            apiVersion: v1
+            kind: ConfigMap
+            metadata: {name: openbao-ca-bundle, namespace: openbao}
+            data: {ca.crt: "{{ lookup('ansible.builtin.file', obdir ~ '/ca.crt') }}\n"}
+          "ClusterSecretStore//openbao-erag":
+            apiVersion: external-secrets.io/v1
+            kind: ClusterSecretStore
+            metadata: {name: openbao-erag}
+            spec:
+              conditions:
+                - namespaceSelector: {matchLabels: {secrets.ai-solutions/erag: "true"}}
+            status:
+              conditions: [{type: Ready, status: "True", reason: Valid, message: "store validated"}]
+
+    # --- probe, ensure, status -------------------------------------------------
+
+    - name: "app_secrets | test | openbao | Run the main cases"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: probe-ok, op: probe, ids: [chat-history/postgres]}
+        - {name: ensure-fresh, op: ensure, ids: [edp/postgresql]}
+        - {name: ensure-rerun, op: ensure, ids: [edp/postgresql]}
+        - {name: status, op: status, ids: [edp/postgresql, user/hf-token]}
+        - {name: nkey, op: ensure, ids: [nats/auth]}
+        - {name: static-missing, op: ensure, ids: [user/hf-token]}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | openbao | Probe set up the worker namespace, ServiceAccount and CA"
+      ansible.builtin.assert:
+        that:
+          - obcases['probe-ok'].ok
+          - obcases['probe-ok'].worker.probe.state == 'ok'
+          # Every port op tells the roles that Secrets are projections.
+          - app_secrets_projected | bool
+          - _st['Namespace//erag-secrets'].metadata.labels['secrets.ai-solutions/erag'] == 'true'
+          # setup created it, so it is marked (teardown deletes only such a namespace).
+          - _st['Namespace//erag-secrets'].metadata.labels['app.kubernetes.io/managed-by'] == 'app_secrets'
+          - _st['ServiceAccount/erag-secrets/erag-secrets-worker'].automountServiceAccountToken == false
+          - "'BEGIN CERTIFICATE' in _st['ConfigMap/erag-secrets/openbao-ca-bundle'].data['ca.crt']"
+          - "'PRIVATE KEY' not in _st['ConfigMap/erag-secrets/openbao-ca-bundle'].data['ca.crt']"
+        fail_msg: "probe-ok: {{ obcases['probe-ok'].msg }}"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | The worker Job carries no value"
+      ansible.builtin.assert:
+        that:
+          - _job.spec.backoffLimit == 0
+          - _pod.automountServiceAccountToken == false
+          - _pod.serviceAccountName == 'erag-secrets-worker'
+          - _c.args == ['ensure']
+          - _c.env | selectattr('valueFrom', 'defined') | list | length == 0
+          - _c.env | map(attribute='name') | sort == ['BAO_ADDR', 'BAO_CACERT', 'BAO_CLIENT_TIMEOUT', 'OB_AUTH_MOUNT', 'OB_JWT_FILE', 'OB_KV_MOUNT', 'OB_PLAN_FILE', 'OB_ROLE', 'OB_WORK_DIR']
+          - _pod.volumes | selectattr('secret', 'defined') | list | length == 0
+          - (_pod.volumes | selectattr('name', 'equalto', 'openbao-token') | first).projected.sources[0].serviceAccountToken.audience == 'vault'
+          - (_pod.volumes | selectattr('name', 'equalto', 'openbao-ca') | first).configMap.name == 'openbao-ca-bundle'
+          - _c.securityContext.readOnlyRootFilesystem
+          - _plan == ['write edp/postgresql t1/erag/edp/postgresql password=password:32:0 admin_password=password:32:0']
+        fail_msg: "worker Job shape: {{ _job.metadata.name }} plan {{ _plan }}"
+        quiet: true
+      vars:
+        _job: "{{ _st['FakeJobRuns//all'].jobs[_runs[1]] }}"
+        _pod: "{{ _job.spec.template.spec }}"
+        _c: "{{ _pod.containers[0] }}"
+        _plan: "{{ _st['FakeJobRuns//all'].configmaps[_runs[1]].data.plan | trim | split('\n') }}"
+
+    - name: "app_secrets | test | openbao | Check created values in OpenBao and the projected Secret"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _checks
+      changed_when: false
+      loop:
+        - [check, "{{ obdir }}", t1/erag/edp/postgresql, password, "[A-Za-z0-9]{32}"]
+        - [check, "{{ obdir }}", t1/erag/edp/postgresql, admin_password, "[A-Za-z0-9]{32}"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", edp/edp-postgresql-secret, DATABASE_PASSWORD, "<<t1/erag/edp/postgresql#password>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", edp/edp-postgresql-secret, DATABASE_ADMIN_PASSWORD, "<<t1/erag/edp/postgresql#admin_password>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", edp/edp-postgresql-secret, DATABASE_USER, "edp"]
+        - [verify-nkey, "{{ obdir }}", t1/erag/nats/auth]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", nats/nats-auth, user.nk, "<<t1/erag/nats/auth#seed>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", nats/nats-auth, user.pub, "<<t1/erag/nats/auth#public_key>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", system/nats-auth, user.nk, "<<t1/erag/nats/auth#seed>>"]
+      loop_control:
+        label: "{{ item[0] }} {{ item[-3:] | join(' ') }}"
+
+    - name: "app_secrets | test | openbao | Values are well-formed and projected unchanged"
+      ansible.builtin.assert:
+        that: _checks.results | map(attribute='stdout') | list == ['ok'] * (_checks.results | length)
+        fail_msg: "{{ _checks.results | map(attribute='item') | map('first') | zip(_checks.results | map(attribute='stdout')) | list | to_json }}"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | ensure results, ExternalSecret shape, idempotency, status, nkey, static"
+      ansible.builtin.assert:
+        that:
+          - obcases['ensure-fresh'].ok
+          - obcases['ensure-fresh'].worker.credentials['edp/postgresql'].result == 'created'
+          - obcases['ensure-fresh'].worker.credentials['edp/postgresql'].version == 1
+          - _es.apiVersion == 'external-secrets.io/v1'
+          - _es.spec.refreshPolicy == 'Periodic'
+          - _es.spec.refreshInterval == '1h'
+          - _es.spec.secretStoreRef.kind == 'ClusterSecretStore'
+          - _es.spec.secretStoreRef.name == 'openbao-erag'
+          - _es.spec.target.name == 'edp-postgresql-secret'
+          - _es.spec.target.creationPolicy == 'Owner'
+          - _es.spec.target.deletionPolicy == 'Retain'
+          - _es.spec.target.template.engineVersion == 'v2'
+          - _es.spec.target.template.mergePolicy == 'Replace'
+          - _es.spec.target.template.data.keys() | sort == ['DATABASE_ADMIN_PASSWORD', 'DATABASE_HOST', 'DATABASE_NAME', 'DATABASE_PASSWORD', 'DATABASE_PORT', 'DATABASE_USER']
+          - _es.spec.target.template.data.DATABASE_PORT == '5432'
+          - _es.spec.target.template.data.DATABASE_USER == 'edp'
+          - _es.spec.target.template.data.DATABASE_PASSWORD == ('{' ~ '{ .edp_postgresql__password }' ~ '}')
+          - _es.spec.data | map(attribute='remoteRef.key') | unique == ['t1/erag/edp/postgresql']
+          - _es.spec.data | map(attribute='remoteRef.property') | sort == ['admin_password', 'password']
+          - _st['Namespace//edp'].metadata.labels['secrets.ai-solutions/erag'] == 'true'
+          # Every credential path any registry projection into edp reads, enabled
+          # or not (so every ensure writes the same value), sorted.
+          - _st['Namespace//edp'].metadata.annotations['secrets.ai-solutions/erag-paths'].split(',') == ['erag/edp/object-store', 'erag/edp/postgresql', 'erag/edp/redis', 'erag/keycloak/edp-oidc', 'erag/user/edp-s3', 'erag/user/sharepoint', 'erag/vector-db/mssql', 'erag/vector-db/pgvector', 'erag/vector-db/redis']
+          - _st['Secret/edp/edp-postgresql-secret'].data.keys() | sort == ['DATABASE_ADMIN_PASSWORD', 'DATABASE_HOST', 'DATABASE_NAME', 'DATABASE_PASSWORD', 'DATABASE_PORT', 'DATABASE_USER']
+          - obcases['ensure-rerun'].ok
+          - obcases['ensure-rerun'].worker.credentials['edp/postgresql'].result == 'exists'
+          - obcases['ensure-rerun'].worker.credentials['edp/postgresql'].version == 1
+          - obcases['status'].ok
+          - "obcases['status'].status['edp/postgresql'] == {'exists': true, 'version': 1, 'deleted': false, 'mechanism': 'openbao', 'tracked': true, 'path': 'intel-ai/t1/erag/edp/postgresql'}"
+          - obcases['status'].status['user/hf-token'].exists == false
+          - obcases['status'].worker.credentials.values() | map(attribute='action') | unique == ['check']
+          - obcases['nkey'].ok
+          - _st['ExternalSecret/nats/nats-auth'] is defined
+          - _st['ExternalSecret/system/nats-auth'] is defined
+          - _st['ExternalSecret/chatqna/nats-auth'] is defined
+          - _st['ExternalSecret/system/nats-auth'].spec.target.template.data.keys() | list == ['user.nk']
+          - not obcases['static-missing'].ok
+          - "'intel-ai/t1/erag/user/hf-token' in obcases['static-missing'].msg"
+          - "'operator-supplied' in obcases['static-missing'].msg"
+          - _st['ExternalSecret/erag-secrets/hf-token'] is not defined
+        fail_msg: "{{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
+        quiet: true
+      vars:
+        _es: "{{ _st['ExternalSecret/edp/edp-postgresql-secret'] }}"
+
+    # --- operator-supplied, pending projections, templates ----------------------
+
+    - name: "app_secrets | test | openbao | Operator writes user/hf-token (test value)"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['put-random', obdir, 't1/erag/user/hf-token', 'token'] }}"
+      register: _put
+      changed_when: true
+      failed_when: _put.stdout != 'rc=0'
+
+    - name: "app_secrets | test | openbao | Operator writes zz-test/two-keys without key b (test values)"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['put-random', obdir, 't1/erag/zz-test/two-keys', 'a'] }}"
+      register: _put
+      changed_when: true
+      failed_when: _put.stdout != 'rc=0'
+
+    - name: "app_secrets | test | openbao | Run the template and pending cases"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: static-present, op: ensure, ids: [user/hf-token]}
+        - {name: pending, op: ensure, ids: [keycloak/edp-oidc]}
+        - {name: template-undefined, op: ensure, ids: [zz-test/plain], registry: "{{ test_registry }}"}
+        - {name: template-redis, op: ensure, ids: [edp/redis]}
+        - {name: template-vdb, op: ensure, ids: [vector-db/redis]}
+        - {name: value-from-unset, op: ensure, ids: [zz-test/vf], registry: "{{ test_registry }}"}
+        - {name: two-variants, op: ensure, ids: [vector-db/redis, vector-db/pgvector]}
+        - {name: embed-static, op: ensure, ids: [user/hf-token], registry: "{{ test_registry }}"}
+        - {name: embed-special, op: ensure, ids: [zz-test/special-embed], registry: "{{ test_registry }}"}
+        - {name: incomplete-write, op: ensure, ids: [zz-test/two-keys], registry: "{{ test_registry }}"}
+        - {name: incomplete-dep, op: ensure, ids: [zz-test/dep-a], registry: "{{ test_registry }}"}
+        - {name: incomplete-status, op: status, ids: [zz-test/two-keys], registry: "{{ test_registry }}"}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | openbao | Check the template projections"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _tchecks
+      changed_when: false
+      loop:
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", erag-secrets/hf-token, token, "<<t1/erag/user/hf-token#token>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", edp/edp-celery-secrets, CELERY_BROKER_URL, "redis://default:<<t1/erag/edp/redis#password>>@edp-redis:6379"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", chatqna/vector-database-config, REDIS_URL, "redis://default:<<t1/erag/vector-db/redis#password>>@vdb-redis-cluster-headless.vdb.svc:6379"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", chatqna/vector-database-config, VECTOR_STORE, "redis-cluster"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", chatqna/vector-database-config, REDIS_PORT, "6379"]
+      loop_control:
+        label: "{{ item[3] }} {{ item[4] }}"
+
+    - name: "app_secrets | test | openbao | Template and pending results"
+      ansible.builtin.assert:
+        that:
+          - _tchecks.results | map(attribute='stdout') | list == ['ok'] * (_tchecks.results | length)
+          - obcases['static-present'].ok
+          - obcases['static-present'].worker.credentials['user/hf-token'].result == 'exists'
+          - _st['ExternalSecret/llm-inference/hf-token'] is defined
+          # The pipeline and audio copies only from the ensure of their roles
+          # (gate facts hf_token_secret_pipeline / hf_token_secret_audio).
+          - _st['ExternalSecret/chatqna/hf-token-secret'] is not defined
+          - _st['ExternalSecret/system/hf-token-secret'] is not defined
+          - _st['ExternalSecret/audio/audio-hf-token-secret'] is not defined
+          - _st['Namespace//audio'] is not defined
+          - obcases['pending'].ok
+          # Before app_edp sets edp_secret_config (app_keycloak_config's ensure),
+          # no EDP Secret is projected and none of its sources is read.
+          - _st['ExternalSecret/edp/keycloak-minio-secret'] is not defined
+          - _st['ExternalSecret/edp/edp-access-secret'] is not defined
+          - "'edp/object-store' not in obcases['pending'].worker.credentials"
+          - "'user/sharepoint' not in obcases['pending'].worker.credentials"
+          - "'user/edp-s3' not in obcases['pending'].worker.credentials"
+          # The configurator input projection carries only the enabled keys
+          # (no OIDC, federation or Grafana configured here).
+          - _st['ExternalSecret/keycloak/keycloak-configurator-sensitive'].spec.target.template.data.keys() | list == ['edp-oidc-client-secret']
+          - "'user/keycloak-oidc' not in obcases['pending'].worker.credentials"
+          - not obcases['template-undefined'].ok
+          - "'template no-such-template is not defined' in obcases['template-undefined'].msg"
+          - obcases['template-redis'].ok
+          - obcases['template-redis'].worker.credentials['edp/redis'].result == 'created'
+          - obcases['template-vdb'].ok
+          # enabled: edp_enabled is unset here, so no copy in the EDP namespace.
+          - _st['ExternalSecret/edp/vector-database-config'] is not defined
+          - _st['ExternalSecret/vdb/redis-cluster-secret'] is defined
+          - _st['ExternalSecret/chatqna/vector-database-config'].spec.data | map(attribute='secretKey') | list == ['vector_db_redis__password']
+          - _st['ExternalSecret/chatqna/vector-database-config'].spec.target.template.data.keys() | sort == ['REDIS_HOST', 'REDIS_PASSWORD', 'REDIS_PORT', 'REDIS_URL', 'REDIS_USERNAME', 'VECTOR_STORE']
+          - not obcases['value-from-unset'].ok
+          - "'zz-test/zz-value-from: value_from zz_unset_fact is not set (the role that owns the Secret sets this fact before ensure)' in obcases['value-from-unset'].msg"
+          - not obcases['two-variants'].ok
+          - "'more than one variant of the same Secret' in obcases['two-variants'].msg"
+          - not obcases['embed-static'].ok
+          - "'zz-test/zz-embed-static A: template zz-embed embeds user/hf-token.token, which may need escaping (static)' in obcases['embed-static'].msg"
+          - not obcases['embed-special'].ok
+          - "'embeds zz-test/special-embed.password, which may need escaping (password with special characters)' in obcases['embed-special'].msg"
+          - _st['ExternalSecret/zz-test/zz-embed-static'] is not defined
+          - not obcases['incomplete-write'].ok
+          - obcases['incomplete-write'].worker.credentials['zz-test/two-keys'].result == 'incomplete'
+          - "'lacks key(s) b ' in obcases['incomplete-write'].msg"
+          - "'bao kv patch' in obcases['incomplete-write'].msg"
+          - not obcases['incomplete-dep'].ok
+          - obcases['incomplete-dep'].worker.credentials['zz-test/two-keys'].action == 'check'
+          - obcases['incomplete-dep'].worker.credentials['zz-test/two-keys'].result == 'incomplete'
+          - _st['ExternalSecret/zz-test/zz-dep'] is not defined
+          # status reads metadata only.
+          - obcases['incomplete-status'].ok
+          - obcases['incomplete-status'].status['zz-test/two-keys'].exists
+        fail_msg: "{{ _tchecks.results | map(attribute='stdout') | list | to_json }} {{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
+        quiet: true
+
+    # --- HF token: the real role tasks (app_pre_install, app_pipeline, app_audio) ---
+
+    # The ExternalSecrets the earlier static-present case rendered are removed, so
+    # the real project_hf_token.yaml must render them again.
+    - name: "app_secrets | test | openbao | Remove the earlier HF token projections"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: >-
+          {{ _st | dict2items | rejectattr('key', 'in', ['ExternalSecret/erag-secrets/hf-token',
+             'ExternalSecret/llm-inference/hf-token', 'Secret/erag-secrets/hf-token',
+             'Secret/llm-inference/hf-token']) | items2dict | to_json }}
+      no_log: true
+
+    - name: "app_secrets | test | openbao | HF token via the real role tasks"
+      block:
+        - name: "app_secrets | test | openbao | Run app_pre_install project_hf_token.yaml"
+          ansible.builtin.include_role:
+            name: app_pre_install
+            tasks_from: project_hf_token.yaml
+          vars:
+            secrets_backend: openbao
+            app_secrets_openbao_address: "{{ test_addr }}"
+            app_secrets_registry_file: "{{ default_registry }}"
+
+        # The projection blocks of app_pipeline and app_audio, as the roles have them.
+        - name: "app_secrets | test | openbao | Extract the pipeline and audio projection blocks"
+          ansible.builtin.copy:
+            dest: "{{ ds_out }}/hf-role-blocks.yaml"
+            mode: "0600"
+            content: "{{ _blocks | to_nice_yaml }}"
+          vars:
+            _blocks: >-
+              {{ (lookup('ansible.builtin.file', playbook_dir ~ '/../../app_pipeline/tasks/install.yaml') | from_yaml
+                  | selectattr('name', 'equalto', 'app_pipeline | Project the HF token into the pipeline namespace') | list)
+                 + (lookup('ansible.builtin.file', playbook_dir ~ '/../../app_audio/tasks/install.yaml') | from_yaml
+                  | selectattr('name', 'equalto', 'app_audio | Project the HF token into the audio namespace') | list) }}
+
+        - name: "app_secrets | test | openbao | Run the pipeline and audio projection blocks"
+          ansible.builtin.include_tasks: "{{ ds_out }}/hf-role-blocks.yaml"
+          vars:
+            secrets_backend: openbao
+            app_secrets_openbao_address: "{{ test_addr }}"
+            app_secrets_registry_file: "{{ default_registry }}"
+
+        - name: "app_secrets | test | openbao | HF token role tasks succeeded"
+          ansible.builtin.set_fact:
+            _hf_roles: {ok: true, msg: ""}
+      rescue:
+        - name: "app_secrets | test | openbao | HF token role tasks failed"
+          ansible.builtin.set_fact:
+            _hf_roles: {ok: false, msg: "{{ ansible_failed_result.msg | default('') }}"}
+
+    - name: "app_secrets | test | openbao | Run the HF token status case"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: hf-status, op: status, ids: [user/hf-token]}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | openbao | Check the HF token copies"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _hchecks
+      changed_when: false
+      loop:
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", chatqna/hf-token-secret, HF_TOKEN, "<<t1/erag/user/hf-token#token>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", audio/audio-hf-token-secret, HF_TOKEN, "<<t1/erag/user/hf-token#token>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", llm-inference/hf-token, token, "<<t1/erag/user/hf-token#token>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", erag-secrets/hf-token, token, "<<t1/erag/user/hf-token#token>>"]
+      loop_control:
+        label: "{{ item[3] }} {{ item[4] }}"
+
+    - name: "app_secrets | test | openbao | HF token results"
+      ansible.builtin.assert:
+        that:
+          - _hchecks.results | map(attribute='stdout') | list == ['ok'] * (_hchecks.results | length)
+          - _hf_roles.ok
+          - hugging_token_projected | bool
+          - hf_token_secret_pipeline | bool
+          - hf_token_secret_audio | bool
+          - obcases['hf-status'].ok
+          - "obcases['hf-status'].status['user/hf-token'] == {'exists': true, 'version': 1, 'deleted': false, 'mechanism': 'openbao', 'tracked': true, 'path': 'intel-ai/t1/erag/user/hf-token'}"
+          - _st['ExternalSecret/erag-secrets/hf-token'] is defined
+          - _st['ExternalSecret/llm-inference/hf-token'] is defined
+          # The gmc chart renders hf-token-secret in the pipeline namespace, not in gmc_namespace.
+          - _st['ExternalSecret/system/hf-token-secret'] is not defined
+          - "'erag/user/hf-token' in _st['Namespace//chatqna'].metadata.annotations['secrets.ai-solutions/erag-paths'].split(',')"
+          - _st['Namespace//audio'].metadata.annotations['secrets.ai-solutions/erag-paths'] == 'erag/user/hf-token'
+          - _st['ExternalSecret/chatqna/hf-token-secret'].spec.target.template.data.keys() | list == ['HF_TOKEN']
+        fail_msg: "{{ _hf_roles | default({}) | to_json }} {{ _hchecks.results | map(attribute='stdout') | list | to_json }} {{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
+        quiet: true
+
+    # --- Keycloak path: what app_keycloak_config ensures before the configurator ---
+
+    - name: "app_secrets | test | openbao | Operator writes the Keycloak OIDC and LDAP bind secrets (test values)"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _put
+      changed_when: true
+      failed_when: _put.stdout != 'rc=0'
+      loop:
+        - [put-random, "{{ obdir }}", t1/erag/user/keycloak-oidc, client_secret]
+        - [put-random, "{{ obdir }}", t1/erag/user/ldap-bind, password]
+      loop_control:
+        label: "{{ item[2] }}"
+
+    # The secret_ids expression of the real role task, evaluated per feature set.
+    - name: "app_secrets | test | openbao | Extract the Keycloak ensure list from configure_keycloak.yaml"
+      ansible.builtin.copy:
+        dest: "{{ ds_out }}/kc-ensure-ids.j2"
+        mode: "0600"
+        content: >-
+          {{ (lookup('ansible.builtin.file', playbook_dir ~ '/../../app_keycloak_config/tasks/configure_keycloak.yaml') | from_yaml
+              | selectattr('name', 'equalto', 'app_keycloak_config | Ensure the Keycloak credentials and configurator inputs')
+              | first).vars.secret_ids }}
+
+    # Only the users and the EDP client (no MCP, Grafana, OIDC or federation).
+    - name: "app_secrets | test | openbao | Keycloak, base features"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case:
+          name: kc-base
+          op: ensure
+          ids: "{{ lookup('ansible.builtin.template', ds_out ~ '/kc-ensure-ids.j2') | from_yaml }}"
+
+    - name: "app_secrets | test | openbao | Keycloak, base features: erag-credentials has no MCP keys"
+      ansible.builtin.set_fact:
+        _kc_base_keys: "{{ _st['ExternalSecret/keycloak/erag-credentials'].spec.target.template.data.keys() | sort }}"
+        _kc_base_secret_keys: "{{ _st['Secret/keycloak/erag-credentials'].data.keys() | sort }}"
+
+    - name: "app_secrets | test | openbao | Configure every Keycloak feature"
+      ansible.builtin.set_fact:
+        mcp_enabled: true
+        grafana_oauth_domain: grafana.t1.example
+        erag_keycloak_oidc_endpoint: https://idp.t1.example/.well-known/openid-configuration
+        erag_keycloak_federation_endpoint: ldaps://ldap.t1.example
+
+    - name: "app_secrets | test | openbao | Keycloak, every feature"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case:
+          name: kc-full
+          op: ensure
+          ids: "{{ lookup('ansible.builtin.template', ds_out ~ '/kc-ensure-ids.j2') | from_yaml }}"
+
+    - name: "app_secrets | test | openbao | Check the Keycloak projections"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _kchecks
+      changed_when: false
+      loop:
+        # special: true meets the realm password policy (digit, upper, lower, special).
+        - [check, "{{ obdir }}", t1/erag/keycloak/erag-admin, password, "(?=.*[0-9])(?=.*[A-Z])(?=.*[a-z])(?=.*[!#%+,.:=@^_~-])[A-Za-z0-9!#%+,.:=@^_~-]{32}"]
+        - [check, "{{ obdir }}", t1/erag/keycloak/erag-user, password, "(?=.*[0-9])(?=.*[A-Z])(?=.*[a-z])(?=.*[!#%+,.:=@^_~-])[A-Za-z0-9!#%+,.:=@^_~-]{32}"]
+        - [check, "{{ obdir }}", t1/erag/keycloak/erag-maintainer, password, "(?=.*[0-9])(?=.*[A-Z])(?=.*[a-z])(?=.*[!#%+,.:=@^_~-])[A-Za-z0-9!#%+,.:=@^_~-]{32}"]
+        - [check, "{{ obdir }}", t1/erag/keycloak/mcp-client, client_secret, "[A-Za-z0-9]{32}"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, KEYCLOAK_ERAG_ADMIN_USERNAME, erag-admin]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, KEYCLOAK_ERAG_ADMIN_PASSWORD, "<<t1/erag/keycloak/erag-admin#password>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, KEYCLOAK_ERAG_USER_PASSWORD, "<<t1/erag/keycloak/erag-user#password>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, KEYCLOAK_ERAG_MAINTAINER_USERNAME, erag-maintainer]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, KEYCLOAK_ERAG_MAINTAINER_PASSWORD, "<<t1/erag/keycloak/erag-maintainer#password>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, MCP_CLIENT_ID, mcp-client]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, MCP_CLIENT_SECRET, "<<t1/erag/keycloak/mcp-client#client_secret>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/keycloak-configurator-sensitive, oidc-client-secret, "<<t1/erag/user/keycloak-oidc#client_secret>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/keycloak-configurator-sensitive, federation-bind-password, "<<t1/erag/user/ldap-bind#password>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/keycloak-configurator-sensitive, grafana-oauth-client-secret, "<<t1/erag/keycloak/grafana-oauth#client_secret>>"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/keycloak-configurator-sensitive, edp-oidc-client-secret, "<<t1/erag/keycloak/edp-oidc#client_secret>>"]
+      loop_control:
+        label: "{{ item[0] }} {{ item[-3:-1] | join(' ') }}"
+
+    - name: "app_secrets | test | openbao | Keycloak projection results"
+      ansible.builtin.assert:
+        that:
+          - _kchecks.results | map(attribute='stdout') | list == ['ok'] * (_kchecks.results | length)
+          - obcases['kc-base'].ok
+          - obcases['kc-base'].worker.credentials.keys() | sort == ['keycloak/edp-oidc', 'keycloak/erag-admin', 'keycloak/erag-maintainer', 'keycloak/erag-user']
+          - obcases['kc-full'].worker.credentials.keys() | sort == ['keycloak/edp-oidc', 'keycloak/erag-admin', 'keycloak/erag-maintainer', 'keycloak/erag-user', 'keycloak/grafana-oauth', 'keycloak/mcp-client', 'user/keycloak-oidc', 'user/ldap-bind']
+          - obcases['kc-base'].worker.credentials['keycloak/erag-admin'].result == 'created'
+          # Today's keys of erag-credentials, MCP keys only with MCP enabled.
+          - _kc_base_keys == ['KEYCLOAK_ERAG_ADMIN_PASSWORD', 'KEYCLOAK_ERAG_ADMIN_USERNAME', 'KEYCLOAK_ERAG_MAINTAINER_PASSWORD', 'KEYCLOAK_ERAG_MAINTAINER_USERNAME', 'KEYCLOAK_ERAG_USER_PASSWORD', 'KEYCLOAK_ERAG_USER_USERNAME']
+          - _kc_base_secret_keys == _kc_base_keys
+          - "'keycloak/mcp-client' not in obcases['kc-base'].worker.credentials"
+          - obcases['kc-full'].ok
+          - obcases['kc-full'].worker.credentials['keycloak/erag-admin'].result == 'exists'
+          - obcases['kc-full'].worker.credentials['user/keycloak-oidc'].result == 'exists'
+          - _st['Secret/keycloak/erag-credentials'].data.keys() | sort == (_kc_base_keys + ['MCP_CLIENT_ID', 'MCP_CLIENT_SECRET']) | sort
+          - _st['Secret/keycloak/keycloak-configurator-sensitive'].data.keys() | sort == ['edp-oidc-client-secret', 'federation-bind-password', 'grafana-oauth-client-secret', 'oidc-client-secret']
+          # grafana-sso-env waits for configure_grafana_sso.yaml (grafana_sso_config);
+          # the EDP Secrets for app_edp (edp_secret_config).
+          - _st['ExternalSecret/monitoring/grafana-sso-env'] is not defined
+          - _st['Namespace//monitoring'] is not defined
+          - _st['ExternalSecret/edp/keycloak-minio-secret'] is not defined
+        fail_msg: "{{ _kchecks.results | map(attribute='stdout') | list | to_json }} {{ obcases | dict2items | selectattr('key', 'match', '^kc-') | map(attribute='value.msg') | list | to_json }}"
+        quiet: true
+
+    # The real role tasks, projected mode: first without the platform Grafana
+    # (nothing is projected), then with it.
+    - name: "app_secrets | test | openbao | configure_grafana_sso.yaml without the platform Grafana"
+      ansible.builtin.include_role:
+        name: app_keycloak_config
+        tasks_from: configure_grafana_sso.yaml
+      vars:
+        secrets_backend: openbao
+        app_secrets_openbao_address: "{{ test_addr }}"
+        app_secrets_registry_file: "{{ default_registry }}"
+
+    - name: "app_secrets | test | openbao | Without the platform Grafana nothing is projected"
+      ansible.builtin.assert:
+        that:
+          - grafana_sso_config is not defined
+          - _st['ExternalSecret/monitoring/grafana-sso-env'] is not defined
+          - _st['Namespace//monitoring'] is not defined
+        quiet: true
+
+    - name: "app_secrets | test | openbao | Seed the platform Grafana Deployment"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: >-
+          {{ _st | combine({'Deployment/monitoring/kube-prometheus-stack-grafana': {
+               'apiVersion': 'apps/v1', 'kind': 'Deployment',
+               'metadata': {'name': 'kube-prometheus-stack-grafana', 'namespace': 'monitoring'},
+               'spec': {'template': {'metadata': {}, 'spec': {'containers': [{'name': 'grafana'}]}}}}}) | to_json }}
+
+    - name: "app_secrets | test | openbao | Grafana SSO via configure_grafana_sso.yaml"
+      block:
+        - name: "app_secrets | test | openbao | Run configure_grafana_sso.yaml"
+          ansible.builtin.include_role:
+            name: app_keycloak_config
+            tasks_from: configure_grafana_sso.yaml
+          vars:
+            secrets_backend: openbao
+            app_secrets_openbao_address: "{{ test_addr }}"
+            app_secrets_registry_file: "{{ default_registry }}"
+
+        - name: "app_secrets | test | openbao | Grafana SSO succeeded"
+          ansible.builtin.set_fact:
+            _kc_grafana: {ok: true, msg: ""}
+      rescue:
+        - name: "app_secrets | test | openbao | Grafana SSO failed"
+          ansible.builtin.set_fact:
+            _kc_grafana: {ok: false, msg: "{{ ansible_failed_result.msg | default('') }}"}
+
+    # What local mode writes to grafana-sso-env from the same settings, with the
+    # client secret as a placeholder (_grafana_sso_env holds it empty here).
+    - name: "app_secrets | test | openbao | Write the expected grafana-sso-env"
+      ansible.builtin.copy:
+        dest: "{{ ds_out }}/kc-grafana-expected.json"
+        mode: "0600"
+        content: >-
+          {{ {'secrets': {'monitoring/grafana-sso-env': _grafana_sso_env | default({})
+               | combine({'GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET': '<<t1/erag/keycloak/grafana-oauth#client_secret>>'})}} | to_json }}
+
+    - name: "app_secrets | test | openbao | Compare grafana-sso-env"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['secret-matches', obdir, state_file, ds_out ~ '/kc-grafana-expected.json'] }}"
+      register: _kc_grafana_match
+      changed_when: false
+
+    - name: "app_secrets | test | openbao | Grafana SSO results"
+      ansible.builtin.assert:
+        that:
+          - _kc_grafana.ok
+          - (_grafana_sso_env | default({})).GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET | default('x') == ''
+          - _grafana_sso_env | length == 18
+          - _kc_grafana_match.stdout_lines == ['ok monitoring/grafana-sso-env']
+          # ESO wrote it; the role did not (no ansible labels merged in).
+          - (_st['Secret/monitoring/grafana-sso-env'].metadata.labels | default({})) == {}
+          - _st['Namespace//monitoring'].metadata.labels['secrets.ai-solutions/erag'] == 'true'
+          - _st['Namespace//monitoring'].metadata.annotations['secrets.ai-solutions/erag-paths'] == 'erag/keycloak/grafana-oauth'
+          - _dep.spec.template.metadata.annotations['erag.intel.com/grafana-sso-config-hash'] == (grafana_sso_config | to_json | hash('sha1'))
+          - "(_dep.spec.template.spec.containers | first).envFrom == [{'secretRef': {'name': 'grafana-sso-env', 'optional': true}}]"
+        fail_msg: "{{ _kc_grafana.msg }} {{ _kc_grafana_match.stdout_lines | default([]) }}"
+        quiet: true
+      vars:
+        _dep: "{{ _st['Deployment/monitoring/kube-prometheus-stack-grafana'] }}"
+
+    - name: "app_secrets | test | openbao | Back to the default Keycloak features"
+      ansible.builtin.set_fact:
+        mcp_enabled: false
+        grafana_oauth_domain: ""
+        erag_keycloak_oidc_endpoint: ""
+        erag_keycloak_federation_endpoint: ""
+
+    # The EDP Secrets read edp_secret_config (set by app_edp before ensure).
+    - name: "app_secrets | test | openbao | Load the settings app_edp sets (seaweedfs storage)"
+      ansible.builtin.include_vars:
+        file: "{{ ds_out }}/edp-seaweedfs/registry-vars.yaml"
+
+    # --- race, deleted, after_deploy ------------------------------------------------
+
+    - name: "app_secrets | test | openbao | Another writer creates fingerprint/postgres first"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['put-random', obdir, 't1/erag/fingerprint/postgres', 'password'] }}"
+      register: _put
+      changed_when: true
+      failed_when: _put.stdout != 'rc=0'
+
+    - name: "app_secrets | test | openbao | Digest before the race"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['digest', obdir, 't1/erag/fingerprint/postgres'] }}"
+      register: _digest_before
+      changed_when: false
+
+    - name: "app_secrets | test | openbao | Delete the current version of edp/postgresql"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['root', obdir, 'kv', 'delete', '-mount=intel-ai', 't1/erag/edp/postgresql'] }}"
+      register: _del
+      changed_when: true
+      failed_when: _del.stdout != 'rc=0'
+
+    - name: "app_secrets | test | openbao | Run the race, deleted and after_deploy cases"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: race, op: ensure, ids: [fingerprint/postgres], env: {FAKE_OPENBAO_RACE_PATH: t1/erag/fingerprint/postgres}}
+        - {name: deleted, op: ensure, ids: [edp/postgresql]}
+        - {name: deleted-status, op: status, ids: [edp/postgresql]}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | openbao | Count the worker runs before after_deploy"
+      ansible.builtin.set_fact:
+        _runs_before_after_deploy: "{{ _runs | length }}"
+
+    - name: "app_secrets | test | openbao | after_deploy is a no-op"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: after-deploy, op: ensure, ids: [edp/postgresql, platform/keycloak-admin], phase: after_deploy}
+
+    - name: "app_secrets | test | openbao | Digest after the race"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['digest', obdir, 't1/erag/fingerprint/postgres'] }}"
+      register: _digest_after
+      changed_when: false
+
+    - name: "app_secrets | test | openbao | Race, deleted and after_deploy results"
+      ansible.builtin.assert:
+        that:
+          - obcases['race'].ok
+          - obcases['race'].worker.credentials['fingerprint/postgres'].result == 'exists'
+          - _digest_before.stdout == _digest_after.stdout
+          - _digest_before.stdout != 'none'
+          - not obcases['deleted'].ok
+          - "'edp/postgresql' in obcases['deleted'].msg"
+          - "'deleted' in obcases['deleted'].msg"
+          - "'undelete' in obcases['deleted'].msg"
+          - obcases['deleted-status'].status['edp/postgresql'].deleted
+          - not obcases['deleted-status'].status['edp/postgresql'].exists
+          - obcases['after-deploy'].ok
+          - (_runs | length) == (_runs_before_after_deploy | int)
+        fail_msg: "{{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | Count the worker runs before the probe failures"
+      ansible.builtin.set_fact:
+        _runs_before: "{{ _runs | length }}"
+
+    # --- probe failures -------------------------------------------------------------------
+
+    - name: "app_secrets | test | openbao | ClusterSecretStore not Ready"
+      ansible.builtin.include_tasks: openbao_state_case.yaml
+      vars:
+        patch_key: "ClusterSecretStore//openbao-erag"
+        patch: {status: {conditions: [{type: Ready, status: "False", reason: InvalidProviderConfig, message: "unable to log in"}]}}
+        case: {name: css-not-ready, op: probe, ids: [chat-history/postgres]}
+
+    - name: "app_secrets | test | openbao | CA bundle missing"
+      ansible.builtin.include_tasks: openbao_state_case.yaml
+      vars:
+        patch_key: "ConfigMap/openbao/openbao-ca-bundle"
+        patch: null
+        case: {name: ca-missing, op: probe, ids: [chat-history/postgres]}
+
+    - name: "app_secrets | test | openbao | CA bundle with a private key"
+      ansible.builtin.include_tasks: openbao_state_case.yaml
+      vars:
+        patch_key: "ConfigMap/openbao/openbao-ca-bundle"
+        patch: {data: {ca.crt: "{{ lookup('ansible.builtin.file', obdir ~ '/ca.crt') }}\n-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"}}
+        case: {name: ca-private-key, op: probe, ids: [chat-history/postgres]}
+
+    - name: "app_secrets | test | openbao | No worker ran for the CA failures"
+      ansible.builtin.assert:
+        that: (_runs | length) == (_runs_before | int) + 1
+        fail_msg: "worker runs: {{ _runs | length }} (before {{ _runs_before }}, css-not-ready ran one)"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | Run the OpenBao failure cases"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: login-role, op: probe, ids: [chat-history/postgres], role: no-such-role}
+        - {name: login-audience, op: probe, ids: [chat-history/postgres], audience: other}
+        - {name: unreachable, op: probe, ids: [chat-history/postgres], addr: "https://127.0.0.1:1"}
+        - {name: ensure-unreachable, op: ensure, ids: [chat-history/postgres], addr: "https://127.0.0.1:1"}
+        - {name: rotate, op: rotate, ids: [chat-history/postgres]}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    # --- generators, versions, scheduled deletion, slow Jobs and ESO, guards ----------
+
+    - name: "app_secrets | test | openbao | Write a second version, schedule deletions on chat-history/postgres"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _prep
+      changed_when: true
+      failed_when: _prep.stdout != 'rc=0'
+      loop:
+        - [put-random, "{{ obdir }}", t1/erag/fingerprint/postgres, password]
+        - [root, "{{ obdir }}", kv, metadata, put, -mount=intel-ai, -delete-version-after=1h, t1/erag/chat-history/postgres]
+      loop_control:
+        label: "{{ item[0] }} {{ item[-2:] | join(' ') }}"
+
+    - name: "app_secrets | test | openbao | Run the generator, version and timing cases"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: generators, op: ensure, ids: [zz-test/generators], registry: "{{ test_registry }}"}
+        - {name: version-2, op: status, ids: [fingerprint/postgres]}
+        - {name: scheduled-deletion, op: ensure, ids: [chat-history/postgres]}
+        - {name: scheduled-deletion-rerun, op: ensure, ids: [chat-history/postgres]}
+        - {name: slow, op: ensure, ids: [keycloak/edp-oidc], env: {FAKE_K8S_POLLS: "3"}}
+        - {name: job-timeout, op: probe, ids: [chat-history/postgres], env: {FAKE_K8S_POLLS: "1000"}, timeout: 2}
+        - {name: eso-not-ready, op: ensure, ids: [keycloak/edp-oidc], env: {FAKE_ESO_FAIL: "1"}}
+        - {name: literal-delimiters, op: ensure, ids: [zz-test/bad-literal], registry: "{{ test_registry }}"}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | openbao | Destroy version 2 of fingerprint/postgres"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['root', obdir, 'kv', 'destroy', '-mount=intel-ai', '-versions=2', 't1/erag/fingerprint/postgres'] }}"
+      register: _destroy
+      changed_when: true
+      failed_when: _destroy.stdout != 'rc=0'
+
+    - name: "app_secrets | test | openbao | Status of a destroyed version"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: destroyed, op: status, ids: [fingerprint/postgres]}
+
+    - name: "app_secrets | test | openbao | Check the generator formats"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _gchecks
+      changed_when: false
+      loop:
+        - [check, "{{ obdir }}", t1/erag/zz-test/generators, hex_key, "[0-9a-f]{32}"]
+        - [check, "{{ obdir }}", t1/erag/zz-test/generators, special, "[A-Za-z0-9!#%+,.:=@^_~-]{24}"]
+        - [secret-equals, "{{ obdir }}", "{{ state_file }}", zz-test/zz-generators, SPECIAL, "<<t1/erag/zz-test/generators#special>>"]
+      loop_control:
+        label: "{{ item[0] }} {{ item[-2:] | join(' ') }}"
+
+    - name: "app_secrets | test | openbao | Generator, version, timing and guard results"
+      ansible.builtin.assert:
+        that:
+          - _gchecks.results | map(attribute='stdout') | list == ['ok', 'ok', 'ok']
+          - obcases['generators'].ok
+          - obcases['version-2'].status['fingerprint/postgres'].version == 2
+          - obcases['version-2'].status['fingerprint/postgres'].exists
+          - obcases['destroyed'].status['fingerprint/postgres'].deleted
+          - not obcases['destroyed'].status['fingerprint/postgres'].exists
+          - obcases['scheduled-deletion'].ok
+          - obcases['scheduled-deletion'].worker.credentials['chat-history/postgres'].result == 'created'
+          - obcases['scheduled-deletion-rerun'].ok
+          - obcases['scheduled-deletion-rerun'].worker.credentials['chat-history/postgres'].result == 'exists'
+          - obcases['slow'].ok
+          - obcases['slow'].worker.credentials['keycloak/edp-oidc'].result == 'exists'
+          - not obcases['job-timeout'].ok
+          - "'did not report a result (not finished after 2s)' in obcases['job-timeout'].msg"
+          - not obcases['eso-not-ready'].ok
+          - "'ExternalSecrets not Ready: ' in obcases['eso-not-ready'].msg"
+          - "'edp/keycloak-minio-secret (SecretSyncedError: injected failure (test))' in obcases['eso-not-ready'].msg"
+          - "'keycloak/keycloak-configurator-sensitive (SecretSyncedError: injected failure (test))' in obcases['eso-not-ready'].msg"
+          - not obcases['literal-delimiters'].ok
+          - "'must not contain Go template delimiters' in obcases['literal-delimiters'].msg"
+          - _st['ExternalSecret/zz-test/zz-bad'] is not defined
+          # Each run deletes the previous worker Job and ConfigMap (per component: the
+          # rotate case left one rotator run); the CA bundle stays.
+          - _st.keys() | select('match', '^Job/erag-secrets/erag-secrets-') | reject('match', '^Job/erag-secrets/erag-secrets-rotate-') | list | length == 1
+          - _st.keys() | select('match', '^ConfigMap/erag-secrets/erag-secrets-') | reject('match', '^ConfigMap/erag-secrets/erag-secrets-rotate-') | list | length == 1
+          - _st.keys() | select('match', '^Job/erag-secrets/erag-secrets-rotate-') | list | length == 1
+          - _st['ConfigMap/erag-secrets/openbao-ca-bundle'] is defined
+        fail_msg: "{{ _gchecks.results | map(attribute='stdout') | list | to_json }} {{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
+        quiet: true
+
+    # --- data services: ESO Secrets equal today's Secrets ---------------------------------
+
+    - name: "app_secrets | test | openbao | Operator writes the SharePoint and S3 secrets, repairs the deleted entries (test values)"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _put
+      changed_when: true
+      failed_when: _put.stdout != 'rc=0'
+      loop:
+        # Left deleted / destroyed by the cases above.
+        - [root, "{{ obdir }}", kv, undelete, -mount=intel-ai, -versions=1, t1/erag/edp/postgresql]
+        - [put-random, "{{ obdir }}", t1/erag/fingerprint/postgres, password]
+        - [put-random, "{{ obdir }}", t1/erag/user/sharepoint, client_secret]
+        - [put-random, "{{ obdir }}", t1/erag/user/edp-s3, access_key_id, secret_access_key]
+      loop_control:
+        label: "{{ item[0] }} {{ item[-1] }}"
+
+    # Per scenario of fixtures/data_services_inventory.yaml (expected.json and
+    # registry-vars.yaml written by test_data_services.yaml): ensure its
+    # credential IDs, then every Secret the chart or role renders today must
+    # equal the ESO-made one, key for key and value for value.
+    - name: "app_secrets | test | openbao | Run the data service scenarios"
+      ansible.builtin.include_tasks: openbao_ds_case.yaml
+      loop: [vdb-redis, vdb-pgvector, vdb-mssql, chat-history, fingerprint-nats, edp-s3, edp-s3compatible]
+      loop_control:
+        loop_var: scenario
+
+    # enabled: no SeaweedFS projection for the s3 storage types (nothing else
+    # has ensured edp/object-store successfully before).
+    - name: "app_secrets | test | openbao | No SeaweedFS Secrets for s3 and s3compatible storage"
+      ansible.builtin.assert:
+        that:
+          - _st['ExternalSecret/seaweedfs/seaweedfs-s3-secret'] is not defined
+          - _st['ExternalSecret/seaweedfs/seaweedfs-admin-secret'] is not defined
+          - _st['Namespace//seaweedfs'] is not defined
+          - _st['ExternalSecret/edp/edp-aws-access-secrets'] is defined
+        fail_msg: "{{ _st.keys() | select('match', '^ExternalSecret/seaweedfs/') | list }}"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | Run the SeaweedFS data service scenarios"
+      ansible.builtin.include_tasks: openbao_ds_case.yaml
+      loop: [edp-seaweedfs, edp-seaweedfs-path-sharepoint]
+      loop_control:
+        loop_var: scenario
+
+    - name: "app_secrets | test | openbao | Data service Secrets equal today's"
+      ansible.builtin.assert:
+        that:
+          - obcases | dict2items | selectattr('key', 'match', '^ds-') | rejectattr('value.ok') | list | length == 0
+          # One line per expected Secret of every scenario.
+          - (_ds_lines | length) == (_ds_expected | int)
+          - _ds_lines | reject('match', '^ok ') | list | length == 0
+        fail_msg: "{{ _ds_lines | reject('match', '^ok ') | list | to_json }} {{ obcases | dict2items | selectattr('key', 'match', '^ds-') | rejectattr('value.ok') | map(attribute='value.msg') | list | to_json }}"
+        quiet: true
+      vars:
+        _ds_lines: "{{ ds_results | default({}) | dict2items | map(attribute='value') | flatten }}"
+        _ds_expected: "{{ ds_expected | default({}) | dict2items | map(attribute='value') | map('int') | sum }}"
+
+    - name: "app_secrets | test | openbao | Add a host for the role defaults checks"
+      ansible.builtin.add_host:
+        name: app_secrets_defaults_internal
+        ansible_connection: local
+        openbao_mode: internal
+        env_name: t1
+
+    - name: "app_secrets | test | openbao | Add a host for the role defaults checks (external)"
+      ansible.builtin.add_host:
+        name: app_secrets_defaults_external
+        ansible_connection: local
+        openbao_mode: external
+        openbao_address: https://bao.example.com:8200
+        openbao_cluster_id: prod-a
+        openbao_namespace: bao-ns
+        env_name: t1
+
+    # --- delete (teardown) -------------------------------------------------------------
+    # Entries the registry does not know (the layer teardown must remove them
+    # too), and one outside the erag prefix (must stay). Written before the
+    # values are saved, so the leak check covers them.
+    - name: "app_secrets | test | openbao | Write entries the registry does not know (test values)"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _put
+      changed_when: true
+      failed_when: _put.stdout != 'rc=0'
+      loop:
+        - [put-random, "{{ obdir }}", t1/erag/user/zz-unknown, token]
+        - [put-random, "{{ obdir }}", t1/erag/zz-old/nested/deep, password]
+        - [put-random, "{{ obdir }}", t1/erag/zz-soft, password]
+        - [root, "{{ obdir }}", kv, delete, -mount=intel-ai, t1/erag/zz-soft]
+        - [root, "{{ obdir }}", kv, metadata, put, -mount=intel-ai, -max-versions=3, t1/erag/zz-meta-only]
+        - [put-random, "{{ obdir }}", t1/eragx/keep, password]
+      loop_control:
+        label: "{{ item[0] }} {{ item[-1] }}"
+
+    - name: "app_secrets | test | openbao | Save every stored value for the leak check (before sealing)"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['values', obdir, lookup('ansible.builtin.env', 'VALUES_FILE')] }}"
+      register: _nvalues
+      changed_when: false
+      failed_when: (_nvalues.stdout | int) < 8
+
+    - name: "app_secrets | test | openbao | Before the deletes"
+      ansible.builtin.set_fact:
+        _es_before: "{{ _st.keys() | select('match', '^ExternalSecret/') | list }}"
+        _ch_es: >-
+          {{ _st | dict2items | selectattr('key', 'match', '^ExternalSecret/')
+             | selectattr('value.metadata.annotations.erag-secrets/credential-ids', 'search', '(^|,)chat-history/postgres(,|$)')
+             | map(attribute='key') | list }}
+        _labelled_before: "{{ _ns_with_erag }}"
+
+    - name: "app_secrets | test | openbao | The deletes have something to delete"
+      ansible.builtin.assert:
+        that:
+          - _ch_es | length > 0
+          - (_es_before | length) > (_ch_es | length)
+          # Platform and other-layer namespaces (keycloak, monitoring, the model namespace).
+          - "'Namespace//keycloak' in _labelled_before"
+          - "'Namespace//monitoring' in _labelled_before"
+          - "'Namespace//llm-inference' in _labelled_before"
+        fail_msg: "{{ _ch_es }} {{ _es_before | length }} {{ _labelled_before }}"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | Delete with an unreachable OpenBao"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: delete-unreachable, op: delete, ids: [chat-history/postgres], addr: "https://127.0.0.1:1"}
+
+    - name: "app_secrets | test | openbao | A failed delete leaves the cluster untouched"
+      ansible.builtin.assert:
+        that:
+          - not obcases['delete-unreachable'].ok
+          - _es_before | reject('in', _st.keys() | list) | list | length == 0
+          - _ch_es | map('regex_replace', '^ExternalSecret/', 'Secret/') | reject('in', _st.keys() | list) | list | length == 0
+          - _ns_with_erag | sort == _labelled_before | sort
+        fail_msg: "{{ _es_before | reject('in', _st.keys() | list) | list }} {{ _ns_with_erag }}"
+        quiet: true
+
+    # Story 17: the store is gone for good. No worker runs; the cluster side
+    # is cleaned anyway and the KV entry stays (the next case deletes it).
+    - name: "app_secrets | test | openbao | Count the worker runs before the store-lost delete"
+      ansible.builtin.set_fact:
+        _runs_before_lost: "{{ _runs | length }}"
+
+    - name: "app_secrets | test | openbao | Delete with a lost store (erag_teardown_store_lost)"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: delete-store-lost, op: delete, ids: [chat-history/postgres], addr: "https://127.0.0.1:1", store_lost: true}
+
+    - name: "app_secrets | test | openbao | Count the entry after the store-lost delete"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['count', obdir, 't1/erag/chat-history'] }}"
+      register: _count_lost
+      changed_when: false
+
+    - name: "app_secrets | test | openbao | A store-lost delete cleans the cluster only"
+      ansible.builtin.assert:
+        that:
+          - obcases['delete-store-lost'].ok
+          - _count_lost.stdout == '1'
+          - (_runs | length) == (_runs_before_lost | int)
+          - _ch_es | select('in', _st.keys() | list) | list | length == 0
+          - _ch_es | map('regex_replace', '^ExternalSecret/', 'Secret/') | select('in', _st.keys() | list) | list | length == 0
+        fail_msg: "{{ obcases['delete-store-lost'].msg }} count={{ _count_lost.stdout }} left={{ _ch_es | select('in', _st.keys() | list) | list }}"
+        quiet: true
+
+    - name: "app_secrets | test | openbao | Delete one credential"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: delete-partial, op: delete, ids: [chat-history/postgres]}
+
+    - name: "app_secrets | test | openbao | Count the entries after the partial delete"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['count', obdir, item] }}"
+      register: _counts_partial
+      changed_when: false
+      loop: [t1/erag/chat-history, t1/erag/edp]
+
+    - name: "app_secrets | test | openbao | Unreachable and partial delete results"
+      ansible.builtin.assert:
+        that:
+          - not obcases['delete-unreachable'].ok
+          - "'is unreachable' in obcases['delete-unreachable'].msg"
+          - obcases['delete-partial'].ok
+          - obcases['delete-partial'].worker.credentials['chat-history/postgres'].result == 'removed'
+          - obcases['delete-partial'].worker.purge is none
+          - _st['FakeJobRuns//all'].configmaps[_runs[-1]].data.plan | trim == 'delete chat-history/postgres t1/erag/chat-history/postgres'
+          - _counts_partial.results | map(attribute='stdout') | list == ['0', '3']
+          # Only the ExternalSecrets (and Secrets) that read it are gone.
+          - _ch_es | select('in', _st.keys() | list) | list | length == 0
+          - _ch_es | map('regex_replace', '^ExternalSecret/', 'Secret/') | select('in', _st.keys() | list) | list | length == 0
+          - (_st.keys() | select('match', '^ExternalSecret/') | list | length) == (_es_before | length) - (_ch_es | length)
+          - _st['Namespace//erag-secrets'] is defined
+          - _st['Namespace//keycloak'].metadata.labels['secrets.ai-solutions/erag'] == 'true'
+        fail_msg: >-
+          {{ obcases['delete-unreachable'].msg }} | {{ obcases['delete-partial'].msg }}
+          {{ obcases['delete-partial'].worker.credentials | default({}) | to_json }}
+          {{ _counts_partial.results | map(attribute='stdout') | list }}
+        quiet: true
+
+    # The ID list of the real teardown task.
+    - name: "app_secrets | test | openbao | Read the app_pre_install teardown call"
+      ansible.builtin.set_fact:
+        # include_role only: the task's vars hold a Jinja expression.
+        _td_role: >-
+          {{ (lookup('ansible.builtin.file', playbook_dir ~ '/../../app_pre_install/tasks/teardown.yaml') | from_yaml
+              | selectattr('name', 'equalto', 'app_pre_install | Remove the erag credentials from the credential store') | first)['ansible.builtin.include_role'] }}
+        _td_ids: >-
+          {{ (lookup('ansible.builtin.file', playbook_dir ~ '/../../app_pre_install/defaults/main.yaml') | from_yaml)
+             .app_pre_install_teardown_secret_ids }}
+
+    - name: "app_secrets | test | openbao | Count the entries before the layer teardown"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['count', obdir, 't1/erag'] }}"
+      register: _count_before_full
+      changed_when: false
+
+    # Annotation without the label: must be cleaned up too. A killed rotation
+    # left its Role/RoleBinding in keycloak (part-of: erag-secrets): removed. A
+    # Role without that label stays.
+    - name: "app_secrets | test | openbao | A namespace with the paths annotation only, leftover rotator RBAC"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: >-
+          {{ _st | combine({'Namespace//zz-annotated': {'apiVersion': 'v1', 'kind': 'Namespace',
+                             'metadata': {'name': 'zz-annotated', 'labels': {'keep': 'me'},
+                                          'annotations': {'secrets.ai-solutions/erag-paths': 'erag/x', 'other': 'stays'}}},
+                            'Role/keycloak/erag-secrets-rotator': {'apiVersion': 'rbac.authorization.k8s.io/v1', 'kind': 'Role',
+                             'metadata': {'name': 'erag-secrets-rotator', 'namespace': 'keycloak',
+                                          'labels': {'app.kubernetes.io/part-of': 'erag-secrets', 'app.kubernetes.io/managed-by': 'app_secrets'}}},
+                            'RoleBinding/keycloak/erag-secrets-rotator': {'apiVersion': 'rbac.authorization.k8s.io/v1', 'kind': 'RoleBinding',
+                             'metadata': {'name': 'erag-secrets-rotator', 'namespace': 'keycloak',
+                                          'labels': {'app.kubernetes.io/part-of': 'erag-secrets', 'app.kubernetes.io/managed-by': 'app_secrets'}}},
+                            'Role/keycloak/zz-keep-role': {'apiVersion': 'rbac.authorization.k8s.io/v1', 'kind': 'Role',
+                             'metadata': {'name': 'zz-keep-role', 'namespace': 'keycloak', 'labels': {'keep': 'me'}}}}) | to_json }}
+      no_log: true
+
+    - name: "app_secrets | test | openbao | Layer teardown, re-run"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      loop:
+        - {name: delete-full, op: delete, ids: "{{ _td_ids }}"}
+        - {name: delete-full-rerun, op: delete, ids: "{{ _td_ids }}"}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | openbao | Count the entries after the layer teardown"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      register: _counts_full
+      changed_when: false
+      loop:
+        - [count, "{{ obdir }}", t1/erag]
+        - [count, "{{ obdir }}", t1/eragx]
+        - [check, "{{ obdir }}", t1/eragx/keep, password, "[0-9a-f]{32}"]
+
+    - name: "app_secrets | test | openbao | Layer teardown results"
+      ansible.builtin.assert:
+        that:
+          - _td_role.name == 'app_secrets'
+          - _td_role.tasks_from == 'delete.yaml'
+          - >-
+            lookup('ansible.builtin.file', playbook_dir ~ '/../../app_pre_install/tasks/teardown.yaml')
+            is search('secret_ids: "[{][{] app_pre_install_teardown_secret_ids [}][}]"')
+          # The teardown list is the whole registry (app_secrets_catalog: the
+          # default registry, loaded by the last case).
+          - _td_ids | sort == app_secrets_catalog.keys() | list | sort
+          - _td_ids | unique | length == _td_ids | length
+          - obcases['delete-full'].ok
+          - _full.credentials | dict2items | rejectattr('value.result', 'in', ['removed', 'missing']) | list | length == 0
+          - _full.credentials['edp/postgresql'].result == 'removed'
+          - _full.credentials['chat-history/postgres'].result == 'missing'
+          - _full.purge.state == 'ok'
+          - _full.purge.prefix == 't1/erag'
+          # Exactly what the registry entries left: zz-test/* of the test
+          # registry, user/zz-unknown, zz-old/nested/deep, zz-soft (soft-deleted)
+          # and zz-meta-only (no version).
+          - (_full.purge.removed | int) >= 4
+          - >-
+            (_full.purge.removed | int) ==
+            (_count_before_full.stdout | int) - (_full.credentials | dict2items | selectattr('value.result', 'equalto', 'removed') | list | length)
+          # Foreground: the Secrets are gone before the task returns.
+          - _st['FakeDeletes//ExternalSecret'].policies | unique == ['Foreground']
+          - "_st['Namespace//zz-annotated'].metadata.labels == {'keep': 'me'}"
+          - "_st['Namespace//zz-annotated'].metadata.annotations == {'other': 'stays'}"
+          - _counts_full.results | map(attribute='stdout') | list == ['0', '1', 'ok']
+          - obcases['delete-full-rerun'].ok
+          - _rerun.credentials | dict2items | rejectattr('value.result', 'equalto', 'missing') | list | length == 0
+          - _rerun.purge.state == 'ok'
+          - (_rerun.purge.removed | int) == 0
+          # Cluster: no ExternalSecret, no Secret owned by one, no layer label or
+          # paths annotation, no worker namespace or anything in it.
+          - _st.keys() | select('match', '^ExternalSecret/') | list | length == 0
+          - >-
+            _st | dict2items | selectattr('key', 'match', '^Secret/')
+            | selectattr('value.metadata.ownerReferences', 'defined') | list | length == 0
+          - _ns_with_erag | length == 0
+          - _st['Namespace//erag-secrets'] is not defined
+          - _st.keys() | select('match', '^[A-Za-z]+/erag-secrets/') | reject('match', '^JobLog/') | list | length == 0
+          # Leftover importer/rotator RBAC is gone; other Roles stay.
+          - _st['Role/keycloak/erag-secrets-rotator'] is not defined
+          - _st['RoleBinding/keycloak/erag-secrets-rotator'] is not defined
+          - _st['Role/keycloak/zz-keep-role'] is defined
+          # Platform namespaces stay, without the erag label.
+          - _st['Namespace//keycloak'] is defined
+          - _st['Namespace//monitoring'] is defined
+        fail_msg: >-
+          {{ obcases['delete-full'].msg }} | {{ obcases['delete-full-rerun'].msg }}
+          purge {{ _full.purge | default({}) | to_json }} rerun {{ _rerun.purge | default({}) | to_json }}
+          counts {{ _counts_full.results | map(attribute='stdout') | list }}
+          left {{ _st.keys() | select('match', '^(ExternalSecret/|Namespace//)') | list }}
+        quiet: true
+      vars:
+        _full: "{{ obcases['delete-full'].worker }}"
+        _rerun: "{{ obcases['delete-full-rerun'].worker }}"
+
+    # A worker namespace that setup did not create (no marker): it stays, and
+    # only the erag-secrets objects, the label and the annotation go.
+    - name: "app_secrets | test | openbao | Seed a worker namespace that someone else created"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: >-
+          {{ _st | combine({'Namespace//erag-secrets': {'apiVersion': 'v1', 'kind': 'Namespace',
+                             'metadata': {'name': 'erag-secrets', 'labels': {'team': 'other'},
+                                          'annotations': {'secrets.ai-solutions/erag-paths': 'erag/user/hf-token'}}},
+                            'ConfigMap/erag-secrets/not-ours': {'apiVersion': 'v1', 'kind': 'ConfigMap',
+                             'metadata': {'name': 'not-ours', 'namespace': 'erag-secrets'}}}) | to_json }}
+      no_log: true
+
+    - name: "app_secrets | test | openbao | Layer teardown with a foreign worker namespace"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: delete-foreign-ns, op: delete, ids: "{{ _td_ids }}"}
+
+    - name: "app_secrets | test | openbao | Foreign worker namespace results"
+      ansible.builtin.assert:
+        that:
+          - obcases['delete-foreign-ns'].ok
+          - "_ns.metadata.labels == {'team': 'other'}"
+          - _ns.metadata.annotations | default({}) == {}
+          - _st['ConfigMap/erag-secrets/not-ours'] is defined
+          - _st['ServiceAccount/erag-secrets/erag-secrets-worker'] is not defined
+          - _st['ConfigMap/erag-secrets/openbao-ca-bundle'] is not defined
+          - _ours | length == 0
+        fail_msg: "{{ obcases['delete-foreign-ns'].msg }} {{ _ns | default({}) | to_json }} {{ _st.keys() | select('search', 'erag-secrets') | list }}"
+        quiet: true
+      vars:
+        _ns: "{{ _st['Namespace//erag-secrets'] | default({'metadata': {}}) }}"
+        _ours: >-
+          {%- set o = [] -%}
+          {%- for k, v in _st.items() if (k.startswith('Job/erag-secrets/') or k.startswith('ConfigMap/erag-secrets/'))
+                and 'app.kubernetes.io/part-of' in (v.metadata.labels | default({}, true)) -%}
+            {%- set _ = o.append(k) -%}
+          {%- endfor -%}
+          {{ o }}
+
+    - name: "app_secrets | test | openbao | Remove the foreign worker namespace"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: >-
+          {{ _st | dict2items | rejectattr('key', 'in', ['Namespace//erag-secrets', 'ConfigMap/erag-secrets/not-ours'])
+             | items2dict | to_json }}
+      no_log: true
+
+    - name: "app_secrets | test | openbao | Seal OpenBao"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['root', obdir, 'operator', 'seal'] }}"
+      register: _seal
+      changed_when: true
+      failed_when: _seal.stdout != 'rc=0'
+
+    - name: "app_secrets | test | openbao | Probe a sealed OpenBao"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: sealed, op: probe, ids: [chat-history/postgres]}
+
+    - name: "app_secrets | test | openbao | Delete with a sealed OpenBao"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: delete-sealed, op: delete, ids: [chat-history/postgres]}
+
+    - name: "app_secrets | test | openbao | Probe failure messages"
+      ansible.builtin.assert:
+        that:
+          - not obcases['css-not-ready'].ok
+          - "'ClusterSecretStore openbao-erag is not Ready (InvalidProviderConfig: unable to log in)' in obcases['css-not-ready'].msg"
+          - not obcases['ca-missing'].ok
+          - "'openbao/openbao-ca-bundle is missing' in obcases['ca-missing'].msg"
+          - not obcases['ca-private-key'].ok
+          - "'holds a private key' in obcases['ca-private-key'].msg"
+          - not obcases['login-role'].ok
+          - "'could not log in to OpenBao as role no-such-role' in obcases['login-role'].msg"
+          - not obcases['login-audience'].ok
+          - "'could not log in' in obcases['login-audience'].msg"
+          - "'audience' in obcases['login-audience'].msg"
+          - not obcases['unreachable'].ok
+          - "'is unreachable from namespace erag-secrets' in obcases['unreachable'].msg"
+          - not obcases['ensure-unreachable'].ok
+          - "'is unreachable' in obcases['ensure-unreachable'].msg"
+          - obcases['ensure-unreachable'].worker.credentials | length == 0
+          - not obcases['sealed'].ok
+          - "'is sealed' in obcases['sealed'].msg"
+          - "'Unseal after a restart' in obcases['sealed'].msg"
+          - not obcases['delete-sealed'].ok
+          - "'is sealed' in obcases['delete-sealed'].msg"
+          # No server here: the rotator runs and fails before it writes (test_rotation.yaml covers rotate).
+          - "'chat-history/postgres (postgres-alter-user):' in obcases['rotate'].msg"
+        fail_msg: "{{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
+        quiet: true
+
+# The role defaults as plain vars on their own hosts (no case runs there).
+- name: "app_secrets | test | openbao | Role defaults: address, namespace and cluster id"
+  hosts: app_secrets_defaults_internal:app_secrets_defaults_external
+  gather_facts: false
+  tasks:
+    - name: "app_secrets | test | openbao | Load the role defaults"
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../defaults/main.yaml"
+      vars:
+        role_path: /unused
+
+    - name: "app_secrets | test | openbao | Defaults follow openbao_mode, openbao_namespace and openbao_cluster_id"
+      ansible.builtin.assert:
+        that:
+          - (app_secrets_openbao_address | trim) == _want.addr
+          - (app_secrets_openbao_namespace | trim) == _want.ns
+          - (app_secrets_openbao_cluster_id | trim) == _want.cid
+        fail_msg: "{{ inventory_hostname }}: {{ app_secrets_openbao_address | trim }} {{ app_secrets_openbao_namespace }} {{ app_secrets_openbao_cluster_id }}"
+        quiet: true
+      vars:
+        _want: >-
+          {{ {'addr': 'https://openbao-active.openbao.svc:8200', 'ns': 'openbao', 'cid': 't1'}
+             if inventory_hostname == 'app_secrets_defaults_internal'
+             else {'addr': 'https://bao.example.com:8200', 'ns': 'bao-ns', 'cid': 'prod-a'} }}

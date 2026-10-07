@@ -36,7 +36,16 @@ When `mcp_enabled` is true, the Keycloak configurator Job creates a ready-to-use
 - An audience mapper adding `mcp-gateway`, the audience the gateway requires
 - `access.token.lifespan` of 900s, so agent tokens stay short-lived without changing the realm default
 
-The credentials are stored in two places:
+Where the client secret is stored depends on `secrets_backend`.
+
+With `secrets_backend: openbao`, OpenBao is the source of truth. ESO projects the value into the Kubernetes Secret `keycloak/erag-credentials`, and no file is written. Read it after an [operator login](../deploy/openbao.md#log-in-to-openbao):
+
+```bash
+bao kv get -mount=intel-ai -field=client_secret <cluster_id>/erag/keycloak/mcp-client
+# The client ID is mcp_keycloak_client_id (default mcp-client); it is not stored in OpenBao.
+```
+
+With `secrets_backend: local` (default), it is stored in two places:
 
 ```bash
 # Kubernetes Secret (source of truth)
@@ -49,9 +58,11 @@ grep MCP_CLIENT env/<name>/logs/rag/default_credentials.txt
 # MCP_CLIENT_SECRET="<generated-secret>"
 ```
 
+To change the secret with OpenBao, rotate it: `./es_auto_installer.sh install erag --env <name> --only -- -e 'erag_rotate=[keycloak/mcp-client]'` sets a new secret in Keycloak and in OpenBao ([Rotate a credential](../deploy/openbao.md#rotate-a-credential)). Agents then need the new value.
+
 > **Note:** `mcp-client` is intended for development, testing, and the e2e suite. For production integrations, create a dedicated client per agent (see [Creating a production agent client](#creating-a-production-agent-client-in-keycloak)).
 
-> **Caution:** Remove `env/<name>/logs/rag/default_credentials.txt` once you have copied the values you need. It also holds Keycloak user passwords.
+> **Caution:** With `secrets_backend: local`, remove `env/<name>/logs/rag/default_credentials.txt` once you have copied the values you need. It also holds Keycloak user passwords. The next install writes it again. With `secrets_backend: openbao` there is no such file.
 
 ## Connecting an agent
 
@@ -62,7 +73,7 @@ An agent first exchanges its own client credentials for an access token at Keycl
 TOKEN=$(curl -s "https://keycloak.<base_domain_name>/realms/EnterpriseRAG/protocol/openid-connect/token" \
   -d grant_type=client_credentials \
   -d client_id=mcp-client \
-  -d client_secret="<value from default_credentials.txt>" | jq -r .access_token)
+  -d client_secret="<the client secret, from OpenBao or default_credentials.txt>" | jq -r .access_token)
 
 # 2. Connect (add --no-buffer for streaming)
 curl -N "https://<base_domain_name>/api/v1/mcp/sse" -H "Authorization: Bearer $TOKEN"

@@ -62,7 +62,11 @@
     file: ontap_s3_teardown.yaml
   when: not (_edp_ontap_s3_active | bool)
 
+# Local Secrets only: with projected Secrets the client secret comes from the
+# store (keycloak/edp-oidc, set in Keycloak by the configurator) and reaches
+# keycloak-minio-secret and edp-access-secret through ESO.
 - name: "app_edp | Retrieve minio OIDC client secret from Keycloak"
+  when: not (app_secrets_projected | default(false))
   block:
     - name: "app_edp | Get client_secret_id keycloak"
       vars:
@@ -96,24 +100,44 @@
         msg: "Failed to retrieve client secret for '{{ edp_client_id }}'. The keycloak configurator should have created this client."
       when: "'pre-upgrade' not in ansible_run_tags"
 
-- name: "app_edp | Generate random string for keys"
-  ansible.builtin.include_role:
-    name: app_generate_password
-    tasks_from: generate_key
-  loop:
-    - {name: EDP_MINIO_ACCESS_KEY}
-    - {name: EDP_MINIO_SECRET_KEY}
-  no_log: "{{ secure_logs }}"
+# Also fails early on what projected Secrets cannot carry yet.
+- name: "app_edp | Resolve the non-secret settings of the EDP Secrets"
+  ansible.builtin.include_tasks:
+    file: secret_config.yaml
 
-- name: "app_edp | Generate password"
+- name: "app_edp | Generate keys and passwords"
   ansible.builtin.include_role:
-    name: app_generate_password
-    tasks_from: generate_password
-  loop:
-    - {name: EDP_REDIS, user: "{{ edp_redis_username }}"}
-    - {name: EDP_POSTGRESQL, user: "{{ edp_postgresql_user_username }}"}
-    - {name: EDP_POSTGRESQL_ADMIN, user: "{{ edp_postgresql_admin_username }}"}
-  no_log: "{{ secure_logs }}"
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [edp/object-store, edp/redis, edp/postgresql]
+
+# Projected Secrets: renders keycloak-minio-secret (and edp-access-secret once
+# its other sources exist). app_keycloak_config ensured it before the configurator.
+- name: "app_edp | Project the minio OIDC client secret"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [keycloak/edp-oidc]
+  when: app_secrets_projected | default(false)
+
+# Operator-supplied: present-check only (openbao); nothing to do in local mode.
+- name: "app_edp | Check the operator S3 keys"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [user/edp-s3]
+  when: edp_secret_storage in ['s3', 's3compatible']
+
+- name: "app_edp | Check the SharePoint client secret"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: ensure.yaml
+  vars:
+    secret_ids: [user/sharepoint]
+  when: erag_keycloak_oidc_tenant_id | default('', true) | string | trim | length > 0
 
 - name: "app_edp | Assert SharePoint configuration is complete"
   ansible.builtin.assert:
@@ -133,7 +157,11 @@
       {{ {'erag_keycloak_oidc_endpoint': erag_keycloak_oidc_endpoint | default('', true) | string | trim,
           'erag_keycloak_oidc_client_id': erag_keycloak_oidc_client_id | default('', true) | string | trim,
           'erag_keycloak_oidc_client_secret': erag_keycloak_oidc_client_secret | default('', true) | string | trim}
-         | dict2items | selectattr('value', 'falsy') | map(attribute='key') | list }}
+         | dict2items | selectattr('value', 'falsy') | map(attribute='key')
+         | reject('in', _sp_store_vars) | list }}
+    # Projected Secrets: the client secret is read from the store
+    # (erag/user/sharepoint, checked by the ensure above), not config.
+    _sp_store_vars: "{{ ['erag_keycloak_oidc_client_secret'] if app_secrets_projected | default(false) else [] }}"
   when: erag_keycloak_oidc_tenant_id | default('', true) | string | trim | length > 0
 
 - name: "app_edp | Assert SharePoint sync lock TTL is a positive integer"
@@ -188,21 +216,8 @@
 
 - name: "app_edp | Mark secrets for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-    namespace: "{{ edp_namespace }}"
-    secret_name: "{{ item.secret_name }}"
-    password_mappings: "{{ item.password_mappings }}"
-  loop:
-    - secret_name: "edp-access-secret"
-      password_mappings:
-        - {key: EDP_ACCESS_KEY, variable: EDP_MINIO_ACCESS_KEY, user: ""}
-        - {key: EDP_SECRET_KEY, variable: EDP_MINIO_SECRET_KEY, user: ""}
-    - secret_name: "edp-redis-secret"
-      password_mappings:
-        - {key: password, variable: EDP_REDIS_PASSWORD, user: "{{ edp_redis_username }}"}
-    - secret_name: "edp-postgresql-secret"
-      password_mappings:
-        - {key: DATABASE_PASSWORD, variable: EDP_POSTGRESQL_PASSWORD, user: "{{ edp_postgresql_user_username }}"}
-        - {key: DATABASE_ADMIN_PASSWORD, variable: EDP_POSTGRESQL_ADMIN_PASSWORD, user: "{{ edp_postgresql_admin_username }}"}
+    secret_ids: [edp/object-store, edp/redis, edp/postgresql]
+    ensure_phase: after_deploy

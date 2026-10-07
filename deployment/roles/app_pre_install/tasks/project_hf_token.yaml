@@ -1,0 +1,70 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Projected Secrets (OpenBao): the operator HF token, erag/user/hf-token. It is
+# optional, as in local mode. When the entry exists, ensure projects it into the
+# credential-store namespace (vector_dims Job) and the model namespace
+# (model-manager, MM_HF_TOKEN_FROM_SECRET); the pipeline and audio roles project
+# their own copies. Sets hugging_token_projected.
+#
+# Shared by app_inference_models, which runs first (components.yaml: app_pre_install
+# depends on it) and needs the projection before model-manager deploys, and by
+# app_pre_install install.yaml (for a run without app_inference_models). The work
+# is done once per run: the first caller sets hugging_token_projected.
+
+# app_inference_models runs before app_pre_install's solution_config.yaml, so the
+# delivery mode (app_secrets_projected) and the CAP-5 conflicts are not known yet.
+- name: "app_pre_install | HF token | Check where the operator-supplied secrets come from"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: preflight.yaml
+  vars:
+    configuration_issues: []
+  when: app_secrets_projected is not defined
+
+- name: "app_pre_install | HF token | Fail on operator secrets also set outside the store"
+  ansible.builtin.fail:
+    msg: |
+      CONFIGURATION FAILED
+
+      {{ configuration_issues | length }} issue(s) must be resolved before continuing:
+
+      {% for issue in configuration_issues %}
+      {{ loop.index }}. {{ issue }}
+      {% endfor %}
+  when: configuration_issues | default([]) | length > 0
+
+- name: "app_pre_install | HF token | Projected HF token"
+  when:
+    - app_secrets_projected | default(false)
+    - hugging_token_projected is not defined
+  block:
+    - name: "app_pre_install | Look up the operator HF token in the credential store"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: status.yaml
+      vars:
+        secret_ids: [user/hf-token]
+
+    - name: "app_pre_install | Record whether the HF token is in the credential store"
+      ansible.builtin.set_fact:
+        hugging_token_projected: "{{ app_secrets_status['user/hf-token'].exists | bool }}"
+
+    - name: "app_pre_install | Project the HF token"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [user/hf-token]
+      when: hugging_token_projected | bool
+
+    - name: "app_pre_install | Warn that no HF token is in the credential store"
+      ansible.builtin.debug:
+        msg: |
+          WARNING: no HF token in OpenBao {{ app_secrets_status['user/hf-token'].path }}{{ ' (its current version is deleted)' if app_secrets_status['user/hf-token'].deleted | default(false) else '' }}.
+
+          Gated models from Hugging Face need it: write the token there (key token)
+          and run the install again. If you're only using publicly available models,
+          you can ignore this warning.
+      when: not (hugging_token_projected | bool)

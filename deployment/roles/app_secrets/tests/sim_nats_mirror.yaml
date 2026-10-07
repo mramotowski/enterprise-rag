@@ -1,0 +1,29 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_role_calls.yaml: app_nats mirroring of the seed into the
+# consumer namespaces (unchanged role code, shared by both sequences).
+
+---
+- name: "app_nats | Read auth secret for mirroring"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ nats_auth_secret_name }}"
+    namespace: "{{ nats_namespace }}"
+  register: _nats_auth_secret_full
+  no_log: true
+
+- name: "app_nats | Create client auth secret in consumer namespaces"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ nats_auth_secret_name }}"
+        namespace: "{{ item }}"
+      data:
+        user.nk: "{{ _nats_auth_secret_full.resources[0].data['user.nk'] }}"
+  no_log: true
+  loop: "{{ nats_client_namespaces }}"

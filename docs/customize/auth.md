@@ -13,7 +13,12 @@ MFA using Google Authenticator can be enabled on an already-running deployment t
 ### Prerequisites
 
 - Intel AI for Enterprise RAG deployed with Keycloak enabled
-- Keycloak admin credentials (available in `env/<name>/logs/rag/default_credentials.txt` after install)
+- The Keycloak admin password (user `admin`). Read it from the platform Secret, in either secrets backend:
+  `kubectl get secret -n keycloak keycloak-admin-secret -o jsonpath='{.data.password}' | base64 -d`.
+  With `secrets_backend: local` it is also in `env/<name>/logs/rag/default_credentials.yaml` (`KEYCLOAK_REALM_ADMIN_PASSWORD`).
+
+> [!NOTE]
+> With `secrets_backend: openbao`, do not regenerate the secrets of the clients the installer manages (`mcp-client`, `grafana-oauth`, `EnterpriseRAG-oidc-minio`) in the admin console: OpenBao keeps the old value, the services that use the client fail, and the next `install erag` sets the OpenBao value again. Rotate them with the installer instead. `validate erag` reports such drift. See [How a change in OpenBao reaches the services](../deploy/openbao.md#how-a-change-in-openbao-reaches-the-services).
 
 ### Enable MFA
 

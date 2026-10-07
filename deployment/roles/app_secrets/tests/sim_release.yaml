@@ -1,0 +1,36 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helper for test_role_calls.yaml: stands in for a Helm release or Job that
+# creates Secrets (the same helper runs in the legacy and the port sequence).
+# Expects: sim_secrets = [{namespace, name, data: {KEY: value}, only_if_absent}].
+# Data values are written base64-encoded, as Helm would.
+
+---
+- name: "app_secrets | test | sim | Look up {{ sim_label }}"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+  loop: "{{ sim_secrets }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  register: _sim_lookup
+  no_log: true
+
+- name: "app_secrets | test | sim | Create {{ sim_label }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ item.item.name }}"
+        namespace: "{{ item.item.namespace }}"
+      data: "{{ dict(item.item.data.keys() | zip(item.item.data.values() | map('string') | map('b64encode'))) }}"
+  loop: "{{ _sim_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.namespace }}/{{ item.item.name }}"
+  when: not (item.item.only_if_absent | default(false)) or item.resources | length == 0
+  no_log: true

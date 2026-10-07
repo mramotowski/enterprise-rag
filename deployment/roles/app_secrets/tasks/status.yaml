@@ -1,0 +1,18 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Port operation 'status'. Usage:
+#   - ansible.builtin.include_role:
+#       name: app_secrets
+#       tasks_from: status.yaml
+#     vars:
+#       secret_ids: [<component>/<credential>, ...]
+
+---
+- name: "app_secrets | status | Validate request"
+  ansible.builtin.include_tasks: common/validate.yaml
+  vars:
+    app_secrets_op: status
+
+- name: "app_secrets | status | Run {{ secrets_backend }} adapter"
+  ansible.builtin.include_tasks: "adapters/{{ secrets_backend }}/status.yaml"

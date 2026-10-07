@@ -9,9 +9,17 @@ proxy:
   http_proxy: "{{ http_proxy | default('') }}"
   https_proxy: "{{ https_proxy | default('') }}"
   no_proxy: "{{ no_proxy | default('') }}"
-{% if (hugging_token is defined) and (hugging_token != "") %}
+{# Projected Secrets: hf-token-secret is an ESO projection of erag/user/hf-token
+   (when the operator wrote it); no token in the values. #}
+{% set _hf_secret = (app_secrets_projected | default(false)) and (hugging_token_projected | default(false) | bool) %}
+{% if ((hugging_token is defined) and (hugging_token != "")) or _hf_secret %}
 tokens:
+{% if (hugging_token is defined) and (hugging_token != "") %}
   hug_token: {{ hugging_token }}
+{% endif %}
+{% if _hf_secret %}
+  hugTokenSecret: true
+{% endif %}
 {% endif %}
 common_tag: &tag "{{ tag }}"
 common_registry: &repo "{{ registry }}"

@@ -4,7 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Keycloak Configurator for in-cluster execution (Job-based)
-# This script runs inside a Kubernetes Pod and stores credentials in K8s secrets
+# This script runs inside a Kubernetes Pod and stores credentials in K8s secrets.
+# With CREDENTIALS_SOURCE=projection it instead reads every credential from its
+# environment (Secrets projected by ESO from the secret store), sets it in
+# Keycloak, never generates, reads back or stores one, and calls no kubectl.
 
 set -e
 
@@ -19,11 +22,19 @@ MINIO_PATH_PREFIX="${MINIO_PATH_PREFIX:-}"
 UI_DOMAIN="${UI_DOMAIN:-solutions.ai}"
 CREDENTIALS_SECRET_NAME="${CREDENTIALS_SECRET_NAME:-erag-credentials}"
 CREDENTIALS_SECRET_NAMESPACE="${CREDENTIALS_SECRET_NAMESPACE:-auth}"
+# "projection": credentials come from the environment (see the header).
+CREDENTIALS_SOURCE="${CREDENTIALS_SOURCE:-}"
+# Projection mode: set when a projected value could not be applied; the Job fails at the end.
+PROJECTION_FAILED=false
 
 # MCP gateway caller identity
 MCP_ENABLED="${MCP_ENABLED:-false}"
 MCP_CLIENT_ID="${MCP_CLIENT_ID:-mcp-client}"
-MCP_CLIENT_SECRET=""
+if [[ "$CREDENTIALS_SOURCE" == "projection" ]]; then
+  MCP_CLIENT_SECRET="${MCP_CLIENT_SECRET:-}"
+else
+  MCP_CLIENT_SECRET=""
+fi
 # Audience the MCP gateway requires in caller tokens, and how long those tokens live.
 MCP_AUDIENCE="${MCP_AUDIENCE:-mcp-gateway}"
 MCP_ACCESS_TOKEN_LIFESPAN="${MCP_ACCESS_TOKEN_LIFESPAN:-900}"
@@ -69,6 +80,15 @@ log_info() { echo "[INFO] $1"; }
 log_error() { echo "[ERROR] $1" >&2; }
 log_success() { echo "[SUCCESS] $1"; }
 
+projected() { [[ "$CREDENTIALS_SOURCE" == "projection" ]]; }
+
+# Projection mode: record a value that could not be applied and go on, so one
+# run reports every failure; the Job exits non-zero at the end.
+projection_failed() {
+  log_error "$1"
+  PROJECTION_FAILED=true
+}
+
 # Password generation
 generate_random_password() {
   local LENGTH=12
@@ -88,6 +108,20 @@ get_or_create_credential() {
   local password_key="${target}_PASSWORD"
   local username_key="${target}_USERNAME"
   local password=""
+
+  if projected; then
+    # The projected password (env from erag-credentials); never generated here.
+    password="${!password_key:-}"
+    if [ -z "$password" ]; then
+      log_error "$password_key is not set: the projected Secret $CREDENTIALS_SECRET_NAME lacks it - not creating users"
+      exit 1
+    fi
+    log_info "Using the projected password for $target"
+    export "${username_key}=${username}"
+    NEW_PASSWORD="$password"
+    NEW_USERNAME="$username"
+    return 0
+  fi
 
   # Try to get existing password from secret
   if kubectl get secret "$CREDENTIALS_SECRET_NAME" -n "$CREDENTIALS_SECRET_NAMESPACE" &>/dev/null; then
@@ -112,6 +146,10 @@ get_or_create_credential() {
 
 # Store all credentials to Kubernetes secret
 store_credentials_to_secret() {
+  if projected; then
+    log_info "Secret $CREDENTIALS_SECRET_NAME is a projection of the secret store - not written"
+    return 0
+  fi
   log_info "Storing credentials to secret $CREDENTIALS_SECRET_NAME"
 
   local extra_mcp_keys=""
@@ -176,13 +214,18 @@ create_mcp_client() {
   fi
 
   local secret_response
-  secret_response=$(curl_get "${KEYCLOAK_URL}/admin/realms/${realm_name}/clients/${client_uuid}/client-secret")
   local client_secret
-  client_secret=$(echo "$secret_response" | jq -r '.value // empty')
+  if projected; then
+    # Set once the client is final (after a possible recreate below).
+    client_secret="$MCP_CLIENT_SECRET"
+  else
+    secret_response=$(curl_get "${KEYCLOAK_URL}/admin/realms/${realm_name}/clients/${client_uuid}/client-secret")
+    client_secret=$(echo "$secret_response" | jq -r '.value // empty')
 
-  if [[ -z "$client_secret" ]]; then
-    log_error "Failed to retrieve client secret for '$client_name'"
-    return 1
+    if [[ -z "$client_secret" ]]; then
+      log_error "Failed to retrieve client secret for '$client_name'"
+      return 1
+    fi
   fi
 
   local sa_username="service-account-${client_name}"
@@ -221,11 +264,13 @@ create_mcp_client() {
       log_error "Failed to disable standard flow for '$client_name' (HTTP $HTTP_CODE)"
     fi
 
-    secret_response=$(curl_get "${KEYCLOAK_URL}/admin/realms/${realm_name}/clients/${client_uuid}/client-secret")
-    client_secret=$(echo "$secret_response" | jq -r '.value // empty')
-    if [[ -z "$client_secret" ]]; then
-      log_error "Failed to retrieve client secret for '$client_name' after recreate"
-      return 1
+    if ! projected; then
+      secret_response=$(curl_get "${KEYCLOAK_URL}/admin/realms/${realm_name}/clients/${client_uuid}/client-secret")
+      client_secret=$(echo "$secret_response" | jq -r '.value // empty')
+      if [[ -z "$client_secret" ]]; then
+        log_error "Failed to retrieve client secret for '$client_name' after recreate"
+        return 1
+      fi
     fi
 
     sleep 2
@@ -237,6 +282,10 @@ create_mcp_client() {
   fi
 
   log_info "Service account user '$sa_username' found (ID: ${sa_user_id:0:8}...)"
+
+  if projected; then
+    set_client_secret "$realm_name" "$client_name" "$MCP_CLIENT_SECRET" || return 1
+  fi
 
   assign_user_client_role "$realm_name" "$sa_username" "ERAG-user" "EnterpriseRAG-oidc-backend"
   assign_user_client_role "$realm_name" "$sa_username" "erag-admin-group" "EnterpriseRAG-oidc-minio"
@@ -375,6 +424,55 @@ get_client_id() {
   local client_name=$2
   local url="${KEYCLOAK_URL}/admin/realms/$realm_name/clients"
   curl_get "$url" | jq -r --arg name "$client_name" '.[] | select(.clientId == $name) | .id'
+}
+
+# Projection mode: set the secret of an existing confidential client to $3 (with
+# optional extra client fields as a JSON object in $4), then check that Keycloak
+# holds exactly it. The secret goes to curl on stdin, never in its arguments,
+# and is never printed.
+set_client_secret() {
+  local realm_name=$1
+  local client_name=$2
+  local secret=$3
+  local extra=${4:-'{}'}
+
+  if [[ -z "$secret" ]]; then
+    log_error "No projected secret for client '$client_name'"
+    return 1
+  fi
+  # A fresh admin token: the lookups below (curl_get) do not retry on 401.
+  get_access_token
+  local client_uuid
+  client_uuid=$(get_client_id "$realm_name" "$client_name")
+  if [[ -z "$client_uuid" ]]; then
+    log_error "Client '$client_name' not found - cannot set its secret"
+    return 1
+  fi
+
+  local url="${KEYCLOAK_URL}/admin/realms/${realm_name}/clients/${client_uuid}"
+  local code _
+  for _ in $(seq 1 $CURL_RETRY_LIMIT); do
+    code=$(jq -n --arg s "$secret" --argjson extra "$extra" '$extra + {secret: $s}' \
+      | curl -s -o /dev/null -w "%{http_code}" -X PUT "$url" \
+        -H "Authorization: Bearer $ACCESS_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-binary @-)
+    [[ "$code" == 401 ]] || break
+    get_access_token
+  done
+  if [[ ! "$code" =~ ^2 ]]; then
+    HTTP_CODE=$code
+    log_error "Failed to set the secret of client '$client_name' (HTTP $code)"
+    return 1
+  fi
+
+  local stored
+  stored=$(curl_get "${url}/client-secret" | jq -r '.value // empty')
+  if [[ "$stored" != "$secret" ]]; then
+    log_error "Client '$client_name' does not hold the projected secret after the update"
+    return 1
+  fi
+  log_success "Client '$client_name' secret set from the projection"
 }
 
 # Get group ID by name
@@ -667,6 +765,11 @@ create_user() {
     log_success "User '$username' created"
   elif [[ $HTTP_CODE == 409 ]]; then
     log_info "User '$username' already exists"
+    if projected; then
+      log_info "User '$username' keeps its password: the projected password applies to users this Job creates (a user from before the secret store keeps its old one until migration imports it)"
+    fi
+  elif projected; then
+    projection_failed "Failed to create user '$username' with the projected password (HTTP $HTTP_CODE)"
   else
     log_error "Failed to create user '$username' (HTTP $HTTP_CODE)"
   fi
@@ -1181,6 +1284,23 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
+# Projection mode: every projected input must be there before Keycloak is changed.
+if projected; then
+  missing=()
+  for var in KEYCLOAK_ERAG_ADMIN_PASSWORD KEYCLOAK_ERAG_USER_PASSWORD KEYCLOAK_ERAG_MAINTAINER_PASSWORD EDP_OIDC_CLIENT_SECRET; do
+    [ -n "${!var:-}" ] || missing+=("$var")
+  done
+  if [[ "$MCP_ENABLED" == "true" && -z "$MCP_CLIENT_SECRET" ]]; then missing+=(MCP_CLIENT_SECRET); fi
+  if [[ -n "${GRAFANA_DOMAIN:-}" && -z "${GRAFANA_OAUTH_CLIENT_SECRET:-}" ]]; then missing+=(GRAFANA_OAUTH_CLIENT_SECRET); fi
+  if [[ "$OIDC_ENDPOINT" =~ ^https?:// && -z "$OIDC_CLIENT_SECRET" ]]; then missing+=(OIDC_CLIENT_SECRET); fi
+  if [[ "$FEDERATION_ENDPOINT" =~ ^ldaps?:// && -z "$FEDERATION_BIND_PASSWORD" ]]; then missing+=(FEDERATION_BIND_PASSWORD); fi
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Projected credentials missing or empty: ${missing[*]} - Keycloak left unchanged"
+    exit 1
+  fi
+  log_info "Credentials come from the projected Secrets $CREDENTIALS_SECRET_NAME and keycloak-configurator-sensitive"
+fi
+
 # Get access token
 log_info "Authenticating with Keycloak..."
 get_access_token
@@ -1261,6 +1381,11 @@ else
   minio_redirect_uri="https://$MINIO_DOMAIN/oauth_callback"
 fi
 create_client "$KEYCLOAK_REALM" "EnterpriseRAG-oidc-minio" "false" "true" "false" "$minio_base_url" "$minio_redirect_uri" "false" "https://${MINIO_DOMAIN}"
+if projected; then
+  # The EDP and SeaweedFS OIDC client secret comes from the store (keycloak/edp-oidc).
+  set_client_secret "$KEYCLOAK_REALM" "EnterpriseRAG-oidc-minio" "${EDP_OIDC_CLIENT_SECRET:-}" \
+    || projection_failed "The EnterpriseRAG-oidc-minio client secret was not set from the projection"
+fi
 create_client_role "$KEYCLOAK_REALM" "EnterpriseRAG-oidc-minio" "consoleAdmin"
 create_client_role "$KEYCLOAK_REALM" "EnterpriseRAG-oidc-minio" "readwrite"
 create_client_role "$KEYCLOAK_REALM" "EnterpriseRAG-oidc-minio" "erag-admin-group"
@@ -1330,7 +1455,11 @@ if [ -n "${GRAFANA_DOMAIN:-}" ]; then
   fi
 
   # Set the client secret to match what Grafana is configured with
-  if [ -n "${GRAFANA_OAUTH_CLIENT_SECRET:-}" ]; then
+  if projected; then
+    set_client_secret "$KEYCLOAK_REALM" "grafana-oauth" "${GRAFANA_OAUTH_CLIENT_SECRET:-}" \
+      '{"clientId": "grafana-oauth", "publicClient": false, "standardFlowEnabled": true, "directAccessGrantsEnabled": true}' \
+      || projection_failed "The grafana-oauth client secret was not set from the projection"
+  elif [ -n "${GRAFANA_OAUTH_CLIENT_SECRET:-}" ]; then
     local_client_uuid=$(get_client_id "$KEYCLOAK_REALM" "grafana-oauth")
     get_access_token
     HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
@@ -1469,10 +1598,19 @@ fi
 if [[ "$MCP_ENABLED" == "true" ]]; then
   log_info "Configuring MCP client..."
   MCP_CONFIG_ATTEMPTED=true
-  create_mcp_client "$KEYCLOAK_REALM" || log_error "MCP client configuration failed - continuing without MCP credentials"
+  if projected; then
+    create_mcp_client "$KEYCLOAK_REALM" || projection_failed "MCP client configuration failed - the projected MCP client secret is not in Keycloak"
+  else
+    create_mcp_client "$KEYCLOAK_REALM" || log_error "MCP client configuration failed - continuing without MCP credentials"
+  fi
 fi
 
 # Store credentials to Kubernetes secret
 store_credentials_to_secret
+
+if [[ "$PROJECTION_FAILED" == "true" ]]; then
+  log_error "Keycloak does not hold every projected credential - see the errors above"
+  exit 1
+fi
 
 log_success "Keycloak configuration completed successfully!"

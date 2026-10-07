@@ -9,7 +9,11 @@
           'erag_keycloak_oidc_alias': erag_keycloak_oidc_alias | default('', true) | string | trim,
           'erag_keycloak_oidc_client_id': erag_keycloak_oidc_client_id | default('', true) | string | trim,
           'erag_keycloak_oidc_client_secret': erag_keycloak_oidc_client_secret | default('', true) | string | trim}
-         | dict2items | selectattr('value', 'falsy') | map(attribute='key') | list }}
+         | dict2items | selectattr('value', 'falsy') | map(attribute='key')
+         | reject('in', _erag_oidc_store_vars) | list }}
+    # Projected Secrets: the client secret is read from the store
+    # (erag/user/keycloak-oidc, whose ensure fails naming the path), not config.
+    _erag_oidc_store_vars: "{{ ['erag_keycloak_oidc_client_secret'] if app_secrets_projected | default(false) else [] }}"
   block:
     - name: "app_keycloak_config | Assert Single Sign-On configuration is complete"
       ansible.builtin.assert:

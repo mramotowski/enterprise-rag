@@ -1,0 +1,4 @@
+---
+# Test double for kubernetes.core (app_secrets tests only): k8s and k8s_info
+# backed by the JSON file in FAKE_K8S_STATE. Never install it.
+requires_ansible: ">=2.15.0"

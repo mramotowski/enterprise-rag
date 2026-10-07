@@ -47,6 +47,16 @@ edp_s3_bucket_name_regex_filter: ""  # optional: restrict which buckets EDP trac
 
 Requires SQS event notifications configured on the S3 bucket for automatic ingestion.
 
+> [!IMPORTANT]
+> With `secrets_backend: openbao`, the access keys of the `s3` and `s3compatible` types are not set in `config.erag.yaml` (nor in the `s3_access_key` / `s3_secret_key` environment variables): the install fails at preflight while they are set. Write them to OpenBao, keys `access_key_id` and `secret_access_key`, and keep the other settings in the config:
+>
+> ```bash
+> bao kv put   -mount=intel-ai <cluster_id>/erag/user/edp-s3 access_key_id=-
+> bao kv patch -mount=intel-ai <cluster_id>/erag/user/edp-s3 secret_access_key=-
+> ```
+>
+> Feed each value on stdin without a trailing newline (`printf '%s' "$V" | bao kv put ...`), as shown in [Credentials in OpenBao](../deploy/openbao.md#log-in-to-openbao); the entries are described in [Operator-supplied secrets](../deploy/openbao.md#operator-supplied-secrets-eraguser).
+
 ### S3-compatible (without SQS)
 
 ```yaml
@@ -98,6 +108,8 @@ edp_s3_compatible_secret_access_key: "<secret-key>"
 ```
 
 `edp_storage_type` is automatically derived as `s3compatible` when `ontap_s3_data_lif` is set on a `netapp-trident` cluster. You can override it explicitly, but the role will reject a value that contradicts an active ONTAP S3 proxy.
+
+With `secrets_backend: openbao`, write the two keys to OpenBao `erag/user/edp-s3` instead (see the note under [External S3](#external-s3)), and set `edp_storage_type: "s3compatible"` explicitly: the derivation looks for the access key in the config, which no longer holds it.
 
 Deploy or redeploy:
 

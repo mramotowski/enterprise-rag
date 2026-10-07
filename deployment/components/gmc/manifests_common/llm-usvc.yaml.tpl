@@ -113,7 +113,7 @@ spec:
                 name: extra-env-config
                 optional: true
           env:
-          {{- if .Values.tokens.hug_token }}
+          {{- if or .Values.tokens.hug_token .Values.tokens.hugTokenSecret }}
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

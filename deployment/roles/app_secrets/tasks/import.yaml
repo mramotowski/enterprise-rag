@@ -1,0 +1,29 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Port operation 'import' (migration of a local-mode env, AD-12). Usage:
+#   - ansible.builtin.include_role:
+#       name: app_secrets
+#       tasks_from: import.yaml
+#     vars:
+#       secret_ids: [<component>/<credential>, ...]   # required, explicit
+#       import_phase: import     # default; app_pre_install, after probe and
+#                                # before any ensure: the current values of the
+#                                # credentials go into the store, unchanged
+#       # import_phase: finalize # app_post_install, after the Helm upgrades:
+#                                # the local copies of the values are removed
+#
+# The local backend has nothing to import (both phases are no-ops). The
+# openbao adapter does the work once per env (adapters/openbao/import.yaml).
+
+---
+- name: "app_secrets | import | Validate request"
+  ansible.builtin.include_tasks: common/validate.yaml
+  vars:
+    app_secrets_op: import
+
+- name: "app_secrets | import | Run {{ secrets_backend }} adapter"
+  ansible.builtin.include_tasks:
+    file: "adapters/{{ secrets_backend }}/{{ _app_secrets_import_task }}.yaml"
+  vars:
+    _app_secrets_import_task: "{{ 'finalize' if (import_phase | default('import')) in ['finalize'] else 'import' }}"

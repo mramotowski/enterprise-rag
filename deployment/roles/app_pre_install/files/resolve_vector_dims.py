@@ -18,6 +18,7 @@ Outputs a single JSON object to stdout:
 
 import json
 import argparse
+import os
 import sys
 import urllib.request
 import urllib.error
@@ -107,6 +108,16 @@ def main():
         help="HuggingFace API token for accessing gated models (optional)",
     )
     parser.add_argument(
+        "--hf-token-env",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Read the HuggingFace API token from this environment variable "
+            "instead of --hf-token, so it never appears in argv (used by the "
+            "in-cluster Job; an unset or empty variable means no token)"
+        ),
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Skip the HuggingFace Hub API call (useful in air-gapped environments)",
@@ -123,10 +134,14 @@ def main():
 
     args = parser.parse_args()
 
+    hf_token = args.hf_token
+    if args.hf_token_env:
+        hf_token = os.environ.get(args.hf_token_env) or None
+
     vector_dims, source = resolve_vector_dims(
         model_id=args.embedding_model_id,
         offline=args.offline,
-        hf_token=args.hf_token,
+        hf_token=hf_token,
     )
 
     if vector_dims is None:

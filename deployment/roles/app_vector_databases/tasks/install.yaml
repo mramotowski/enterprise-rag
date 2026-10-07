@@ -42,13 +42,13 @@
 - name: "app_vector_databases | Configure Redis-based vector store"
   when: vector_databases_vector_store == 'redis-cluster'
   block:
+    # The port skips the Redis password when REDIS_PASSWORD is already defined.
     - name: "app_vector_databases | Generate password for Redis"
       ansible.builtin.include_role:
-        name: app_generate_password
-        tasks_from: generate_password.yaml
-      loop:
-        - {name: 'REDIS', user: "default"}
-      when: REDIS_PASSWORD is not defined
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [vector-db/redis]
 
     - name: "app_vector_databases | Generate user connection details for Redis vector store"
       ansible.builtin.set_fact:
@@ -63,12 +63,15 @@
             '-headless' + '.' + vector_databases_namespace + '.svc'
           }}
 
+    # Embeds the password: only when this role creates vector-database-config
+    # (the registry template builds it when the port projects the Secret).
     - name: "app_vector_databases | Generate uri connection details for Redis vector store"
       ansible.builtin.set_fact:
         vector_database_connection_host_with_auth: >-
           {{
             "redis://" + vector_database_connection_username + ':' + REDIS_PASSWORD + '@' + vector_database_connection_host  + ':' + vector_database_connection_port
           }}
+      when: not (app_secrets_projected | default(false))
 
 - name: "app_vector_databases | Configure Postgres-like vector store"
   when: vector_databases_vector_store == 'pgvector'
@@ -81,10 +84,10 @@
 
     - name: "app_vector_databases | Generate password"
       ansible.builtin.include_role:
-        name: app_generate_password
-        tasks_from: generate_password.yaml
-      loop:
-        - {name: 'POSTGRES', user: "{{ vector_database_connection_username }}"}
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [vector-db/pgvector]
 
     - name: "app_vector_databases | Generate host connection details for vector store"
       ansible.builtin.set_fact:
@@ -99,6 +102,7 @@
           {{
             "postgresql://" + vector_database_connection_username + ':' + POSTGRES_PASSWORD + '@' + vector_database_connection_host  + ':' + vector_database_connection_port + '/' + vector_database_name
           }}
+      when: not (app_secrets_projected | default(false))
 
 - name: "app_vector_databases | Configure Mssql-like vector store"
   when: vector_databases_vector_store == 'mssql'
@@ -139,10 +143,10 @@
 
     - name: "app_vector_databases | Generate password"
       ansible.builtin.include_role:
-        name: app_generate_password
-        tasks_from: generate_password.yaml
-      loop:
-        - {name: 'MSSQL', user: "default"}
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secret_ids: [vector-db/mssql]
 
     - name: "app_vector_databases | Generate user connection details for vector store"
       ansible.builtin.set_fact:
@@ -163,7 +167,10 @@
           {{
             "SERVER=" + vector_database_connection_host + ';DATABASE=' + vector_database_name + ';UID=' + vector_database_connection_username + ';PWD=' + MSSQL_PASSWORD + ';'
           }}
+      when: not (app_secrets_projected | default(false))
 
+# vector-database-config: created here in local mode; with projected Secrets
+# the port's ensure above already rendered it (registry secrets:).
 - name: "app_vector_databases | Create namespace list for creating vector db connection details"
   ansible.builtin.set_fact:
     vector_db_connection_detail_namespaces: >-
@@ -201,7 +208,9 @@
         REDIS_PORT: "{{ vector_database_connection_port | b64encode }}"
         REDIS_USERNAME: "{{ vector_database_connection_username | b64encode }}"
         REDIS_PASSWORD: '{{ REDIS_PASSWORD | b64encode }}'
-  when: vector_databases_vector_store == 'redis-cluster'
+  when:
+    - vector_databases_vector_store == 'redis-cluster'
+    - not (app_secrets_projected | default(false))
   no_log: "{{ secure_logs }}"
   loop: "{{ vector_db_connection_detail_namespaces | flatten }}"
 
@@ -222,7 +231,9 @@
         POSTGRES_USERNAME: "{{ vector_database_connection_username | b64encode }}"
         POSTGRES_PASSWORD: '{{ POSTGRES_PASSWORD | b64encode }}'
         POSTGRES_DB: '{{ vector_database_name | b64encode }}'
-  when: vector_databases_vector_store == 'pgvector'
+  when:
+    - vector_databases_vector_store == 'pgvector'
+    - not (app_secrets_projected | default(false))
   no_log: "{{ secure_logs }}"
   loop: "{{ vector_db_connection_detail_namespaces | flatten }}"
 
@@ -243,7 +254,9 @@
         MSSQL_USER: "{{ vector_database_connection_username | b64encode }}"
         MSSQL_PASSWORD: '{{ MSSQL_PASSWORD | b64encode }}'
         MSSQL_DB: '{{ vector_database_name | b64encode }}'
-  when: vector_databases_vector_store == 'mssql'
+  when:
+    - vector_databases_vector_store == 'mssql'
+    - not (app_secrets_projected | default(false))
   no_log: "{{ secure_logs }}"
   loop: "{{ vector_db_connection_detail_namespaces | flatten }}"
 
@@ -277,33 +290,27 @@
 
 - name: "app_vector_databases | Mark secret for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-      namespace: "{{ vector_databases_namespace }}"
-      secret_name: "redis-cluster-secret"
-      password_mappings:
-        - {key: REDIS_PASSWORD, variable: REDIS_PASSWORD, user: "default"}
+    secret_ids: [vector-db/redis]
+    ensure_phase: after_deploy
   when: vector_databases_vector_store in ['redis-cluster']
 
 - name: "app_vector_databases | Mark secret for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-      namespace: "{{ vector_databases_namespace }}"
-      secret_name: "pgvector-secret"
-      password_mappings:
-        - {key: POSTGRES_PASSWORD, variable: POSTGRES_PASSWORD, user: "{{ vector_database_connection_username }}"}
+    secret_ids: [vector-db/pgvector]
+    ensure_phase: after_deploy
   when: vector_databases_vector_store == 'pgvector'
 
 - name: "app_vector_databases | Mark secret for password management"
   ansible.builtin.include_role:
-    name: app_password_mgmt
-    tasks_from: markup.yaml
+    name: app_secrets
+    tasks_from: ensure.yaml
   vars:
-      namespace: "{{ vector_databases_namespace }}"
-      secret_name: "mssql-secret"
-      password_mappings:
-        - {key: MSSQL_PASSWORD, variable: MSSQL_PASSWORD, user: "{{ vector_database_connection_username }}"}
+    secret_ids: [vector-db/mssql]
+    ensure_phase: after_deploy
   when: vector_databases_vector_store == 'mssql'

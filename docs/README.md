@@ -31,6 +31,7 @@ Install the layer, pick a pipeline, and take it onto a partner platform.
 | Guide | What it covers |
 |-------|----------------|
 | [Deploy the RAG Layer](deploy/install_rag.md) | Step-by-step install, endpoints, credentials, and teardown |
+| [Credentials in OpenBao](deploy/openbao.md) | `secrets_backend: openbao`: path layout, first-login retrieval, operator-supplied secrets, migration, rotation, teardown |
 | [Pipelines](deploy/pipelines.md) | The five flavours, ChatQnA variants, and how to switch between them |
 | [Deploy on VMware](deploy/vmware.md) | Running the chatbot on VMware vSphere |
 | [Deployment Layer Reference](../deployment/README.md) | What the `deployment/` plug-in contributes and how the installer consumes it |

@@ -1,0 +1,60 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter: status. Sets app_secrets_status = {<id>: {exists, mechanism,
+# tracked}} and never a value.
+#   file_password / file_key: every legacy file_var line (<NAME>_PASSWORD or the
+#                             key line) is present in the password file; the
+#                             <NAME>_USERNAME lines are not checked
+#   user_supplied:            any config var in its user_supplied map is non-empty
+#   role_managed:             not tracked locally (the owning role keeps it in
+#                             its k8s Secret); exists is false, tracked false
+
+---
+- name: "app_secrets | status | Map file credentials"
+  ansible.builtin.include_tasks: file_items.yaml
+  vars:
+    app_secrets_op: status
+
+- name: "app_secrets | status | Check password file lines"
+  ansible.builtin.command:
+    argv: ["grep", "-q", "-e", "^{{ item.file_var }}:", "--", "{{ app_secrets_local_password_file_path }}"]
+  register: _app_secrets_file_checks
+  loop: "{{ app_secrets_local_file_items }}"
+  loop_control:
+    label: "{{ item.id }} {{ item.file_var }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "app_secrets | status | Set credential status"
+  ansible.builtin.set_fact:
+    app_secrets_status: "{{ _status }}"
+  vars:
+    _status: >-
+      {%- set out = {} -%}
+      {%- for cid in app_secrets_selected_ids -%}
+        {%- set e = app_secrets_catalog[cid] -%}
+        {%- set m = e.local.mechanism -%}
+        {%- if m in ['file_password', 'file_key'] -%}
+          {%- set checks = _app_secrets_file_checks.results | selectattr('item.id', 'equalto', cid) | list -%}
+          {%- set exists = (checks | length > 0) and (checks | rejectattr('rc', 'equalto', 0) | list | length == 0) -%}
+          {%- set _ = out.update({cid: {'exists': exists, 'mechanism': m, 'tracked': true}}) -%}
+        {%- elif m == 'user_supplied' -%}
+          {%- set ns = namespace(found=false) -%}
+          {%- for k in e.user_supplied | default({}) | dict2items | map(attribute='value') | flatten -%}
+            {%- if (lookup('ansible.builtin.vars', k, default='') | default('', true) | string | length) > 0 -%}
+              {%- set ns.found = true -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set _ = out.update({cid: {'exists': ns.found, 'mechanism': m, 'tracked': true}}) -%}
+        {%- else -%}
+          {%- set _ = out.update({cid: {'exists': false, 'mechanism': m, 'tracked': false}}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true
+
+- name: "app_secrets | status | Report credential status"
+  ansible.builtin.debug:
+    var: app_secrets_status

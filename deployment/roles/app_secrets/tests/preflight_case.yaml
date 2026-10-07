@@ -1,0 +1,32 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Inner playbook of test_preflight.yaml (run by it, never alone): one case of
+# the real app_pre_install solution_config.yaml (preflight port op, then the
+# HF_TOKEN fallback) with the case's config as extra vars and its environment
+# variables set by the caller. Writes {issues, hugging_token_set, projected}
+# to the file in -e out=<path>; never prints a value.
+
+---
+- name: "app_secrets | test | preflight case"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    base_domain_name: example.test
+    env_name: t1
+    secure_logs: true
+  tasks:
+    - name: "app_secrets | test | preflight | Run solution_config.yaml"
+      ansible.builtin.include_role:
+        name: app_pre_install
+        tasks_from: solution_config.yaml
+
+    - name: "app_secrets | test | preflight | Record the result"
+      ansible.builtin.copy:
+        dest: "{{ out }}"
+        mode: "0600"
+        content: >-
+          {{ {'issues': configuration_issues,
+              'hugging_token_set': (hugging_token | default('') | length > 0),
+              'projected': app_secrets_projected | default('undefined')} | to_json }}
+      no_log: true

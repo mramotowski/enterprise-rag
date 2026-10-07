@@ -142,6 +142,17 @@ minutes the replay takes. After the replay, an account that existed at backup ti
 created after the backup is not. A `post_restore` hook rolls the identity service so it stops answering
 from its own cache of the pre-restore realm.
 
+## Credentials with OpenBao
+
+With `secrets_backend: openbao` and the in-cluster OpenBao, the credentials of the restored
+databases live in OpenBao, not in Secrets of this profile's namespaces. The profile therefore
+starts with namespace `openbao-backup`. Before the backup, a hook saves an OpenBao Raft snapshot
+there. After the restore, the first hook restores that snapshot and force-syncs the projected
+Secrets, so the credentials match the restored volumes. The snapshot covers the whole OpenBao: a
+restore rolls back the paths of **every** layer, and it needs the unseal shares of the OpenBao that
+took it, which no backup contains. With an external OpenBao the hooks do nothing, and backing it up
+is up to you. See [Credentials in OpenBao - Backup and restore](../deploy/openbao.md#backup-and-restore).
+
 ## The vector store after a restore
 
 A restore recreates the vector database's StatefulSet pods, and Kubernetes gives them new IPs —

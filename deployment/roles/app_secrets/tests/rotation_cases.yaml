@@ -1,0 +1,412 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Inner playbook of test_rotation.yaml (run by it, never alone): app_secrets
+# rotate against real OpenBao and Postgres and the fake Redis / Keycloak. No task
+# here may print a value: value checks run in the harness, which prints only
+# ok/mismatch/denied, versions or counts.
+#
+# Environment (set by test_rotation.yaml): FAKE_OPENBAO_DIR, FAKE_K8S_STATE,
+# FAKE_K8S_ON_APPLY, FAKE_OPENBAO_ADDR, FAKE_ENDPOINTS, OUT_DIR.
+
+---
+- name: "app_secrets | test | rotation cases"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    env_name: t1
+    openbao_kv_mount: intel-ai
+    eso_refresh_interval: 1h
+    secure_logs: true
+    mcp_enabled: true
+    out_dir: "{{ lookup('ansible.builtin.env', 'OUT_DIR') }}"
+    test_addr: "{{ lookup('ansible.builtin.env', 'FAKE_OPENBAO_ADDR') }}"
+    obdir: "{{ lookup('ansible.builtin.env', 'FAKE_OPENBAO_DIR') }}"
+    state_file: "{{ lookup('ansible.builtin.env', 'FAKE_K8S_STATE') }}"
+    harness: "{{ ansible_playbook_python }} {{ playbook_dir }}/files/fake_openbao_cluster.py"
+    app_secrets_worker_poll_delay: 1
+    app_secrets_worker_timeout: 60
+    app_secrets_eso_wait_retries: 3
+    app_secrets_eso_wait_delay: 1
+    app_secrets_rotate_sync_retries: 3
+    app_secrets_rotate_sync_delay: 1
+    app_secrets_rotate_rollout_delay: 1
+    _st: "{{ lookup('ansible.builtin.file', state_file) | from_json }}"
+    _runs: "{{ (_st['FakeJobRuns//all'] | default({'names': []})).names }}"
+    kc_ids: [keycloak/erag-admin, keycloak/erag-user, keycloak/erag-maintainer, keycloak/mcp-client]
+    fp: t1/erag/fingerprint/postgres
+    rd: t1/erag/edp/redis
+    mc: t1/erag/keycloak/mcp-client
+    hf: t1/erag/user/hf-token
+    rcases: {}
+    _ready: {observedGeneration: 1, replicas: 1, updatedReplicas: 1, availableReplicas: 1, readyReplicas: 1}
+  tasks:
+    - name: "app_secrets | test | rotation | Create the output dir"
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: "app_secrets | test | rotation | Seed the platform side, the namespaces and the consumers"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: "{{ _seed | combine(_namespaces, _workloads) | to_json }}"
+      vars:
+        _ca: "{{ lookup('ansible.builtin.file', obdir ~ '/ca.crt') }}\n"
+        _seed:
+          "Namespace//openbao": {apiVersion: v1, kind: Namespace, metadata: {name: openbao}}
+          "ConfigMap/openbao/openbao-ca-bundle": {apiVersion: v1, kind: ConfigMap, metadata: {name: openbao-ca-bundle, namespace: openbao}, data: {ca.crt: "{{ _ca }}"}}
+          "ConfigMap/erag-secrets/kube-root-ca.crt": {apiVersion: v1, kind: ConfigMap, metadata: {name: kube-root-ca.crt, namespace: erag-secrets}, data: {ca.crt: "{{ _ca }}"}}
+          "ClusterSecretStore//openbao-erag":
+            apiVersion: external-secrets.io/v1
+            kind: ClusterSecretStore
+            metadata: {name: openbao-erag}
+            spec:
+              conditions:
+                - namespaceSelector: {matchLabels: {secrets.ai-solutions/erag: "true"}}
+            status:
+              conditions: [{type: Ready, status: "True", reason: Valid, message: "store validated"}]
+        _namespaces: >-
+          {%- set out = {} -%}
+          {%- for ns in ['keycloak', 'system', 'fingerprint', 'chat-history', 'edp'] -%}
+            {%- set _ = out.update({'Namespace//' ~ ns: {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': ns}}}) -%}
+          {%- endfor -%}
+          {{ out }}
+        # Deployed consumers (edp-flower, chat-history-mongodb-ferretdb and the
+        # edp vector-db readers are not: they are skipped).
+        _workloads: >-
+          {%- set out = {} -%}
+          {%- for ns, name in [['fingerprint', 'fingerprint-svc'], ['system', 'gmc-controller'], ['chat-history', 'chat-history-svc'],
+                                ['edp', 'edp-backend'], ['edp', 'edp-celery']] -%}
+            {%- set _ = out.update({'Deployment/' ~ ns ~ '/' ~ name: {'apiVersion': 'apps/v1', 'kind': 'Deployment',
+                  'metadata': {'name': name, 'namespace': ns, 'generation': 1},
+                  'spec': {'replicas': 1, 'template': {'metadata': {'labels': {'app': name}}}}, 'status': _ready}}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # --- the deployment before the rotation ----------------------------------------------
+
+    - name: "app_secrets | test | rotation | Ensure the credentials and their ExternalSecrets"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secrets_backend: openbao
+        secret_ids: "{{ [fp, rd, 't1/erag/chat-history/postgres'] | map('regex_replace', '^t1/erag/', '') | list + kc_ids }}"
+        app_secrets_openbao_address: "{{ test_addr }}"
+
+    - name: "app_secrets | test | rotation | The operator writes the HF token"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['put-random', obdir, hf, 'token'] }}"
+      changed_when: true
+
+    - name: "app_secrets | test | rotation | Ensure the HF token projections"
+      ansible.builtin.include_role:
+        name: app_secrets
+        tasks_from: ensure.yaml
+      vars:
+        secrets_backend: openbao
+        secret_ids: [user/hf-token]
+        app_secrets_openbao_address: "{{ test_addr }}"
+
+    - name: "app_secrets | test | rotation | Set the servers up with the current values"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item }}"
+      loop:
+        # chat_history gets no role: its rotation fails the precheck.
+        - [pg-user, "{{ obdir }}", fingerprint, system_fingerprint, "{{ fp }}", password]
+        - [redis-user, "{{ obdir }}", default, "{{ rd }}", password]
+        - [kc-admin, "{{ obdir }}", "{{ state_file }}", keycloak, keycloak-admin-secret]
+        - [kc-client, "{{ obdir }}", EnterpriseRAG, mcp-client, "{{ mc }}", client_secret]
+      register: _setup
+      changed_when: true
+      failed_when: _setup.rc != 0 or (_setup.stdout | length > 0 and _setup.stdout != 'rc=0')
+
+    # --- the cases -----------------------------------------------------------------------
+
+    - name: "app_secrets | test | rotation | Run the cases"
+      ansible.builtin.include_tasks: rotation_case.yaml
+      loop:
+        - {name: none, ids: [nats/auth]}
+        - {name: mixed, ids: [fingerprint/postgres, nats/auth]}
+        - {name: postgres, ids: [fingerprint/postgres]}
+        - {name: precheck, ids: [chat-history/postgres]}
+        - {name: redis, ids: [edp/redis]}
+        - {name: redis-rollback, ids: [edp/redis], inject: {redis_acl_fail: 1}}
+        - {name: keycloak, ids: [keycloak/mcp-client]}
+        - {name: keycloak-put-fails, ids: [keycloak/mcp-client], inject: {kc_put_fail: 1}}
+        - {name: keycloak-readback, ids: [keycloak/mcp-client], inject: {kc_readback_wrong: 1}}
+        - {name: operator-missing, ids: [user/sharepoint]}
+        - {name: rollout-stuck, ids: [fingerprint/postgres], env: {FAKE_ROLLOUT_STUCK: gmc-controller}, timeout: 2}
+        - {name: eso-fails, ids: [edp/redis], env: {FAKE_ESO_FAIL: "1"}}
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: "app_secrets | test | rotation | The operator writes a new HF token version"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + ['put-random', obdir, hf, 'token'] }}"
+      changed_when: true
+
+    - name: "app_secrets | test | rotation | Run the operator-write case"
+      ansible.builtin.include_tasks: rotation_case.yaml
+      vars:
+        case: {name: operator, ids: [user/hf-token]}
+
+    # --- checks (the harness prints ok / denied / mismatch / numbers only) ----------------
+
+    - name: "app_secrets | test | rotation | Check the servers, the store and the Secrets"
+      ansible.builtin.command:
+        argv: "{{ harness.split(' ') + item.cmd }}"
+      loop:
+        # postgres: v2 rotated, v3 rotated again (rollout-stuck); the old values no longer log in.
+        - {cmd: [kv-version, "{{ obdir }}", "{{ fp }}"], want: "3"}
+        - {cmd: [pg-login, "{{ obdir }}", fingerprint, system_fingerprint, "{{ fp }}", password, "3"], want: ok}
+        - {cmd: [pg-login, "{{ obdir }}", fingerprint, system_fingerprint, "{{ fp }}", password, "2"], want: denied}
+        - {cmd: [pg-login, "{{ obdir }}", fingerprint, system_fingerprint, "{{ fp }}", password, "1"], want: denied}
+        - {cmd: [pg-verifier, "{{ obdir }}", fingerprint], want: ok}
+        - {cmd: [kv-key-differs, "{{ obdir }}", "{{ fp }}", password, "1", "2"], want: ok}
+        - {cmd: [secret-equals, "{{ obdir }}", "{{ state_file }}", fingerprint/fingerprint-postgresql-secret, password, "<<{{ fp }}#password>>"], want: ok}
+        - {cmd: [secret-equals, "{{ obdir }}", "{{ state_file }}", system/fingerprint-postgresql-secret, password, "<<{{ fp }}#password>>"], want: ok}
+        # precheck: nothing written.
+        - {cmd: [kv-version, "{{ obdir }}", t1/erag/chat-history/postgres], want: "1"}
+        # redis: v2 rotated; v3 written and v4 restoring v2 (rollback); v5 rotated (ESO then failed).
+        - {cmd: [kv-version, "{{ obdir }}", "{{ rd }}"], want: "5"}
+        - {cmd: [kv-same, "{{ obdir }}", "{{ rd }}", "2", "4"], want: ok}
+        - {cmd: [kv-key-differs, "{{ obdir }}", "{{ rd }}", password, "2", "3"], want: ok}
+        - {cmd: [redis-login, "{{ obdir }}", default, "{{ rd }}", password, "5"], want: ok}
+        - {cmd: [redis-login, "{{ obdir }}", default, "{{ rd }}", password, "2"], want: denied}
+        - {cmd: [fakes-get, "{{ obdir }}", redis.plaintext_rules], want: "0"}
+        # The Secret still holds v4 (= v2): the force-sync of v5 failed (eso-fails).
+        - {cmd: [secret-equals, "{{ obdir }}", "{{ state_file }}", edp/edp-redis-secret, password, "<<{{ rd }}#password>>"], want: mismatch}
+        # keycloak: v2 rotated; v3/v4 put failure; v5/v6 read-back failure (restored).
+        - {cmd: [kv-version, "{{ obdir }}", "{{ mc }}"], want: "6"}
+        - {cmd: [kv-same, "{{ obdir }}", "{{ mc }}", "2", "6"], want: ok}
+        - {cmd: [kv-same, "{{ obdir }}", "{{ mc }}", "2", "4"], want: ok}
+        - {cmd: [kc-secret-is, "{{ obdir }}", EnterpriseRAG, mcp-client, "{{ mc }}", client_secret], want: ok}
+        - {cmd: [kc-secret-is, "{{ obdir }}", EnterpriseRAG, mcp-client, "{{ mc }}", client_secret, "1"], want: mismatch}
+        - {cmd: [secret-equals, "{{ obdir }}", "{{ state_file }}", keycloak/erag-credentials, MCP_CLIENT_SECRET, "<<{{ mc }}#client_secret>>"], want: ok}
+        # operator-write: the projection follows the operator's version 2.
+        - {cmd: [kv-version, "{{ obdir }}", "{{ hf }}"], want: "2"}
+        - {cmd: [secret-equals, "{{ obdir }}", "{{ state_file }}", erag-secrets/hf-token, token, "<<{{ hf }}#token>>"], want: ok}
+      loop_control:
+        label: "{{ item.cmd[0] }} {{ item.cmd[2:] | join(' ') }} -> {{ item.want }}"
+      register: _checks
+      changed_when: false
+
+    - name: "app_secrets | test | rotation | The servers, the store and the Secrets are as expected"
+      ansible.builtin.assert:
+        that: _mismatches | length == 0
+        fail_msg: "{{ _mismatches }}"
+        quiet: true
+      vars:
+        _mismatches: >-
+          {%- set out = [] -%}
+          {%- for r in _checks.results if r.stdout != r.item.want -%}
+            {%- set _ = out.append(r.item.cmd[0] ~ ' ' ~ (r.item.cmd[2:] | join(' ')) ~ ': want ' ~ r.item.want ~ ', got ' ~ r.stdout) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "app_secrets | test | rotation | Each case behaved as specified"
+      ansible.builtin.assert:
+        that:
+          # rotate: none fails with the registry reason, before any Job; so does a mixed list.
+          - not rcases['none'].ok
+          - "'nats/auth: the NATS server and clients read the key only at start' in rcases['none'].msg"
+          - rcases['none'].runs == 0
+          - not rcases['mixed'].ok and rcases['mixed'].runs == 0
+          - "'nothing was changed' in rcases['mixed'].msg"
+          # postgres: rotated, synced, restarted.
+          - rcases['postgres'].ok
+          - rcases['postgres'].results['fingerprint/postgres'].result == 'rotated'
+          - rcases['postgres'].results['fingerprint/postgres'].version == 2
+          - rcases['postgres'].results['fingerprint/postgres'].previous_version == 1
+          - rcases['postgres'].results['fingerprint/postgres'].external_secrets | sort == ['fingerprint/fingerprint-postgresql-secret', 'system/fingerprint-postgresql-secret']
+          - rcases['postgres'].results['fingerprint/postgres'].restarted | sort == ['fingerprint/Deployment/fingerprint-svc', 'system/Deployment/gmc-controller']
+          - rcases['postgres'].runs == 1
+          # precheck: nothing changed.
+          - not rcases['precheck'].ok
+          - "'precheck_failed' in rcases['precheck'].msg and 'nothing changed' in rcases['precheck'].msg"
+          - "'server unchanged' in rcases['precheck'].msg"
+          - "'chat-history-mongodb-postgresql' not in rcases['precheck'].msg"
+          # redis: rotated; edp-flower is not deployed.
+          - rcases['redis'].ok
+          - rcases['redis'].results['edp/redis'].restarted | sort == ['edp/Deployment/edp-backend', 'edp/Deployment/edp-celery']
+          - rcases['redis'].results['edp/redis'].skipped == ['edp/Deployment/edp-flower']
+          - rcases['redis'].results['edp/redis'].external_secrets | sort == ['edp/edp-celery-secrets', 'edp/edp-redis-secret']
+          # redis rollback: the hook failed, the server and the store hold the old value.
+          - not rcases['redis-rollback'].ok
+          - "'rolled_back' in rcases['redis-rollback'].msg and 'server restored' in rcases['redis-rollback'].msg"
+          - "'injected failure' in rcases['redis-rollback'].msg"
+          - "'version 4 restores version 2' in rcases['redis-rollback'].msg"
+          # The rollback force-synced the restored version again.
+          - rcases['redis-rollback'].force_sync['ExternalSecret/edp/edp-redis-secret'] | length > 0
+          - rcases['redis-rollback'].force_sync['ExternalSecret/edp/edp-redis-secret'] != rcases['redis'].force_sync['ExternalSecret/edp/edp-redis-secret']
+          - rcases['keycloak-put-fails'].force_sync['ExternalSecret/keycloak/erag-credentials'] != rcases['keycloak'].force_sync['ExternalSecret/keycloak/erag-credentials']
+          # keycloak: rotated with the temporary Role; nothing to restart.
+          - rcases['keycloak'].ok
+          - rcases['keycloak'].results['keycloak/mcp-client'].restarted == []
+          - rcases['keycloak'].results['keycloak/mcp-client'].external_secrets == ['keycloak/erag-credentials']
+          - not rcases['keycloak-put-fails'].ok and 'rolled_back' in rcases['keycloak-put-fails'].msg
+          - "'injected failure' in rcases['keycloak-put-fails'].msg"
+          - not rcases['keycloak-readback'].ok and 'does not hold the new secret' in rcases['keycloak-readback'].msg
+          - "'server restored' in rcases['keycloak-readback'].msg"
+          # operator-write: no KV write, the projection synced.
+          - rcases['operator'].ok
+          - rcases['operator'].results['user/hf-token'].result == 'operator'
+          - rcases['operator'].results['user/hf-token'].version == 2
+          - rcases['operator'].results['user/hf-token'].restarted == []
+          - not rcases['operator-missing'].ok
+          - "'intel-ai/t1/erag/user/sharepoint does not exist' in rcases['operator-missing'].msg"
+          # A stuck rollout fails after the rotation; an ESO failure before any restart.
+          - not rcases['rollout-stuck'].ok and 'system/Deployment/gmc-controller did not finish' in rcases['rollout-stuck'].msg
+          - not rcases['eso-fails'].ok and 'did not refresh' in rcases['eso-fails'].msg
+          - "'Nothing was restarted' in rcases['eso-fails'].msg"
+        fail_msg: "{{ rcases | dict2items | map(attribute='key') | zip(rcases | dict2items | map(attribute='value.msg')) | map('join', ' => ') | list }}"
+        quiet: true
+
+    - name: "app_secrets | test | rotation | Read the Job runs"
+      ansible.builtin.set_fact:
+        _jobs: "{{ _st['FakeJobRuns//all'].jobs }}"
+        _rbac: "{{ _st['FakeJobRuns//all'].rbac }}"
+        _cms: "{{ _st['FakeJobRuns//all'].configmaps }}"
+        _api: "{{ (_st['FakeKubeApi//requests'] | default({}))['items'] | default([]) }}"
+
+    - name: "app_secrets | test | rotation | The rotator Jobs are shaped as specified"
+      ansible.builtin.assert:
+        that:
+          # Every rotator runs under the worker ServiceAccount as the worker role.
+          - _rotators | length >= 10
+          - _rotators | map('extract', _jobs) | map(attribute='spec.template.spec.serviceAccountName') | unique == ['erag-secrets-worker']
+          # Only the Keycloak runs get the API token, and only then does the Role exist.
+          - _kc_runs | length == 3
+          - _kc_runs | map('extract', _jobs) | map(attribute='spec.template.spec.containers.0.env') | flatten
+            | selectattr('name', 'equalto', 'KUBE_TOKEN_FILE') | list | length == 3
+          - _other_runs | map('extract', _jobs) | map(attribute='spec.template.spec.containers.0.env') | flatten
+            | selectattr('name', 'equalto', 'KUBE_TOKEN_FILE') | list | length == 0
+          - _kc_runs | map('extract', _rbac) | map('dict2items') | map('map', attribute='key') | map('list')
+            | map('sort') | unique == [['Role/keycloak/erag-secrets-rotator', 'RoleBinding/keycloak/erag-secrets-rotator']]
+          - _other_runs | map('extract', _rbac) | map('length') | unique == [0]
+          # The admin Secret was the only Secret the rotator read; nothing is left behind.
+          - _api | map(attribute='name') | unique == ['keycloak-admin-secret']
+          - _api | map(attribute='allowed') | unique == [true]
+          - _st.keys() | select('match', '^(Role|RoleBinding)/') | list == []
+          # The plans hold the hook target, never a value.
+          - "(_cms[_kc_runs[0]].data['plan.json'] | from_json).target == {'realm': 'EnterpriseRAG', 'client_id': 'mcp-client'}"
+      vars:
+        _rotators: "{{ _jobs.keys() | select('match', '^erag-secrets-rotate-') | list }}"
+        _kc_runs: >-
+          {%- set out = [] -%}
+          {%- for name in _rotators if (_cms[name].data['plan.json'] | from_json).hook == 'keycloak-client-secret-set' -%}
+            {%- set _ = out.append(name) -%}
+          {%- endfor -%}
+          {{ out }}
+        _other_runs: "{{ _rotators | difference(_kc_runs) }}"
+
+    - name: "app_secrets | test | rotation | The erag_rotate forms (app_pre_install defaults)"
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../app_pre_install/defaults/main.yaml"
+        name: pre
+
+    - name: "app_secrets | test | rotation | erag_rotate is parsed into ids"
+      ansible.builtin.assert:
+        that:
+          - pre.app_pre_install_rotate_ids == item.ids
+          - pre.app_pre_install_rotate_run | bool == item.run
+        fail_msg: "{{ item }} -> {{ pre.app_pre_install_rotate_ids }}"
+        quiet: true
+      loop:
+        - {value: [], ids: [], run: false}
+        - {value: "", ids: [], run: false}
+        - {value: "[edp/redis]", ids: [edp/redis], run: true}
+        - {value: "[edp/redis, keycloak/mcp-client]", ids: [edp/redis, keycloak/mcp-client], run: true}
+        - {value: '["edp/redis","nats/auth"]', ids: [edp/redis, nats/auth], run: true}
+        - {value: [fingerprint/postgres], ids: [fingerprint/postgres], run: true}
+        - {value: "[]", ids: [], run: true}
+        - {value: "[edp/redis]", ids: [edp/redis], run: false, action: teardown}
+        - {value: "[edp/redis]", ids: [edp/redis], run: false, action: upgrade}
+      vars:
+        erag_rotate: "{{ item.value }}"
+        component_action: "{{ item.action | default('install') }}"
+
+    - name: "app_secrets | test | rotation | The app_pre_install rotate branch"
+      block:
+        - name: "app_secrets | test | rotation | app_pre_install rotate with erag_rotate=[]"
+          ansible.builtin.include_role:
+            name: app_pre_install
+            tasks_from: rotate.yaml
+          vars:
+            erag_rotate: "[]"
+      rescue:
+        - name: "app_secrets | test | rotation | Note the branch failure"
+          ansible.builtin.set_fact:
+            _branch_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "app_secrets | test | rotation | An empty erag_rotate fails; ids reach app_secrets rotate"
+      ansible.builtin.assert:
+        that:
+          - "'names no credential id' in _branch_msg | default('')"
+        fail_msg: "{{ _branch_msg | default('no failure') }}"
+        quiet: true
+
+    - name: "app_secrets | test | rotation | app_pre_install passes the ids to app_secrets rotate"
+      block:
+        - name: "app_secrets | test | rotation | app_pre_install rotate with erag_rotate=[nats/auth]"
+          ansible.builtin.include_role:
+            name: app_pre_install
+            tasks_from: rotate.yaml
+          vars:
+            erag_rotate: "[nats/auth]"
+            secrets_backend: openbao
+            app_secrets_openbao_address: "{{ test_addr }}"
+      rescue:
+        - name: "app_secrets | test | rotation | Note the rotate failure"
+          ansible.builtin.set_fact:
+            _branch_rotate_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "app_secrets | test | rotation | The rotate-only branch reached app_secrets rotate"
+      ansible.builtin.assert:
+        that: "'nats/auth: the NATS server and clients read the key only at start' in _branch_rotate_msg | default('')"
+        quiet: true
+
+    - name: "app_secrets | test | rotation | Evaluate the erag component switches"
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/files/check_components.py", "{{ playbook_dir }}/../../../components.yaml"]
+      register: _switches
+      changed_when: false
+
+    - name: "app_secrets | test | rotation | Read the rotate branch of app_pre_install install.yaml"
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/files/check_components.py", --rotate-branch,
+               "{{ playbook_dir }}/../../app_pre_install/tasks/install.yaml"]
+      register: _branch
+      changed_when: false
+
+    - name: "app_secrets | test | rotation | Every install step after the rotate branch is skipped in a rotate run"
+      ansible.builtin.assert:
+        that:
+          - (_branch.stdout | from_json).branch > 0
+          - (_branch.stdout | from_json).unguarded == []
+        fail_msg: "{{ _branch.stdout }}"
+        quiet: true
+
+    - name: "app_secrets | test | rotation | A rotate run enables only app_pre_install; otherwise nothing changes"
+      ansible.builtin.assert:
+        that:
+          - _sw.rotate == ['app_pre_install']
+          - _sw.rotate_empty_string == _sw.default
+          - _sw.rotate_teardown == _sw.all_names
+          - _sw.all_on == _sw.all_names
+          - _sw.default == ['app_inference_models', 'app_pre_install', 'app_keycloak_config', 'app_apisix', 'app_nats',
+                            'app_fingerprint', 'app_hpa', 'app_pipeline', 'app_watcher', 'app_post_install']
+        fail_msg: "{{ _switches.stdout }}"
+        quiet: true
+      vars:
+        _sw: "{{ _switches.stdout | from_json }}"
+
+    - name: "app_secrets | test | rotation | Write the Job plans (for the leak grep)"
+      ansible.builtin.copy:
+        dest: "{{ out_dir }}/plans.txt"
+        mode: "0600"
+        content: "{{ _cms.values() | map(attribute='data') | map('to_json') | join('\n') }}\n"

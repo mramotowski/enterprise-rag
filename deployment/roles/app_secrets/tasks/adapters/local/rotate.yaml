@@ -1,0 +1,11 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local adapter: rotate is not supported (rotation needs secrets_backend: openbao).
+
+---
+- name: "app_secrets | rotate | Fail for the local backend"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | rotate | rotation requires secrets_backend: openbao
+      (requested: {{ app_secrets_selected_ids | join(', ') }}; current backend: local)

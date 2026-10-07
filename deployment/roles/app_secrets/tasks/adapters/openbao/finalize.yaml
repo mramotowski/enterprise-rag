@@ -1,0 +1,172 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: import with import_phase finalize (AD-12). app_post_install
+# runs it at the end of every openbao install and upgrade, after the Helm
+# upgrades that stopped putting values into the releases. Only when the
+# migration state is imported (import.yaml), in this order:
+#   1. delete default_credentials.yaml and default_credentials.txt and the rag
+#      tmp dir (never read);
+#   2. delete the env logs of the runs before the migration: the *.log files
+#      directly in app_secrets_migration_log_dir whose mtime is older than the
+#      migration start (the log of this run is written right now);
+#   3. prune the history of every erag Helm release: every revision below the
+#      latest that is not deployed (helm history gives the revisions; their
+#      storage Secrets sh.helm.release.v1.<release>.v<revision> are deleted by
+#      name, never read);
+#   4. set the state to done, when every erag release has a deployed revision
+#      newer than the one import recorded (helm_revisions): only then does no
+#      release revision hold a local value. Otherwise the state stays imported
+#      and the run names the releases to upgrade or uninstall.
+# A failure leaves the state imported, so the next run does the rest.
+
+---
+- name: "app_secrets | import | finalize | openbao | Read the migration state"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ app_secrets_migration_configmap }}"
+    namespace: "{{ app_secrets_worker_namespace }}"
+  register: _app_secrets_migration
+  no_log: true
+
+- name: "app_secrets | import | finalize | openbao | Note the migration state"
+  ansible.builtin.set_fact:
+    _app_secrets_migration_data: "{{ (_app_secrets_migration.resources | default([]) | first | default({})).data | default({}, true) }}"
+
+- name: "app_secrets | import | finalize | openbao | Nothing to finalize"
+  ansible.builtin.debug:
+    msg: >-
+      app_secrets | import | finalize | migration state
+      '{{ _app_secrets_migration_data.state | default('none') }}': nothing to scrub
+  when: _app_secrets_migration_data.state | default('') != 'imported'
+
+- name: "app_secrets | import | finalize | openbao | Scrub the local credentials"
+  when: _app_secrets_migration_data.state | default('') == 'imported'
+  block:
+    - name: "app_secrets | import | finalize | openbao | Delete the local credential files and the rag tmp dir"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ app_secrets_local_password_file | trim }}"
+        - "{{ app_secrets_local_txt_file | trim }}"
+        - "{{ app_secrets_migration_tmp_dir | trim }}"
+
+    - name: "app_secrets | import | finalize | openbao | Find the env logs from before the migration"
+      ansible.builtin.find:
+        paths: "{{ app_secrets_migration_log_dir }}"
+        patterns: ["*.log"]
+        file_type: file
+        recurse: false
+        age: "{{ _app_secrets_migration_age }}s"
+      register: _app_secrets_old_logs
+      # A start in the future (another controller's clock) would match the
+      # current run's log too: skipped then.
+      when:
+        - app_secrets_migration_log_dir | length > 0
+        - (_app_secrets_migration_age | int) > 0
+      vars:
+        _app_secrets_migration_age: >-
+          {{ (now(utc=true).replace(tzinfo=none)
+              - (_app_secrets_migration_data.started | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() | int }}
+
+    - name: "app_secrets | import | finalize | openbao | Delete the env logs from before the migration"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _app_secrets_old_logs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: "app_secrets | import | finalize | openbao | List the erag Helm releases"
+      ansible.builtin.include_tasks: helm_releases.yaml
+      vars:
+        app_secrets_op: import
+
+    - name: "app_secrets | import | finalize | openbao | Read the release histories"
+      ansible.builtin.command:
+        argv: [helm, history, "{{ item.name }}", --namespace, "{{ item.namespace }}", --max, "1000", --output, json]
+      loop: "{{ _app_secrets_erag_releases }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }}"
+      register: _app_secrets_helm_history
+      changed_when: false
+
+    - name: "app_secrets | import | finalize | openbao | Delete the older release revisions"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "sh.helm.release.v1.{{ item.name }}.v{{ item.revision }}"
+        namespace: "{{ item.namespace }}"
+      loop: "{{ _old }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }} revision {{ item.revision }}"
+      vars:
+        # The latest revision and every deployed one stay (a failed latest
+        # upgrade must keep the revision Helm rolls back to).
+        _old: >-
+          {%- set out = [] -%}
+          {%- for h in _app_secrets_helm_history.results -%}
+            {%- set hist = h.stdout | from_json -%}
+            {%- set top = hist | map(attribute='revision') | map('int') | max -%}
+            {%- for r in hist if (r.revision | int) < top and r.status | default('') != 'deployed' -%}
+              {%- set _ = out.append({'name': h.item.name, 'namespace': h.item.namespace, 'revision': r.revision | int}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+      no_log: true
+
+    # An erag release whose only deployed revisions date from before the
+    # migration still holds local values in Helm storage.
+    - name: "app_secrets | import | finalize | openbao | Find the erag releases not upgraded since the import"
+      ansible.builtin.set_fact:
+        _app_secrets_stale_releases: >-
+          {%- set out = [] -%}
+          {%- for h in _app_secrets_helm_history.results -%}
+            {%- set before = _recorded[h.item.namespace ~ '/' ~ h.item.name] | default(0) | int -%}
+            {%- if h.stdout | from_json | selectattr('status', 'equalto', 'deployed')
+                   | map(attribute='revision') | map('int') | select('gt', before) | list | length == 0 -%}
+              {%- set _ = out.append(h.item.namespace ~ '/' ~ h.item.name) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      vars:
+        # "<namespace>/<release>=<revision>,..." (import.yaml); "-" = none.
+        _recorded: >-
+          {%- set out = {} -%}
+          {%- for pair in (_app_secrets_migration_data.helm_revisions | default('-', true)).split(',') if '=' in pair -%}
+            {%- set _ = out.update({pair.split('=')[0]: pair.split('=')[1] | int}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "app_secrets | import | finalize | openbao | Record the migration as done"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ app_secrets_migration_configmap }}"
+            namespace: "{{ app_secrets_worker_namespace }}"
+          data:
+            state: done
+            finished: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+      when: _app_secrets_stale_releases | length == 0
+
+    - name: "app_secrets | import | finalize | openbao | Report"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Migration finalized' if _app_secrets_stale_releases | length == 0 else 'Migration not finalized yet' }}:
+          removed the local credential files, the rag tmp dir,
+          {{ _app_secrets_old_logs.files | default([]) | length }} env log(s) from before the migration
+          and the older revisions of {{ _app_secrets_erag_releases | length }} erag Helm release(s).
+          {{ 'Credentials are now read from OpenBao only (bao kv get).' if _app_secrets_stale_releases | length == 0
+             else 'WARNING: ' ~ (_app_secrets_stale_releases | join(', ')) ~ ' have no deployed revision from after the
+             migration, so their current revision still holds local credential values in Helm storage. Upgrade
+             (install this layer again) or uninstall them; the next run finishes the migration. If a release\'s
+             last revision is failed (helm -n <namespace> history <name>), a reinstall with unchanged chart and
+             values may not deploy it again: helm -n <namespace> rollback <name> <revision> creates a new
+             deployed revision (choose the last revision from after the migration), then run install erag
+             again.' }}

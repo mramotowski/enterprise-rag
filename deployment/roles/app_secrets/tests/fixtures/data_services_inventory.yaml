@@ -1,0 +1,204 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Scenarios of tests/test_data_services.yaml: one host per role values
+# template, vector store engine and EDP storage type.
+#   settings      config of the scenario; loaded after the role defaults, so
+#                 it overrides them as config.erag.yaml would
+#   creds         the credential facts the role has in local mode, set to
+#                 placeholders <<<cid>/<path>#<kv_key>>> (the OpenBao entry the
+#                 projected value comes from; the openbao test substitutes the
+#                 stored values)
+#   secret_ids    the credential IDs the roles ensure in this scenario
+#   projected_secrets  Secrets the chart must not template when projected
+#   role_secrets  the Secrets the role itself creates in local mode (not its
+#                 chart), as its tasks build them today
+
+all:
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  children:
+    vector_databases:
+      vars:
+        values_role: app_vector_databases
+        chart: vector_databases
+        release: vdb
+        release_namespace: vdb
+      hosts:
+        vdb-redis:
+          settings: &common
+            tag: "1.2.3"
+            registry: registry.example/erag
+            pipeline_namespace: chatqna
+            gmc_namespace: system
+            vector_databases_namespace: vdb
+            edp_namespace: edp
+            edp_seaweedfs_namespace: seaweedfs
+            keycloak_namespace: keycloak
+            base_domain_name: erag.example
+            minimal_configuration: false
+            apisix_enabled: false
+            edp_enabled: true
+            vector_databases_vector_store: redis-cluster
+          secret_ids: [vector-db/redis]
+          creds:
+            REDIS_PASSWORD: "<<t1/erag/vector-db/redis#password>>"
+          projected_secrets: [vdb/redis-cluster-secret]
+          role_secrets:
+            chatqna/vector-database-config: &vdb_redis_config
+              VECTOR_STORE: redis-cluster
+              REDIS_URL: "redis://default:<<t1/erag/vector-db/redis#password>>@vdb-redis-cluster-headless.vdb.svc:6379"
+              REDIS_HOST: vdb-redis-cluster-headless.vdb.svc
+              REDIS_PORT: "6379"
+              REDIS_USERNAME: default
+              REDIS_PASSWORD: "<<t1/erag/vector-db/redis#password>>"
+            edp/vector-database-config: *vdb_redis_config
+        vdb-pgvector:
+          settings:
+            <<: *common
+            vector_databases_vector_store: pgvector
+            # Set by the role before its values template.
+            vector_database_connection_username: edp
+            vector_database_name: vdb
+          secret_ids: [vector-db/pgvector]
+          creds:
+            POSTGRES_PASSWORD: "<<t1/erag/vector-db/pgvector#password>>"
+          projected_secrets: [vdb/pgvector-secret]
+          role_secrets:
+            chatqna/vector-database-config: &vdb_pgvector_config
+              VECTOR_STORE: pgvector
+              POSTGRES_URL: "postgresql://edp:<<t1/erag/vector-db/pgvector#password>>@pgvector.vdb.svc:5432/vdb"
+              POSTGRES_HOST: pgvector.vdb.svc
+              POSTGRES_PORT: "5432"
+              POSTGRES_USERNAME: edp
+              POSTGRES_PASSWORD: "<<t1/erag/vector-db/pgvector#password>>"
+              POSTGRES_DB: vdb
+            edp/vector-database-config: *vdb_pgvector_config
+        vdb-mssql:
+          settings:
+            <<: *common
+            vector_databases_vector_store: mssql
+            vector_database_connection_username: edp
+            vector_database_name: vdb
+            mssql_eula_accept: "Y"
+          secret_ids: [vector-db/mssql]
+          creds:
+            MSSQL_PASSWORD: "<<t1/erag/vector-db/mssql#password>>"
+          projected_secrets: [vdb/mssql-secret]
+          role_secrets:
+            chatqna/vector-database-config: &vdb_mssql_config
+              VECTOR_STORE: mssql
+              MSSQL_URL: "SERVER=mssql.vdb.svc;DATABASE=vdb;UID=edp;PWD=<<t1/erag/vector-db/mssql#password>>;"
+              MSSQL_HOST: mssql.vdb.svc
+              MSSQL_PORT: "1433"
+              MSSQL_USER: edp
+              MSSQL_PASSWORD: "<<t1/erag/vector-db/mssql#password>>"
+              MSSQL_DB: vdb
+            edp/vector-database-config: *vdb_mssql_config
+    chat_history:
+      hosts:
+        chat-history:
+          values_role: app_chat_history
+          chart: chat_history
+          release: chat-history
+          release_namespace: chat-history
+          settings: *common
+          secret_ids: [chat-history/postgres]
+          creds:
+            CHAT_HISTORY_POSTGRES_PASSWORD: "<<t1/erag/chat-history/postgres#password>>"
+          projected_secrets: []
+          role_secrets:
+            chat-history/mongo-database-secret:
+              POSTGRES_PASSWORD: "<<t1/erag/chat-history/postgres#password>>"
+              POSTGRES_USER: chat_history
+              POSTGRES_DB: postgres
+    fingerprint_nats:
+      hosts:
+        # No values template or chart change; only the Secrets the roles create.
+        fingerprint-nats:
+          values_role: ""
+          settings: *common
+          secret_ids: [fingerprint/postgres, nats/auth]
+          creds: {}
+          projected_secrets: []
+          role_secrets:
+            fingerprint/fingerprint-postgresql-secret: {password: "<<t1/erag/fingerprint/postgres#password>>"}
+            system/fingerprint-postgresql-secret: {password: "<<t1/erag/fingerprint/postgres#password>>"}
+            nats/nats-auth: {user.nk: "<<t1/erag/nats/auth#seed>>", user.pub: "<<t1/erag/nats/auth#public_key>>"}
+            system/nats-auth: {user.nk: "<<t1/erag/nats/auth#seed>>"}
+            chatqna/nats-auth: {user.nk: "<<t1/erag/nats/auth#seed>>"}
+    edp:
+      vars:
+        values_role: app_edp
+        chart: edp
+        release: edp
+        release_namespace: edp
+        edp_projected_secrets: [edp/edp-access-secret, edp/edp-postgresql-secret, edp/edp-redis-secret, edp/edp-celery-secrets]
+        edp_creds: &edp_creds
+          EDP_MINIO_ACCESS_KEY: "<<t1/erag/edp/object-store#access_key>>"
+          EDP_MINIO_SECRET_KEY: "<<t1/erag/edp/object-store#secret_key>>"
+          edp_client_secret_id: "<<t1/erag/keycloak/edp-oidc#client_secret>>"
+          EDP_REDIS_PASSWORD: "<<t1/erag/edp/redis#password>>"
+          EDP_POSTGRESQL_PASSWORD: "<<t1/erag/edp/postgresql#password>>"
+          EDP_POSTGRESQL_ADMIN_PASSWORD: "<<t1/erag/edp/postgresql#admin_password>>"
+      hosts:
+        edp-seaweedfs:
+          settings: &edp_common
+            <<: *common
+            embedding_model_name: nomic-embed
+            vector_databases_vector_dims: 768
+            vector_databases_vector_datatype: FLOAT32
+            edp_storage_type: seaweedfs
+          # keycloak/edp-oidc: app_keycloak_config ensures it before the
+          # configurator, and app_edp ensures it again ("Project the minio OIDC
+          # client secret"), which renders the EDP Secrets that read it.
+          secret_ids: [edp/object-store, edp/redis, edp/postgresql, seaweedfs/admin, keycloak/edp-oidc]
+          creds: *edp_creds
+          projected_secrets: "{{ edp_projected_secrets }}"
+          role_secrets:
+            seaweedfs/seaweedfs-admin-secret: {adminUser: admin, adminPassword: "<<t1/erag/seaweedfs/admin#password>>"}
+            # seaweedfs-s3-secret is added by the playbook (s3_auth_config | to_json).
+        edp-seaweedfs-path-sharepoint:
+          settings:
+            <<: *edp_common
+            routing_mode: path
+            edp_s3_path_prefix: /s3
+            edp_seaweedfs_path_prefix: /seaweedfs
+            erag_keycloak_oidc_tenant_id: tenant-1
+            erag_keycloak_oidc_client_id: sp-client
+            erag_keycloak_oidc_alias: corp-sso
+            erag_keycloak_oidc_endpoint: https://login.example/tenant-1
+          secret_ids: [edp/object-store, edp/redis, edp/postgresql, user/sharepoint, keycloak/edp-oidc]
+          creds:
+            <<: *edp_creds
+            erag_keycloak_oidc_client_secret: "<<t1/erag/user/sharepoint#client_secret>>"
+          projected_secrets: "{{ edp_projected_secrets }}"
+          role_secrets: {}
+        edp-s3:
+          settings:
+            <<: *edp_common
+            edp_storage_type: s3
+            edp_s3_region: eu-west-1
+            edp_s3_sqs_event_queue_url: https://sqs.eu-west-1.amazonaws.com/123/events
+          secret_ids: [edp/object-store, edp/redis, edp/postgresql, user/edp-s3]
+          creds:
+            <<: *edp_creds
+            edp_s3_access_key_id: "<<t1/erag/user/edp-s3#access_key_id>>"
+            edp_s3_secret_access_key: "<<t1/erag/user/edp-s3#secret_access_key>>"
+          projected_secrets: "{{ edp_projected_secrets + ['edp/edp-aws-access-secrets'] }}"
+          role_secrets: {}
+        edp-s3compatible:
+          settings:
+            <<: *edp_common
+            edp_storage_type: s3compatible
+            edp_s3_compatible_region: us-east-2
+            edp_s3_compatible_internal_url: http://minio.storage.svc:9000
+            edp_s3_compatible_external_url: https://minio.example
+          secret_ids: [edp/object-store, edp/redis, edp/postgresql, user/edp-s3]
+          creds:
+            <<: *edp_creds
+            edp_s3_compatible_access_key_id: "<<t1/erag/user/edp-s3#access_key_id>>"
+            edp_s3_compatible_secret_access_key: "<<t1/erag/user/edp-s3#secret_access_key>>"
+          projected_secrets: "{{ edp_projected_secrets }}"
+          role_secrets: {}

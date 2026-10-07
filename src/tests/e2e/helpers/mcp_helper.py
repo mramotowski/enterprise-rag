@@ -6,7 +6,6 @@
 import asyncio
 import json
 import logging
-import os
 import threading
 import time
 from typing import Any
@@ -15,7 +14,8 @@ import httpx
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-from tests.e2e.helpers.keycloak_helper import DEFAULT_CREDENTIALS_PATH
+from tests.e2e.helpers.k8s_helper import K8sHelper
+from tests.e2e.helpers.keycloak_helper import load_erag_credentials
 from tests.e2e.validation.buildcfg import cfg
 from tests.e2e.validation.constants import VITE_KEYCLOAK_REALM
 
@@ -109,7 +109,7 @@ class McpHelper:
         3. close()   → cancels background task, closes SSE connection
     """
 
-    def __init__(self, credentials_file):
+    def __init__(self, credentials_file, k8s_helper=None):
         fqdn = cfg.get("base_domain_name")
         routing_mode = cfg.get("routing_mode", "subdomain")
         auth_domain = f"https://{fqdn}/auth" if routing_mode == "path" else f"https://keycloak.{fqdn}"
@@ -121,7 +121,7 @@ class McpHelper:
         self.mcp_metadata_url = f"{self.mcp_base_url}/.well-known/oauth-protected-resource"
         self.token_url = f"{auth_domain}/realms/{VITE_KEYCLOAK_REALM}/protocol/openid-connect/token"
 
-        self._credentials = self._load_mcp_credentials(credentials_file)
+        self._credentials = self._load_mcp_credentials(credentials_file, k8s_helper)
         self._token_provider = McpTokenProvider(
             self.token_url, self._credentials["client_id"], self._credentials["client_secret"]
         )
@@ -132,16 +132,12 @@ class McpHelper:
         self._ready = threading.Event()
         self._start_session()
 
-    def _load_mcp_credentials(self, credentials_file) -> dict[str, str]:
-        """Parse MCP_CLIENT_ID and MCP_CLIENT_SECRET from the credentials file."""
-        file_path = credentials_file if credentials_file and os.path.exists(credentials_file) else DEFAULT_CREDENTIALS_PATH
-        credentials = {}
-        with open(file_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    credentials[key.strip()] = value.strip().strip('"')
+    def _load_mcp_credentials(self, credentials_file, k8s_helper=None) -> dict[str, str]:
+        """MCP_CLIENT_ID and MCP_CLIENT_SECRET from the credentials file or, without one
+        (secrets_backend: openbao), from the projected Secret keycloak/erag-credentials."""
+        if k8s_helper is None:
+            k8s_helper = K8sHelper()
+        credentials = load_erag_credentials(credentials_file, k8s_helper)
         return {
             "client_id": credentials.get("MCP_CLIENT_ID", ""),
             "client_secret": credentials.get("MCP_CLIENT_SECRET", ""),

@@ -1,0 +1,111 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao adapter: rotate (AD-9). An erag_rotate run (app_pre_install
+# tasks/rotate.yaml) calls it with the requested ids; nothing else runs.
+#   1. every id must be rotatable: an id with rotate: none fails the run, with
+#      the registry reason, before anything changes;
+#   2. setup (worker namespace, ServiceAccount, CA bundle);
+#   3. for a Keycloak hook only: a Role + RoleBinding that let the worker
+#      ServiceAccount get the platform Keycloak admin Secret (that one name),
+#      deleted again in always;
+#   4. per id, in the requested order (tasks/adapters/openbao/rotate_one.yaml):
+#      the rotator Job writes the new KV version and runs the hook (or, for
+#      operator-write, checks the version the operator wrote); a failed hook
+#      restores the previous version; then the id's ExternalSecrets are
+#      force-synced (force_sync.yaml) and its registry workloads restarted
+#      (restart.yaml). The first failure stops the run: the ids before it stay
+#      rotated, the ids after it are not touched.
+# Sets: app_secrets_rotate_results = {<id>: {result, version, previous_version,
+#       external_secrets: [<ns>/<name>], restarted: [<ns>/<kind>/<name>],
+#       skipped: [<ns>/<kind>/<name>]}}.
+# Expect a short consumer outage: from the hook until a consumer restarts,
+# new connections with the old value fail (and the KV write before the hook
+# lets a periodic ESO refresh project a value the server does not accept yet).
+# Rotate in a maintenance window.
+# No value reaches Ansible: the rotator reports results only.
+
+---
+- name: "app_secrets | rotate | openbao | Fail on credentials that cannot be rotated"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | rotate | not rotatable, nothing was changed:
+      {{ _none | join('; ') }}
+  vars:
+    _none: >-
+      {%- set out = [] -%}
+      {%- for cid in app_secrets_selected_ids if app_secrets_catalog[cid].rotate.none | default(false) -%}
+        {%- set _ = out.append(cid ~ ': ' ~ app_secrets_catalog[cid].rotate.reason) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: _none | length > 0
+
+- name: "app_secrets | rotate | openbao | Set up the worker namespace"
+  ansible.builtin.include_tasks: setup.yaml
+  vars:
+    app_secrets_op: rotate
+
+- name: "app_secrets | rotate | openbao | Note the hooks"
+  ansible.builtin.set_fact:
+    app_secrets_rotate_results: {}
+    _app_secrets_rotate_keycloak: >-
+      {{ app_secrets_selected_ids | map('extract', app_secrets_catalog) | map(attribute='rotate.hook')
+         | select('equalto', 'keycloak-client-secret-set') | list | length > 0 }}
+
+- name: "app_secrets | rotate | openbao | Rotate"
+  block:
+    - name: "app_secrets | rotate | openbao | Let the rotator read the Keycloak admin Secret"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: Role
+            metadata:
+              name: "{{ app_secrets_rotator_rbac_name }}"
+              namespace: "{{ app_secrets_rotate_keycloak_admin_secret.namespace }}"
+              labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/managed-by: app_secrets}
+            rules:
+              - apiGroups: [""]
+                resources: ["secrets"]
+                resourceNames: ["{{ app_secrets_rotate_keycloak_admin_secret.name }}"]
+                verbs: ["get"]
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: RoleBinding
+            metadata:
+              name: "{{ app_secrets_rotator_rbac_name }}"
+              namespace: "{{ app_secrets_rotate_keycloak_admin_secret.namespace }}"
+              labels: {app.kubernetes.io/part-of: erag-secrets, app.kubernetes.io/managed-by: app_secrets}
+            roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: "{{ app_secrets_rotator_rbac_name }}"}
+            subjects:
+              - {kind: ServiceAccount, name: "{{ app_secrets_worker_sa }}", namespace: "{{ app_secrets_worker_namespace }}"}
+      when: _app_secrets_rotate_keycloak | bool
+      no_log: true
+
+    - name: "app_secrets | rotate | openbao | Rotate each credential"
+      ansible.builtin.include_tasks: rotate_one.yaml
+      loop: "{{ app_secrets_selected_ids }}"
+      loop_control:
+        loop_var: _app_secrets_rotate_id
+
+  always:
+    - name: "app_secrets | rotate | openbao | Remove the rotator's Keycloak access"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: rbac.authorization.k8s.io/v1
+        kind: "{{ item }}"
+        name: "{{ app_secrets_rotator_rbac_name }}"
+        namespace: "{{ app_secrets_rotate_keycloak_admin_secret.namespace }}"
+      loop: ["RoleBinding", "Role"]
+      when: _app_secrets_rotate_keycloak | bool
+      no_log: true
+
+- name: "app_secrets | rotate | openbao | Rotated"
+  ansible.builtin.debug:
+    msg: >-
+      app_secrets | rotate |
+      {% for cid, r in app_secrets_rotate_results.items() -%}
+      {{ cid }}: {{ 'operator-written version ' ~ r.version if r.result == 'operator'
+                    else 'version ' ~ r.previous_version ~ ' -> ' ~ r.version }},
+      synced {{ r.external_secrets | join(', ') or 'no ExternalSecret' }},
+      restarted {{ r.restarted | join(', ') or 'nothing' }}{{ (', not deployed: ' ~ (r.skipped | join(', '))) if r.skipped else '' }}{{ '; ' if not loop.last else '' }}
+      {%- endfor %}
