@@ -7,7 +7,7 @@ RUN apk add --no-cache bash
 
 # Install pnpm
 # renovate: datasource=npm depName=pnpm
-ARG PNPM_VERSION=10.33.4
+ARG PNPM_VERSION=10.34.5
 RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 
 WORKDIR /rag-ui
