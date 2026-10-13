@@ -3,7 +3,7 @@
 #
 # openbao adapter: the rotation of one credential (rotate.yaml loops over the
 # ids). Expects: _app_secrets_rotate_id. Runs the rotator Job
-# (templates/rotator-job.yaml.j2, files/secrets_rotator.py), then, when it
+# (templates/secrets-job.yaml.j2, files/secrets_job.py rotate), then, when it
 # rotated (or found the operator's version), force-syncs the credential's
 # ExternalSecrets and restarts its registry workloads. When the hook failed
 # and the previous version was restored, the ExternalSecrets are force-synced
@@ -13,9 +13,7 @@
 ---
 - name: "app_secrets | rotate | openbao | Plan the rotation of {{ _app_secrets_rotate_id }}"
   ansible.builtin.set_fact:
-    app_secrets_rotator_plan: "{{ _plan }}"
-    # Names the Job (run_worker.yaml); no value.
-    app_secrets_worker_plan: ["rotate {{ _app_secrets_rotate_id }}"]
+    app_secrets_worker_plan: "{{ _plan }}"
   vars:
     _entry: "{{ app_secrets_catalog[_app_secrets_rotate_id] }}"
     _hook: "{{ _entry.rotate.hook }}"
@@ -48,7 +46,6 @@
   vars:
     app_secrets_op: rotate
     app_secrets_worker_op: rotate
-    app_secrets_job_template: rotator-job.yaml.j2
     app_secrets_job_component: rotator
 
 - name: "app_secrets | rotate | openbao | Read the result for {{ _app_secrets_rotate_id }}"

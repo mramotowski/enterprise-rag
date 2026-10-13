@@ -2,150 +2,73 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# vector_dims lookup with projected Secrets (ARCHITECTURE-SPINE AD-3): the HF
-# token may not reach the installer host, so files/resolve_vector_dims.py runs
-# as a Job in the credential-store namespace (templates/vector-dims-job.yaml.j2)
-# and reads the token from the projected Secret hf-token. The resolution order
-# and the fallback are the script's, as on the host. The Job log holds only the
-# JSON result line (and the script's fallback warning).
-# Included from install.yaml after the store is opened and the HF token is
-# projected, only when vector_databases_vector_dims is unset.
+# vector_dims lookup with projected Secrets (ARCHITECTURE-SPINE AD-3): the HF token may
+# not reach the installer host, so files/resolve_vector_dims.py runs as a Job
+# (app_script_job) in the credential-store namespace and reads the projected hf-token
+# with --hf-token-env (never in argv, the manifest or the log). Included from
+# install.yaml when vector_databases_vector_dims is unset.
 
-- name: "app_pre_install | vector_dims Job | Name the run"
+- name: "app_pre_install | vector_dims Job | Locate the script"
   ansible.builtin.set_fact:
-    _vector_dims_job_name: >-
-      erag-vector-dims-{{ (embedding_model_id ~ now(utc=true).isoformat()) | hash('sha1') | truncate(10, true, '') }}
+    _vector_dims_script: "{{ role_path }}/files/resolve_vector_dims.py"
 
-- name: "app_pre_install | vector_dims Job | Find previous runs"
-  kubernetes.core.k8s_info:
-    api_version: "{{ item.api_version }}"
-    kind: "{{ item.kind }}"
-    namespace: "{{ vector_dims_job_namespace }}"
-    label_selectors:
-      - "app.kubernetes.io/part-of=erag-secrets"
-      - "app.kubernetes.io/component=vector-dims"
-  loop:
-    - {api_version: batch/v1, kind: Job}
-    - {api_version: v1, kind: ConfigMap}
-  loop_control:
-    label: "{{ item.kind }}"
-  register: _vector_dims_old_runs
-
-- name: "app_pre_install | vector_dims Job | Delete previous runs"
-  kubernetes.core.k8s:
-    state: absent
-    api_version: "{{ item.apiVersion | default('v1') }}"
-    kind: "{{ item.kind }}"
-    name: "{{ item.metadata.name }}"
-    namespace: "{{ vector_dims_job_namespace }}"
-    delete_options:
-      propagationPolicy: Background
-  loop: "{{ _vector_dims_old_runs.results | map(attribute='resources') | map('default', []) | flatten }}"
-  loop_control:
-    label: "{{ item.kind }} {{ item.metadata.name }}"
-
-- name: "app_pre_install | vector_dims Job | Start the Job"
-  block:
-    - name: "app_pre_install | vector_dims Job | Create a private render directory"
-      ansible.builtin.tempfile:
-        state: directory
-        prefix: vector_dims_job_
-      register: _vector_dims_dir
-
-    # Rendered to a file and applied with src: the script is applied verbatim,
-    # never re-read as a template.
-    - name: "app_pre_install | vector_dims Job | Render the Job"
-      ansible.builtin.template:
-        src: vector-dims-job.yaml.j2
-        dest: "{{ _vector_dims_dir.path }}/vector-dims-job.yaml"
-        mode: "0600"
-
-    - name: "app_pre_install | vector_dims Job | Apply the Job"
-      kubernetes.core.k8s:
-        state: present
-        src: "{{ _vector_dims_dir.path }}/vector-dims-job.yaml"
-        wait: false
-
-  always:
-    - name: "app_pre_install | vector_dims Job | Remove the render directory"
-      ansible.builtin.file:
-        path: "{{ _vector_dims_dir.path }}"
-        state: absent
-      when: _vector_dims_dir.path is defined
-
-- name: "app_pre_install | vector_dims Job | Wait for the Job"
-  kubernetes.core.k8s_info:
-    api_version: batch/v1
-    kind: Job
-    name: "{{ _vector_dims_job_name }}"
-    namespace: "{{ vector_dims_job_namespace }}"
-  register: _vector_dims_job
-  # Done: a pod succeeded or failed, or the Job has a Failed condition (e.g.
-  # DeadlineExceeded with no pod ever created).
-  until: >-
-    (_vector_dims_job.resources | default([]) | length > 0) and
-    ((_vector_dims_job.resources[0].status.succeeded | default(0) | int) >= 1 or
-     (_vector_dims_job.resources[0].status.failed | default(0) | int) >= 1 or
-     (_vector_dims_job.resources[0].status.conditions | default([])
-      | selectattr('type', 'equalto', 'Failed') | selectattr('status', 'equalto', 'True') | list | length > 0))
-  retries: "{{ ((vector_dims_job_timeout | int) / (vector_dims_job_poll_delay | int)) | round(0, 'ceil') | int + 2 }}"
-  delay: "{{ vector_dims_job_poll_delay | int }}"
-  failed_when: false
-
-- name: "app_pre_install | vector_dims Job | Read the Job log"
-  kubernetes.core.k8s_log:
-    api_version: batch/v1
-    kind: Job
-    name: "{{ _vector_dims_job_name }}"
-    namespace: "{{ vector_dims_job_namespace }}"
-  register: _vector_dims_log
-  failed_when: false
-  no_log: true
-
-# The script prints exactly one JSON object on stdout; anything else in the
-# log is its fallback warning (stderr).
-- name: "app_pre_install | vector_dims Job | Parse the result"
-  ansible.builtin.set_fact:
-    _vector_dims_result: "{{ _lines | last | default('') }}"
-    _vector_dims_succeeded: "{{ ((_vector_dims_job.resources | default([]) | first | default({})).status | default({})).succeeded | default(0) | int >= 1 }}"
-    _vector_dims_warnings: "{{ _all | select('match', '^WARNING:') | list }}"
+- name: "app_pre_install | vector_dims Job | Run the lookup"
+  ansible.builtin.include_role:
+    name: app_script_job
+    tasks_from: run.yaml
   vars:
-    _all: "{{ _vector_dims_log.log_lines | default([]) | select('string') | list }}"
-    # The script's json.dumps line (a JSON object with vector_dims).
-    _lines: "{{ _all | select('match', '^[{].*\"vector_dims\": *[0-9]+') | list }}"
+    script_job_prefix: erag-vector-dims
+    script_job_namespace: "{{ vector_dims_job_namespace }}"
+    script_job_part_of: erag-secrets
+    script_job_component: vector-dims
+    script_job_managed_by: app_pre_install
+    script_job_script: "{{ _vector_dims_script }}"
+    script_job_image: "{{ vector_dims_job_image }}"
+    script_job_timeout: "{{ vector_dims_job_timeout }}"
+    script_job_poll_delay: "{{ vector_dims_job_poll_delay }}"
+    script_job_result_regex: '^[{].*"vector_dims": *[0-9]+'
+    script_job_args: >-
+      {{ ['--embedding-model-id', embedding_model_id | string]
+         + (['--offline'] if offline_model | default(false) | bool else [])
+         + ['--hf-token-env', 'HF_TOKEN', '--fallback-dims', vector_databases_vector_dims | default(768, true) | int | string] }}
+    # The token ref is required when the token is in the store (no anonymous lookup
+    # and wrong fallback on a missing projection); else optional (anonymous lookup).
+    script_job_env: >-
+      {%- set out = [{'name': 'HF_TOKEN', 'secret': 'hf-token', 'key': 'token',
+                      'optional': not (hugging_token_projected | default(false) | bool)}] -%}
+      {%- for name in ['http_proxy', 'https_proxy', 'no_proxy']
+            if lookup('ansible.builtin.vars', name, default='') | string | length > 0 -%}
+        {%- set _ = out.extend([{'name': name, 'value': lookup('ansible.builtin.vars', name) | string},
+                                {'name': name | upper, 'value': lookup('ansible.builtin.vars', name) | string}]) -%}
+      {%- endfor -%}
+      {{ out }}
+    script_job_isolated: false    # as on the host (no python3 -I)
+    script_job_ttl: 86400
+    script_job_resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 256Mi}}
+    # Kept after the run for the kubectl commands of the failure message.
+    script_job_cleanup: false
 
 - name: "app_pre_install | vector_dims Job | Fail when the Job gave no result"
   ansible.builtin.fail:
     msg: >-
-      app_pre_install | the vector_dims Job {{ vector_dims_job_namespace }}/{{ _vector_dims_job_name }}
-      {{ _what }} (image {{ vector_dims_job_image }}). Check:
-      kubectl -n {{ vector_dims_job_namespace }} describe job {{ _vector_dims_job_name }};
-      kubectl -n {{ vector_dims_job_namespace }} logs job/{{ _vector_dims_job_name }}
+      app_pre_install | the vector_dims Job {{ vector_dims_job_namespace }}/{{ script_job_name }}
+      {{ script_job_reason }} (image {{ vector_dims_job_image }}). Check:
+      kubectl -n {{ vector_dims_job_namespace }} describe job {{ script_job_name }};
+      kubectl -n {{ vector_dims_job_namespace }} logs job/{{ script_job_name }}
       (the Job never logs the token). Or set vector_databases_vector_dims in the configuration
       to skip the lookup.
-  vars:
-    _status: "{{ (_vector_dims_job.resources | default([]) | first | default({})).status | default({}) }}"
-    _failed: >-
-      {{ _status.conditions | default([]) | selectattr('type', 'equalto', 'Failed')
-         | selectattr('status', 'equalto', 'True') | first | default({}) }}
-    _what: >-
-      {{ ('failed (' ~ _failed.reason | default('') ~ ': ' ~ _failed.message | default('') ~ ')')
-         if _failed.reason is defined
-         else ('did not finish within ' ~ vector_dims_job_timeout ~ 's'
-               if (_status.succeeded | default(0) | int) == 0 and (_status.failed | default(0) | int) == 0
-               else ('failed' if not (_vector_dims_succeeded | bool) else 'printed no result line')) }}
-  when: not (_vector_dims_succeeded | bool) or _vector_dims_result | length == 0
+  when: script_job_reason | length > 0
 
 - name: "app_pre_install | vector_dims Job | Apply the detected vector_dims"
   ansible.builtin.set_fact:
-    vector_databases_vector_dims: "{{ (_vector_dims_result | from_json).vector_dims | int }}"
-    vector_databases_vector_dims_source: "{{ (_vector_dims_result | from_json).source }}"
+    vector_databases_vector_dims: "{{ script_job_result.vector_dims | int }}"
+    vector_databases_vector_dims_source: "{{ script_job_result.source }}"
 
 - name: "app_pre_install | vector_dims Job | Show the result"
   ansible.builtin.debug:
     msg: >-
       vector_databases_vector_dims={{ vector_databases_vector_dims }} for model
       '{{ embedding_model_id }}' (source: {{ vector_databases_vector_dims_source }}, in-cluster Job
-      {{ vector_dims_job_namespace }}/{{ _vector_dims_job_name }}{{ ', HF token from OpenBao'
+      {{ vector_dims_job_namespace }}/{{ script_job_name }}{{ ', HF token from OpenBao'
       if hugging_token_projected | default(false) | bool else ', no HF token' }})
-      {{ _vector_dims_warnings | join(' ') }}
+      {{ script_job_warnings | join(' ') }}

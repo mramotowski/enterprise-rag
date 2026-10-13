@@ -13,8 +13,9 @@
 # next to the Secrets and reports only a verdict per client.
 # Local Secrets: the values live on the installer host and install re-applies them
 # anyway, so the check is skipped.
-# app_secrets_projected is set by any app_secrets port op earlier in the run; a run
-# that had none (validate) gets it from the configuration-only preflight.
+# app_secrets_projected (and app_secrets_registry, the source of the client list) is
+# set by any app_secrets port op earlier in the run; a run that had none (validate)
+# gets it from the configuration-only preflight.
 
 - name: "app_keycloak_config | Determine the credential delivery mode"
   ansible.builtin.include_role:
@@ -22,15 +23,15 @@
     tasks_from: preflight.yaml
   vars:
     configuration_issues: []
-  when: app_secrets_projected is not defined
+  when: app_secrets_projected is not defined or app_secrets_registry is not defined
 
 - name: "app_keycloak_config | Report the skipped client secret drift check"
   ansible.builtin.debug:
     msg: >-
       Skipping the Keycloak client secret drift check: credentials are local Secrets,
       kept on the installer host, and install erag re-applies them to Keycloak.
-  when: not (app_secrets_projected | default(false) | bool)
+  when: not (app_secrets_projected | bool)
 
 - name: "app_keycloak_config | Check Keycloak client secrets against OpenBao"
   ansible.builtin.include_tasks: check_client_drift_job.yaml
-  when: app_secrets_projected | default(false) | bool
+  when: app_secrets_projected | bool

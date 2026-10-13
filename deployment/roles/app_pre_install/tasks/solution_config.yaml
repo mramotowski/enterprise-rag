@@ -79,5 +79,5 @@
 
       If you're only using publicly available models, you can ignore this warning.
   when:
-    - not (app_secrets_projected | default(false))
+    - not app_secrets_projected
     - hugging_token is not defined or hugging_token | length == 0

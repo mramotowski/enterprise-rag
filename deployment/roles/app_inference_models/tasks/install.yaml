@@ -510,7 +510,7 @@
   # (MM_HF_TOKEN_FROM_SECRET, enterprise-inference model-manager; projected by
   # the include above). Local mode passes exactly the environment below.
   environment: "{{ _mm_deploy_env | combine({'MM_HF_TOKEN_FROM_SECRET': 'true', 'HF_TOKEN': ''}
-                   if app_secrets_projected | default(false) else {}) }}"
+                   if app_secrets_projected else {}) }}"
   vars:
     _mm_deploy_env:
       KUBECONFIG: "{{ lookup('env', 'KUBECONFIG') }}"

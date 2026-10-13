@@ -69,29 +69,6 @@ app_pre_install_rotate_ids: >-
       else (erag_rotate | string | regex_replace('[][ ]', '') | replace('"', '') | replace("'", '')).split(','))
      | map('string') | map('trim') | reject('equalto', '') | list }}
 
-# --- Migration of a local-mode env to the OpenBao backend (tasks/install.yaml):
-#     every credential of the app_secrets registry that has a legacy Secret
-#     (operator entries under erag/user/ have none). app_post_install finalizes
-#     with the same list (app_post_install_import_secret_ids);
-#     app_secrets tests/test_migration.yaml fails when either list and the registry differ. ---
-app_pre_install_import_secret_ids:
-  - keycloak/erag-admin
-  - keycloak/erag-user
-  - keycloak/erag-maintainer
-  - keycloak/mcp-client
-  - keycloak/grafana-oauth
-  - keycloak/edp-oidc
-  - nats/auth
-  - vector-db/redis
-  - vector-db/pgvector
-  - vector-db/mssql
-  - chat-history/postgres
-  - fingerprint/postgres
-  - edp/postgresql
-  - edp/redis
-  - edp/object-store
-  - seaweedfs/admin
-
 # --- Cross-role shared defaults - derived from base_domain_name in tasks/solution_config.yaml; declared here for standalone runs. ---
 ui_domain_name: "solutions.ai"                                                       # app_ui
 erag_keycloak_domain_name: "auth.solutions.ai"                                        # app_keycloak_config

@@ -14,5 +14,5 @@
   vars:
     app_secrets_op: status
 
-- name: "app_secrets | status | Run {{ secrets_backend }} adapter"
-  ansible.builtin.include_tasks: "adapters/{{ secrets_backend }}/status.yaml"
+- name: "app_secrets | status | Run the openbao adapter"
+  ansible.builtin.include_tasks: adapters/openbao/status.yaml

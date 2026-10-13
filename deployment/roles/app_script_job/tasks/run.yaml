@@ -1,0 +1,171 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Runs the script at script_job_script as a Job (inputs: defaults/main.yaml)
+# after deleting earlier runs, waits until a pod succeeded or failed or the Job has a
+# Failed condition, and reads the log (no_log). Sets script_job_name, script_job_result
+# (last line matching script_job_result_regex, parsed; {} if none), script_job_warnings
+# (WARNING: lines) and script_job_reason ('' on success with a result line, else why not).
+
+- name: "app_script_job | Check the inputs"
+  ansible.builtin.assert:
+    that:
+      - _missing | length == 0
+      # The Job name (prefix, '-', 10 hash characters) is also a label value (63 at most).
+      - script_job_prefix | string | length <= 52
+      - script_job_poll_delay | int > 0
+      - script_job_component is match('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')
+    fail_msg: >-
+      app_script_job: missing inputs {{ _missing }}, or script_job_prefix longer than 52
+      characters, script_job_poll_delay not > 0 or script_job_component not a DNS-1123 label.
+    quiet: true
+  vars:
+    _missing: >-
+      {{ ['script_job_prefix', 'script_job_namespace', 'script_job_part_of', 'script_job_component',
+          'script_job_managed_by', 'script_job_script', 'script_job_image', 'script_job_timeout',
+          'script_job_result_regex'] | reject('in', _set) | list }}
+    _set: "{{ query('ansible.builtin.varnames', '^script_job_') }}"
+
+- name: "app_script_job | {{ script_job_component }} | Name the run"
+  ansible.builtin.set_fact:
+    script_job_name: >-
+      {{ script_job_prefix }}-{{ (script_job_prefix ~ now(utc=true).isoformat()) | hash('sha1') | truncate(10, true, '') }}
+    script_job_result: {}
+    script_job_warnings: []
+    script_job_reason: ""
+
+- name: "app_script_job | {{ script_job_component }} | Run the Job"
+  block:
+    - name: "app_script_job | {{ script_job_component }} | Find previous runs"
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        namespace: "{{ script_job_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/part-of={{ script_job_part_of }}"
+          - "app.kubernetes.io/component={{ script_job_component }}"
+      loop:
+        - {api_version: batch/v1, kind: Job}
+        - {api_version: v1, kind: ConfigMap}
+      loop_control:
+        label: "{{ item.kind }}"
+      register: _script_job_old_runs
+
+    - name: "app_script_job | {{ script_job_component }} | Delete previous runs"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.apiVersion | default('v1') }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ script_job_namespace }}"
+        delete_options:
+          propagationPolicy: Background
+      loop: "{{ _script_job_old_runs.results | map(attribute='resources') | map('default', []) | flatten }}"
+      loop_control:
+        label: "{{ item.kind }} {{ item.metadata.name }}"
+
+    - name: "app_script_job | {{ script_job_component }} | Create a private render directory"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: script_job_
+      register: _script_job_dir
+
+    # Applied with src: the script is applied verbatim, never re-read as a template.
+    - name: "app_script_job | {{ script_job_component }} | Render the Job"
+      ansible.builtin.template:
+        src: job.yaml.j2
+        dest: "{{ _script_job_dir.path }}/job.yaml"
+        mode: "0600"
+
+    - name: "app_script_job | {{ script_job_component }} | Apply the Job"
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ _script_job_dir.path }}/job.yaml"
+        wait: false
+
+    - name: "app_script_job | {{ script_job_component }} | Report the Job"
+      ansible.builtin.debug:
+        msg: "Started Job {{ script_job_namespace }}/{{ script_job_name }}; waiting up to {{ script_job_timeout }}s for it."
+
+    - name: "app_script_job | {{ script_job_component }} | Wait for the Job"
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ script_job_name }}"
+        namespace: "{{ script_job_namespace }}"
+      register: _script_job_job
+      until: >-
+        (_script_job_job.resources | default([]) | length > 0) and
+        ((_script_job_job.resources[0].status.succeeded | default(0) | int) >= 1 or
+         (_script_job_job.resources[0].status.failed | default(0) | int) >= 1 or
+         (_script_job_job.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Failed') | selectattr('status', 'equalto', 'True') | list | length > 0))
+      retries: "{{ ((script_job_timeout | int) / (script_job_poll_delay | int)) | round(0, 'ceil') | int + 2 }}"
+      delay: "{{ script_job_poll_delay | int }}"
+      failed_when: false
+
+    - name: "app_script_job | {{ script_job_component }} | Read the Job log"
+      kubernetes.core.k8s_log:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ script_job_name }}"
+        namespace: "{{ script_job_namespace }}"
+      register: _script_job_log
+      failed_when: false
+      no_log: true
+
+    - name: "app_script_job | {{ script_job_component }} | Parse the result"
+      ansible.builtin.set_fact:
+        _script_job_line: "{{ _lines | last | default('') }}"
+        script_job_warnings: "{{ _all | select('match', '^WARNING:') | list }}"
+        script_job_reason: >-
+          {{ ('failed (' ~ _failed.reason | default('') ~ ': ' ~ _failed.message | default('') ~ ')')
+             if _failed.reason is defined
+             else ('did not finish within ' ~ script_job_timeout ~ 's'
+                   if (_status.succeeded | default(0) | int) == 0 and (_status.failed | default(0) | int) == 0
+                   else ('failed' if (_status.succeeded | default(0) | int) == 0
+                         else ('printed no result line' if _lines | length == 0 else ''))) }}
+      vars:
+        _all: "{{ _script_job_log.log_lines | default([]) | select('string') | list }}"
+        _lines: "{{ _all | select('match', script_job_result_regex) | list }}"
+        _status: "{{ (_script_job_job.resources | default([]) | first | default({})).status | default({}) }}"
+        _failed: >-
+          {{ _status.conditions | default([]) | selectattr('type', 'equalto', 'Failed')
+             | selectattr('status', 'equalto', 'True') | first | default({}) }}
+
+    - name: "app_script_job | {{ script_job_component }} | Decode the result line"
+      when: _script_job_line | length > 0
+      block:
+        - name: "app_script_job | {{ script_job_component }} | Parse the result line as JSON"
+          ansible.builtin.set_fact:
+            script_job_result: "{{ _script_job_line | from_json }}"
+          no_log: true
+      rescue:
+        - name: "app_script_job | {{ script_job_component }} | Report a result line that is not JSON"
+          ansible.builtin.set_fact:
+            script_job_result: {}
+            script_job_reason: "{{ script_job_reason or 'result line is not JSON' }}"
+
+  always:
+    - name: "app_script_job | {{ script_job_component }} | Remove the render directory"
+      ansible.builtin.file:
+        path: "{{ _script_job_dir.path }}"
+        state: absent
+      when: _script_job_dir.path is defined
+
+    - name: "app_script_job | {{ script_job_component }} | Delete the Job"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ script_job_name }}"
+        namespace: "{{ script_job_namespace }}"
+        delete_options:
+          propagationPolicy: Background
+      loop:
+        - {api_version: batch/v1, kind: Job}
+        - {api_version: v1, kind: ConfigMap}
+      loop_control:
+        label: "{{ item.kind }}"
+      when: script_job_cleanup | bool

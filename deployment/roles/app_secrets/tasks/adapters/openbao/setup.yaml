@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # openbao adapter: shared setup, run first by every openbao op (idempotent).
-#   - checks the openbao settings are path-safe;
 #   - reads the CA bundle ConfigMap (ca.crt only) of the platform openbao role
 #     and refuses one that holds a private key;
 #   - creates the worker namespace (labelled for the ClusterSecretStore; marked
@@ -10,31 +9,12 @@
 #     (no token automount, no RBAC) and the CA copy.
 # app_pre_install calls probe first, so this is where the namespace and the
 # ServiceAccount are created before the first worker run.
+# The openbao_* and erag_secrets_* settings are validated once, by the
+# ai-solutions global preflight (playbooks/includes/preflight_secrets.yaml),
+# before any role runs.
 # Expects: app_secrets_op.
 
 ---
-- name: "app_secrets | {{ app_secrets_op }} | openbao | Check the openbao settings"
-  ansible.builtin.assert:
-    that:
-      - (app_secrets_openbao_kv_mount | string) is match('^[A-Za-z0-9._-]+$')
-      - (app_secrets_openbao_kv_mount | string) not in ['.', '..']
-      - (app_secrets_openbao_cluster_id | string) is match('^[A-Za-z0-9._-]+$')
-      - (app_secrets_openbao_cluster_id | string) not in ['.', '..']
-      - (app_secrets_openbao_auth_mount | string) is match('^[A-Za-z0-9._-]+$')
-      - (app_secrets_openbao_address | trim) is match('^https://[^\s/]+')
-      - (app_secrets_worker_namespace | string) is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
-      - (app_secrets_worker_sa | string) is match('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
-    fail_msg: >-
-      app_secrets | {{ app_secrets_op }} | openbao settings are invalid:
-      openbao_kv_mount '{{ app_secrets_openbao_kv_mount }}', cluster id
-      '{{ app_secrets_openbao_cluster_id }}' (openbao_cluster_id or the env name) and
-      openbao_auth_mount '{{ app_secrets_openbao_auth_mount }}' must be names of
-      [A-Za-z0-9._-] other than . and ..; the OpenBao address
-      '{{ app_secrets_openbao_address | trim }}' must be https:// (openbao_address in
-      external mode); erag_secrets_namespace '{{ app_secrets_worker_namespace }}' and
-      erag_secrets_worker_sa '{{ app_secrets_worker_sa }}' must be DNS-1123 names.
-    quiet: true
-
 - name: "app_secrets | {{ app_secrets_op }} | openbao | Read the OpenBao CA bundle"
   kubernetes.core.k8s_info:
     api_version: v1

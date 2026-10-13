@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Tests the in-cluster vector_dims lookup (projected Secrets; ARCHITECTURE-SPINE
-# AD-3) without a cluster: the real tasks/resolve_vector_dims_job.yaml and
-# templates/vector-dims-job.yaml.j2 against the app_secrets fake
+# AD-3) without a cluster: the real tasks/resolve_vector_dims_job.yaml and the
+# app_script_job runner it calls, against the app_secrets fake
 # kubernetes.core, whose Job hook runs the Job's container command on this
 # host with the Job's env (the HF token only from the Secret hf-token, as the
 # kubelet resolves the secretKeyRef) and a fake HuggingFace API.

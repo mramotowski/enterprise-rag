@@ -1,0 +1,20 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# tasks/run.yaml inputs. Required: script_job_prefix (name prefix), script_job_namespace,
+# script_job_part_of / _component / _managed_by (labels; part-of + component select the
+# earlier runs; component names the container and the mount /etc/<component>),
+# script_job_script (absolute path of the script; resolve role_path in a set_fact first:
+# in include_role vars it is evaluated as this role's path), script_job_image,
+# script_job_timeout (activeDeadlineSeconds and polling), script_job_result_regex.
+script_job_poll_delay: 5
+script_job_args: []
+# [{name, value}] or [{name, secret, key, optional}] (secretKeyRef; optional defaults to
+# false; true starts the pod despite a missing key, so the script can report it).
+script_job_env: []
+script_job_host_aliases: []        # [{ip, hostnames}]
+script_job_isolated: true          # python3 -I
+script_job_ttl: 3600
+script_job_resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}
+script_job_cleanup: true           # delete this run's Job and ConfigMap at the end

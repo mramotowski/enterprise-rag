@@ -28,10 +28,41 @@
     - "{{ rag_log_dir }}"
     - "{{ rag_tmp_dir }}"
 
+# Rotation needs the OpenBao backend: refuse a local rotate-only run before the
+# local credential helpers write anything.
+- name: "app_pre_install | Refuse a rotate-only run without the OpenBao backend"
+  ansible.builtin.fail:
+    msg: >-
+      app_pre_install | rotation requires secrets_backend: openbao
+      (requested: {{ app_pre_install_rotate_ids | join(', ') }})
+  when:
+    - app_pre_install_rotate_run | bool
+    - not app_secrets_projected
+
+# Local Secrets: refuse an env that was projected from OpenBao before anything
+# is loaded or generated (story 16).
+- name: "app_pre_install | Refuse to switch an OpenBao env back to local credentials"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: switch_guard.yaml
+  when: not app_secrets_projected
+
+- name: "app_pre_install | Load credentials from password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: lookup.yaml
+  when: not app_secrets_projected
+
+- name: "app_pre_install | Load init passwords"
+  ansible.builtin.include_role:
+    name: app_generate_password
+  when: not app_secrets_projected
+
 - name: "app_pre_install | Open the credential store"
   ansible.builtin.include_role:
     name: app_secrets
     tasks_from: probe.yaml
+  when: app_secrets_projected
 
 # Rotate-only run (erag_rotate set): rotate, and nothing below.
 - name: "app_pre_install | Rotate credentials (erag_rotate)"
@@ -48,11 +79,9 @@
   ansible.builtin.include_role:
     name: app_secrets
     tasks_from: import.yaml
-  vars:
-    secret_ids: "{{ app_pre_install_import_secret_ids }}"
   when:
     - not (app_pre_install_rotate_run | bool)
-    - app_secrets_projected | default(false)
+    - app_secrets_projected
 
 # Projected Secrets: the operator HF token (tasks/project_hf_token.yaml; already
 # done when app_inference_models ran first), then the vector_dims lookup as an
@@ -60,7 +89,7 @@
 - name: "app_pre_install | Projected HF token and vector_dims"
   when:
     - not (app_pre_install_rotate_run | bool)
-    - app_secrets_projected | default(false)
+    - app_secrets_projected
   block:
     - name: "app_pre_install | Project the operator HF token"
       ansible.builtin.include_tasks:

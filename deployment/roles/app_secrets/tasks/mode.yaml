@@ -1,0 +1,14 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sets app_secrets_projected only: true when the backend projects the registry
+# Secrets (ESO ExternalSecrets from OpenBao). Every port op sets it too
+# (common/validate.yaml includes this file). The consumer roles include it at
+# the top of tasks/main.yaml when it is not defined yet, e.g. with
+# `install <component> --only`, which skips app_pre_install. No checks, no
+# cluster access.
+
+---
+- name: "app_secrets | Report how Secrets are delivered"
+  ansible.builtin.set_fact:
+    app_secrets_projected: "{{ secrets_backend in app_secrets_projecting_backends }}"

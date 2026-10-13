@@ -21,7 +21,7 @@
   vars:
     app_secrets_op: probe
     app_secrets_worker_op: probe
-    app_secrets_worker_plan: []
+    app_secrets_worker_plan: {}
 
 - name: "app_secrets | probe | openbao | Fail when OpenBao is not usable"
   ansible.builtin.include_tasks: probe_fail.yaml

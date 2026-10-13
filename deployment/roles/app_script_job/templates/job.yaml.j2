@@ -1,0 +1,81 @@
+{# Copyright (C) 2026 Intel Corporation
+   SPDX-License-Identifier: Apache-2.0
+   tasks/run.yaml: the script (ConfigMap) and the Job. Secret values reach the
+   pod only as secretKeyRef env: never in argv, the manifest or Ansible. #}
+{% set _labels = {
+     'app.kubernetes.io/part-of': script_job_part_of,
+     'app.kubernetes.io/component': script_job_component,
+     'app.kubernetes.io/managed-by': script_job_managed_by} %}
+{% set _file = script_job_script | basename %}
+{% set _dir = '/etc/' ~ script_job_component %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ script_job_name | to_json }}
+  namespace: {{ script_job_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+data:
+  {{ _file | to_json }}: {{ lookup('ansible.builtin.file', script_job_script) | to_json }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ script_job_name | to_json }}
+  namespace: {{ script_job_namespace | to_json }}
+  labels: {{ _labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ script_job_timeout | int }}
+  ttlSecondsAfterFinished: {{ script_job_ttl | int }}
+  template:
+    metadata:
+      labels: {{ _labels | to_json }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+{% if script_job_host_aliases | length > 0 %}
+      hostAliases: {{ script_job_host_aliases | to_json }}
+{% endif %}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ script_job_component | to_json }}
+          image: {{ script_job_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: {{ (['python3'] + (['-I'] if script_job_isolated | bool else []) + [_dir ~ '/' ~ _file]) | to_json }}
+{% if script_job_args | length > 0 %}
+          args: {{ script_job_args | map('string') | list | to_json }}
+{% endif %}
+          env:
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+{% for e in script_job_env %}
+{%   if e.secret is defined %}
+            - name: {{ e.name | to_json }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ e.secret | to_json }}
+                  key: {{ e.key | to_json }}
+                  optional: {{ e.optional | default(false) | bool | to_json }}
+{%   else %}
+            - {name: {{ e.name | to_json }}, value: {{ e.value | string | to_json }}}
+{%   endif %}
+{% endfor %}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources: {{ script_job_resources | to_json }}
+          volumeMounts:
+            - {name: script, mountPath: {{ _dir | to_json }}, readOnly: true}
+      volumes:
+        - name: script
+          configMap:
+            name: {{ script_job_name | to_json }}
+            defaultMode: 0444

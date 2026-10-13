@@ -14,8 +14,7 @@
 # secret_ids naming every registry credential is a layer teardown: the openbao
 # adapter then also deletes whatever else is stored under <cluster_id>/<layer>/,
 # and removes the namespace label and paths annotation and the worker
-# namespace (adapters/openbao/delete.yaml). The local adapter does nothing
-# (the teardown removes the local files).
+# namespace (adapters/openbao/delete.yaml). openbao only (common/validate.yaml).
 
 ---
 - name: "app_secrets | delete | Validate request"
@@ -23,5 +22,5 @@
   vars:
     app_secrets_op: delete
 
-- name: "app_secrets | delete | Run {{ secrets_backend }} adapter"
-  ansible.builtin.include_tasks: "adapters/{{ secrets_backend }}/delete.yaml"
+- name: "app_secrets | delete | Run the openbao adapter"
+  ansible.builtin.include_tasks: adapters/openbao/delete.yaml

@@ -1,0 +1,42 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One case of test_script_job_callers.yaml (loop_var case): runs the caller on a
+# fresh fake cluster and records {ok, msg, reason, result, state} in _r[case.name].
+
+---
+- name: "app_script_job | test | {{ case.name }} | Seed the fake cluster"
+  ansible.builtin.copy:
+    dest: "{{ _tmp.path }}/{{ case.name }}.json"
+    mode: "0600"
+    content: "{{ seed | to_json }}"
+  no_log: true
+
+- name: "app_script_job | test | {{ case.name }} | Run"
+  block:
+    - name: "app_script_job | test | {{ case.name }} | Run the caller"
+      ansible.builtin.include_role:
+        name: "{{ case.role }}"
+        tasks_from: "{{ case.tasks_from }}"
+        apply:
+          environment:
+            FAKE_K8S_STATE: "{{ _tmp.path }}/{{ case.name }}.json"
+            FAKE_K8S_ON_APPLY: "{{ ansible_playbook_python }} {{ playbook_dir }}/files/fake_script_job.py"
+            FAKE_JOB_LOG: "{{ case.log if case.log is string else case.log | to_json }}"
+      vars:
+        mcp_enabled: "{{ case.mcp_enabled | default(true) }}"
+        grafana_oauth_domain: "{{ case.grafana_oauth_domain | default('grafana.solutions.ai') }}"
+
+    - name: "app_script_job | test | {{ case.name }} | Succeeded"
+      ansible.builtin.set_fact:
+        _case: {ok: true, msg: ""}
+  rescue:
+    - name: "app_script_job | test | {{ case.name }} | Failed"
+      ansible.builtin.set_fact:
+        _case: {ok: false, msg: "{{ ansible_failed_result.msg | default('') }}"}
+
+- name: "app_script_job | test | {{ case.name }} | Record the result"
+  ansible.builtin.set_fact:
+    _r: >-
+      {{ _r | default({}) | combine({case.name: _case | combine({'reason': script_job_reason, 'result': script_job_result,
+         'state': lookup('ansible.builtin.file', _tmp.path ~ '/' ~ case.name ~ '.json') | from_json})}) }}

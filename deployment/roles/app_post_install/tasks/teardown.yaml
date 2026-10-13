@@ -15,12 +15,14 @@
 # failing) must stop the teardown here, while every component is still in
 # place. Never writes to OpenBao; in the cluster only the worker namespace,
 # ServiceAccount, CA bundle and a probe Job (the delete removes them). The
-# ClusterSecretStore is not required (the delete does not go through ESO), and
-# with the local backend the probe checks nothing (no remote store).
+# ClusterSecretStore is not required (the delete does not go through ESO).
+# Local Secrets have no remote store to check.
 # erag_teardown_store_lost=true skips it: the env's OpenBao is gone for good,
 # and the delete then skips the store too (docs/deploy/openbao.md, Teardown).
 - name: "app_post_install | OpenBao is usable for the credential delete"
-  when: not (erag_teardown_store_lost | default(false) | bool)
+  when:
+    - app_secrets_projected
+    - not (erag_teardown_store_lost | default(false) | bool)
   block:
     - name: "app_post_install | Probe the credential store (teardown gate)"
       ansible.builtin.include_role:

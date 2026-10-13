@@ -5,7 +5,7 @@
 """
 In-cluster Keycloak client secret drift check (projected Secrets; AD-3).
 
-Run by the Job in templates/client-drift-job.yaml.j2 on validate: logs in to the
+Run as a Job (app_script_job, tasks/check_client_drift_job.yaml) on validate: logs in to the
 Keycloak admin API (realm master, admin-cli), reads the secret Keycloak holds for
 each client erag manages and compares it, in the pod, with the value projected
 from OpenBao. A secret regenerated in the Keycloak admin console breaks the

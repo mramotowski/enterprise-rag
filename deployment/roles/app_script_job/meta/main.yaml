@@ -1,0 +1,12 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+galaxy_info:
+  role_name: app_script_job
+  author: Intel Corporation
+  description: >-
+    Helper role (tasks_from run.yaml): runs a script of the calling role as an
+    in-cluster Job that reads Secrets only as secretKeyRef env (AD-3).
+  license: Apache-2.0
+  min_ansible_version: "2.14"
+dependencies: []

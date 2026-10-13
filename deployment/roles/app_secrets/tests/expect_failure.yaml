@@ -1,26 +1,33 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Helper for test_local_adapter.yaml: run one port op that must fail and
+# Helper for test_port_contract.yaml: run one port op that must fail and
 # record {msg, wrote_file} in test_failures[case.name].
-# Expects: case = {name, op, ids, backend (default local), phase (default
-# before_deploy), registry (default
-# the role's registry)}, test_dir.
+# Expects: case = {name, op, ids (optional: omitted = no secret_ids), backend (default local), import_phase
+# (default import), registry (default the role's registry)}, test_dir.
 
 ---
 - name: "app_secrets | test | {{ case.name }}"
   block:
     - name: "app_secrets | test | {{ case.name }} via the port"
-      ansible.builtin.include_role:
+      ansible.builtin.include_role: &port_call
         name: app_secrets
         tasks_from: "{{ case.op }}.yaml"
       vars:
-        secrets_backend: "{{ case.backend | default('local') }}"
-        log_dir: "{{ test_dir }}/fail/{{ case.name }}"
+        <<: &port_vars
+          secrets_backend: "{{ case.backend | default('local') }}"
+          log_dir: "{{ test_dir }}/fail/{{ case.name }}"
+          import_phase: "{{ case.import_phase | default('import') }}"
+          app_secrets_registry_file: "{{ case.registry | default(playbook_dir ~ '/../files/registry.yaml') }}"
         secret_ids: "{{ case.ids }}"
-        ensure_phase: "{{ case.phase | default('before_deploy') }}"
-        import_phase: "{{ case.import_phase | default('import') }}"
-        app_secrets_registry_file: "{{ case.registry | default(playbook_dir ~ '/../files/registry.yaml') }}"
+      when: "'ids' in case"
+
+    # Without case.ids: the op runs without secret_ids (an include_role var
+    # cannot be omitted).
+    - name: "app_secrets | test | {{ case.name }} via the port, without secret_ids"
+      ansible.builtin.include_role: *port_call
+      vars: *port_vars
+      when: "'ids' not in case"
 
     - name: "app_secrets | test | {{ case.name }} unexpectedly succeeded"
       ansible.builtin.set_fact:

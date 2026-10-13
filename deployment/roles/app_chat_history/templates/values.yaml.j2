@@ -12,7 +12,7 @@ image:
 
 {# With projected Secrets (ESO) the password stays out of the values; the
    chart reads it from mongo-database-secret only. #}
-{% if not (app_secrets_projected | default(false)) %}
+{% if not app_secrets_projected %}
 ferretdb:
   postgresql:
     auth:

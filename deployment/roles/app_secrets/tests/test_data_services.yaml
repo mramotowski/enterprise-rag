@@ -173,6 +173,8 @@
       ansible.builtin.include_role:
         name: app_edp
         tasks_from: secret_config.yaml
+      vars:
+        app_secrets_projected: true
       when:
         - "'projected' in test_modes"
         - values_role == 'app_edp'

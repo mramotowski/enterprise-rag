@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Tests the migration of a local-mode env to the OpenBao backend (story 11,
-# AD-12) end to end without a cluster: the local adapter writes the credential
+# AD-12) end to end without a cluster: app_generate_password writes the credential
 # file, the harness seeds the Secrets a local install leaves (marked, Helm-owned,
 # a platform Secret, Helm release history, a tmp render, an old env log), then
-# app_secrets import runs the real importer Job (files/secrets_importer.py,
+# app_secrets import runs the real importer Job (files/secrets_job.py import,
 # run on this host against a fake Kubernetes API that enforces its Role) against
 # a real OpenBao 2.7.0 (Docker), every credential is ensured as the roles do
 # (the fake ESO adopts the Secrets), a Helm upgrade drops the chart Secrets, and

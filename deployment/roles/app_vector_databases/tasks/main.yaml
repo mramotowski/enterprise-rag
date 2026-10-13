@@ -1,3 +1,11 @@
 ---
+# app_secrets_projected decides where this role's Secrets come from; a run
+# that skipped app_pre_install (--only) has not set it yet.
+- name: "app_vector_databases | Determine the credential delivery mode"
+  ansible.builtin.include_role:
+    name: app_secrets
+    tasks_from: mode.yaml
+  when: app_secrets_projected is not defined
+
 - name: "app_vector_databases | Dispatch action: {{ component_action }}"
   ansible.builtin.include_tasks: "{{ component_action }}.yaml"

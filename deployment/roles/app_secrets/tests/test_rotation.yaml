@@ -6,7 +6,7 @@
 # ghcr.io/cloudnative-pg/postgresql:17 image) take the KV writes and the
 # ALTER ROLE; Redis and Keycloak are fakes in the harness (RESP AUTH / ACL
 # SETUSER, the Keycloak admin REST calls), because their images cannot be
-# pulled here. The rotator Job (files/secrets_rotator.py) runs on this host
+# pulled here. The rotator Job (files/secrets_job.py rotate) runs on this host
 # against those servers (the harness maps the in-cluster service names, see
 # FAKE_ENDPOINTS) and a fake Kubernetes API that enforces its Role; the fake
 # ESO answers the force-sync, the fake controllers the rollout restarts.

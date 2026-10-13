@@ -3,7 +3,7 @@
 {# Projected Secrets (app_secrets_projected): the Job reads every value from the
     ESO projections erag-credentials and keycloak-configurator-sensitive, sets
     them in Keycloak, and has no Kubernetes API access; this file holds no value. #}
-{% set _projected = app_secrets_projected | default(false) | bool %}
+{% set _projected = app_secrets_projected | bool %}
 ---
 apiVersion: v1
 kind: ServiceAccount

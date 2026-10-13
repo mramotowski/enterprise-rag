@@ -37,7 +37,7 @@
 
 - name: "app_pre_install | HF token | Projected HF token"
   when:
-    - app_secrets_projected | default(false)
+    - app_secrets_projected
     - hugging_token_projected is not defined
   block:
     - name: "app_pre_install | Look up the operator HF token in the credential store"

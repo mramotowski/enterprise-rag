@@ -7,11 +7,10 @@
 #       tasks_from: ensure.yaml
 #     vars:
 #       secret_ids: [<component>/<credential>, ...]
-#       ensure_phase: before_deploy   # default; call before the consuming release
-#                                     # (local: generate/load, run role_managed generators)
-#       # ensure_phase: after_deploy  # call after the release created its Secrets
-#                                     # (local: mark them, refresh files; IDs may
-#                                     # include platform/* entries)
+#
+# Call before the consuming release.
+# openbao only (common/validate.yaml): in local mode the roles call
+# app_generate_password / app_password_mgmt themselves.
 
 ---
 - name: "app_secrets | ensure | Validate request"
@@ -19,5 +18,5 @@
   vars:
     app_secrets_op: ensure
 
-- name: "app_secrets | ensure | Run {{ secrets_backend }} adapter"
-  ansible.builtin.include_tasks: "adapters/{{ secrets_backend }}/ensure.yaml"
+- name: "app_secrets | ensure | Run the openbao adapter"
+  ansible.builtin.include_tasks: adapters/openbao/ensure.yaml

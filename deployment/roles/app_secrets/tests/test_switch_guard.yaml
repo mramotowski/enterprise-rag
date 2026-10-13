@@ -1,9 +1,9 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests the switch-back guard of the local adapter's probe (story 16): with
-# secrets_backend local, a cluster that still has erag ExternalSecrets or
-# namespaces with the erag layer label (projected from OpenBao) stops the probe
+# Tests the local-mode switch-back guard, tasks/switch_guard.yaml (story 16):
+# with secrets_backend local, a cluster that still has erag ExternalSecrets or
+# namespaces with the erag layer label (projected from OpenBao) stops the run
 # before anything is generated, unless erag_secrets_switch_to_local_confirmed
 # is true. A cluster that cannot be read also refuses (fail closed). Uses the
 # fake kubernetes.core (one JSON state file per case).

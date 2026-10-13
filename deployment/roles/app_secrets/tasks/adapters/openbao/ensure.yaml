@@ -1,8 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# openbao adapter: ensure.
-#   before_deploy (default), in this order:
+# openbao adapter: ensure, before the consuming release, in this order:
 #     1. setup (worker namespace, ServiceAccount, CA bundle);
 #     2. find the registry secrets: entries ("projections") that read a KV key
 #        of a selected credential; for an entry with variants, the variant that
@@ -13,20 +12,10 @@
 #     4. render one ExternalSecret per projection whose credentials all exist
 #        now (render_externalsecrets.yaml); the others stay pending until the
 #        ensure of their last credential, and are reported.
-#   after_deploy: nothing to do (ESO owns the Secrets; local markup and files
-#     do not exist in openbao mode). Platform IDs are only valid here.
 # No value reaches Ansible: the worker reports results and versions only.
 
 ---
-- name: "app_secrets | ensure | openbao | after_deploy needs no work"
-  ansible.builtin.debug:
-    msg: >-
-      {{ app_secrets_selected_ids | join(', ') }}: ensure_phase after_deploy is a
-      no-op with secrets_backend: openbao (ESO-managed Secrets, no local files or markup)
-  when: ensure_phase | default('before_deploy') == 'after_deploy'
-
-- name: "app_secrets | ensure | openbao | before_deploy"
-  when: ensure_phase | default('before_deploy') == 'before_deploy'
+- name: "app_secrets | ensure | openbao | Ensure"
   block:
     - name: "app_secrets | ensure | openbao | Set up the worker namespace"
       ansible.builtin.include_tasks: setup.yaml

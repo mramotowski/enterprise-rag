@@ -49,7 +49,7 @@
       else is derived. See docs/netapp_ontap_s3.md.{{ ' With projected Secrets (OpenBao) the
       keys go to OpenBao erag/user/edp-s3 (access_key_id, secret_access_key) instead, and
       edp_storage_type: s3compatible must be set explicitly (the derivation keys on the
-      config access key).' if app_secrets_projected | default(false) else '' }}
+      config access key).' if app_secrets_projected else '' }}
   when:
     - not (_edp_ontap_s3_active | bool)
     - _edp_storage_backend == 'netapp-trident'
@@ -127,7 +127,7 @@
         quiet: true
       # Projected Secrets: the keys are read from the store (erag/user/edp-s3,
       # whose ensure in install.yaml fails naming the path), not config.
-      when: not (app_secrets_projected | default(false))
+      when: not app_secrets_projected
 
     - name: "app_edp | ONTAP S3 | Assert the CA certificate file exists"
       ansible.builtin.assert:

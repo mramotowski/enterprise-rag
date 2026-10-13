@@ -3,11 +3,46 @@
 #
 # Shared by every port operation: load the registry, expand it into a catalog
 # of concrete credential IDs, and validate secret_ids and secrets_backend
-# before any adapter runs (so nothing is written for an invalid request).
-# Expects: app_secrets_op, secret_ids (probe: optional, default every
-# credential ID), ensure_phase (ensure only, optional).
+# before the adapter runs (so nothing is written for an invalid request).
+# Every op but the config-only preflight needs a backend that projects the
+# Secrets (openbao): in local mode the roles do not call the port.
+# Expects: app_secrets_op, secret_ids (probe, preflight, import: optional,
+# default every credential ID).
 
 ---
+- name: "app_secrets | {{ app_secrets_op }} | Fail on removed image settings"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | {{ _removed | join(', ') }}
+      {{ 'is' if _removed | length == 1 else 'are' }} no longer used: every secrets Job runs
+      files/secrets_job.py in one Python image, renamed to app_secrets_job_image
+      (default: vector_dims_job_image). Set app_secrets_job_image instead.
+  vars:
+    _removed: >-
+      {%- set out = [] -%}
+      {%- for v in ['app_secrets_worker_image', 'app_secrets_importer_image', 'app_secrets_rotator_image']
+            if lookup('ansible.builtin.vars', v, default='__unset__') != '__unset__' -%}
+        {%- set _ = out.append(v) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: _removed | length > 0
+
+- name: "app_secrets | {{ app_secrets_op }} | Fail on removed import ID lists"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | {{ _removed | join(', ') }} removed:
+      import uses the whole catalog (it imports every credential with a legacy Secret).
+      Remove the setting.
+  vars:
+    _removed: >-
+      {%- set out = [] -%}
+      {%- for v in ['app_pre_install_import_secret_ids', 'app_post_install_import_secret_ids']
+            if lookup('ansible.builtin.vars', v, default='__unset__') != '__unset__' -%}
+        {%- set _ = out.append(v) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: _removed | length > 0
+
 - name: "app_secrets | {{ app_secrets_op }} | Load credential registry"
   ansible.builtin.include_vars:
     file: "{{ app_secrets_registry_file }}"
@@ -34,7 +69,8 @@
       {{ out }}
 
 # platform: entries (platform-owned Secrets erag only marks) are kept apart
-# from the credential catalog; they are valid only for ensure/after_deploy.
+# from the credential catalog: no op takes their IDs, the openbao import reads
+# them to remove the local markup.
 - name: "app_secrets | {{ app_secrets_op }} | Build platform catalog"
   ansible.builtin.set_fact:
     app_secrets_platform_catalog: >-
@@ -49,7 +85,7 @@
       {{ app_secrets_registry_file }}: {{ _invalid | join('; ') }}
     quiet: true
   vars:
-    _required: ['owner_role', 'path', 'keys', 'legacy', 'rotate', 'local']
+    _required: ['owner_role', 'path', 'keys', 'legacy', 'rotate']
     _invalid: >-
       {%- set bad = [] -%}
       {%- for cid, e in app_secrets_catalog.items() -%}
@@ -59,8 +95,6 @@
         {%- set missing = _required | reject('in', e.keys() | list) | list -%}
         {%- if missing | length > 0 -%}
           {%- set _ = bad.append(cid ~ ': missing ' ~ (missing | join(', '))) -%}
-        {%- elif (e.local.mechanism | default('')) not in app_secrets_local_mechanisms -%}
-          {%- set _ = bad.append(cid ~ ': local.mechanism must be one of ' ~ (app_secrets_local_mechanisms | join(', '))) -%}
         {%- elif not ((e.rotate.hook is defined and e.rotate.restart is defined) or (e.rotate.none | default(false) and e.rotate.reason is defined)) -%}
           {%- set _ = bad.append(cid ~ ': rotate must be {hook, restart} or {none, reason}') -%}
         {%- elif e.rotate.hook is defined -%}
@@ -103,7 +137,8 @@
       {%- endfor -%}
       {{ bad }}
 
-# probe works on the whole store when secret_ids is omitted.
+# probe, preflight and import work on the whole catalog when secret_ids is
+# omitted (app_secrets_all_ids_ops).
 - name: "app_secrets | {{ app_secrets_op }} | Resolve secret_ids"
   ansible.builtin.set_fact:
     _app_secrets_ids: >-
@@ -124,7 +159,7 @@
       of credential IDs. Valid IDs: {{ _valid_ids | sort | join(', ') }}
     quiet: true
   vars:
-    _valid_ids: "{{ app_secrets_catalog.keys() | list + app_secrets_platform_catalog.keys() | list }}"
+    _valid_ids: "{{ app_secrets_catalog.keys() | list }}"
 
 - name: "app_secrets | {{ app_secrets_op }} | Fail on unknown credential IDs"
   ansible.builtin.fail:
@@ -132,18 +167,9 @@
       app_secrets | {{ app_secrets_op }} | unknown credential ID(s):
       {{ _unknown | join(', ') }}. Valid IDs: {{ _valid_ids | sort | join(', ') }}
   vars:
-    _valid_ids: "{{ app_secrets_catalog.keys() | list + app_secrets_platform_catalog.keys() | list }}"
+    _valid_ids: "{{ app_secrets_catalog.keys() | list }}"
     _unknown: "{{ _app_secrets_ids | reject('in', _valid_ids) | list }}"
   when: _unknown | length > 0
-
-- name: "app_secrets | {{ app_secrets_op }} | Fail on unknown ensure_phase"
-  ansible.builtin.fail:
-    msg: >-
-      app_secrets | ensure | unknown ensure_phase '{{ ensure_phase }}'.
-      Valid phases: {{ app_secrets_ensure_phases | join(', ') }}
-  when:
-    - app_secrets_op == 'ensure'
-    - ensure_phase | default('before_deploy') not in app_secrets_ensure_phases
 
 - name: "app_secrets | {{ app_secrets_op }} | Fail on unknown import_phase"
   ansible.builtin.fail:
@@ -153,17 +179,6 @@
   when:
     - app_secrets_op == 'import'
     - import_phase | default('import') not in app_secrets_import_phases
-
-- name: "app_secrets | {{ app_secrets_op }} | Fail on platform IDs outside ensure after_deploy"
-  ansible.builtin.fail:
-    msg: >-
-      app_secrets | {{ app_secrets_op }} | {{ _platform | join(', ') }}: platform
-      Secrets are only marked, with ensure and ensure_phase: after_deploy
-  vars:
-    _platform: "{{ _app_secrets_ids | select('in', app_secrets_platform_catalog.keys() | list) | list }}"
-  when:
-    - _platform | length > 0
-    - not (app_secrets_op == 'ensure' and ensure_phase | default('before_deploy') == 'after_deploy')
 
 - name: "app_secrets | {{ app_secrets_op }} | Fail on unknown secrets_backend"
   ansible.builtin.fail:
@@ -182,5 +197,16 @@
 # switches its charts to the externally managed Secrets. Set on every op, so
 # it is defined after the first port call of a run (app_pre_install probe).
 - name: "app_secrets | {{ app_secrets_op }} | Report how Secrets are delivered"
-  ansible.builtin.set_fact:
-    app_secrets_projected: "{{ secrets_backend in app_secrets_projecting_backends }}"
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/mode.yaml"
+
+# The roles call the port only when app_secrets_projected; reaching it in
+# local mode is a caller bug.
+- name: "app_secrets | {{ app_secrets_op }} | Fail without a projecting backend"
+  ansible.builtin.fail:
+    msg: >-
+      app_secrets | {{ app_secrets_op }} | the port is openbao only (secrets_backend:
+      {{ secrets_backend }}; requested: {{ app_secrets_selected_ids | join(', ') }}). In local mode
+      the roles call app_generate_password / app_password_mgmt themselves (when: not app_secrets_projected).
+  when:
+    - app_secrets_op != 'preflight'
+    - not (app_secrets_projected | bool)

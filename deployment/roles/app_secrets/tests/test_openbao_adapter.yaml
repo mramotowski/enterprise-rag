@@ -5,8 +5,11 @@
 # status and the ExternalSecret rendering against a real OpenBao 2.7.0 (Docker
 # image quay.io/openbao/openbao:2.7.0, dev-tls mode on 127.0.0.1) set up like
 # the platform bootstrap, with Kubernetes auth through a fake TokenReview API.
-# The fake kubernetes.core runs each worker Job spec in Docker and plays ESO
-# (files/fake_openbao_cluster.py).
+# The fake kubernetes.core runs each secrets Job (files/secrets_job.py) on this
+# host as its spec says and plays ESO (files/fake_openbao_cluster.py). The NKey
+# public-key derivation is checked against the RFC 8032 vectors and against the
+# Python cryptography package, which must be installed for ansible_playbook_python
+# on this host (CI installs it; the Jobs themselves never use it).
 #
 # Run from the enterprise-rag repo root:
 #   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
@@ -40,6 +43,14 @@
             argv: ["{{ ansible_playbook_python }}", "{{ harness }}", start, "{{ _tmp.path }}/openbao"]
           register: _env
           changed_when: true
+
+        - name: "app_secrets | test | openbao | NKey public keys match RFC 8032 and cryptography"
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ harness }}", nkey-vectors,
+                   "{{ playbook_dir }}/../files/secrets_job.py", "50"]
+          register: _nkey
+          changed_when: false
+          failed_when: _nkey.stdout != 'ok'
 
         - name: "app_secrets | test | openbao | Write the test registry (templates, test-only credentials)"
           ansible.builtin.command:

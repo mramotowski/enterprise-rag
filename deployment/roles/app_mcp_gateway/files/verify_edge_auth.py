@@ -5,7 +5,7 @@
 """
 In-cluster MCP edge authentication check (projected Secrets; AD-3).
 
-Run by the Job in templates/edge-auth-job.yaml.j2: mints an agent token with
+Run as a Job (app_script_job, tasks/verify_edge_auth_job.yaml): mints an agent token with
 the client_credentials grant, the way an agent integration does, then presents
 it to the MCP route until the edge stops answering 401/403. The client id and
 secret come only from the environment (secretKeyRef), never from argv.

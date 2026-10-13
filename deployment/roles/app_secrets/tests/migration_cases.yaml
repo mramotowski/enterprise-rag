@@ -39,7 +39,25 @@
     app_secrets_eso_wait_delay: 1
     _st: "{{ lookup('ansible.builtin.file', state_file) | from_json }}"
     _runs: "{{ (_st['FakeJobRuns//all'] | default({'names': []})).names }}"
-    file_ids: [chat-history/postgres, fingerprint/postgres, edp/object-store, edp/redis, edp/postgresql, vector-db/redis]
+    # The default_credentials.yaml lines (and markup users) of the local
+    # install, keyed <Secret name>#<key>: what the roles' app_generate_password
+    # and app_password_mgmt calls write (upstream).
+    legacy_file_vars:
+      "mongo-database-secret#POSTGRES_PASSWORD": {file_var: CHAT_HISTORY_POSTGRES_PASSWORD, user: chat_history}
+      "fingerprint-postgresql-secret#password": {file_var: FINGERPRINT_POSTGRES_PASSWORD, user: fingerprint}
+      "edp-access-secret#EDP_ACCESS_KEY": {file_var: EDP_MINIO_ACCESS_KEY, user: ""}
+      "edp-access-secret#EDP_SECRET_KEY": {file_var: EDP_MINIO_SECRET_KEY, user: ""}
+      "edp-redis-secret#password": {file_var: EDP_REDIS_PASSWORD, user: default}
+      "edp-postgresql-secret#DATABASE_PASSWORD": {file_var: EDP_POSTGRESQL_PASSWORD, user: edp}
+      "edp-postgresql-secret#DATABASE_ADMIN_PASSWORD": {file_var: EDP_POSTGRESQL_ADMIN_PASSWORD, user: admin}
+      "redis-cluster-secret#REDIS_PASSWORD": {file_var: REDIS_PASSWORD, user: default}
+      # Marked by app_edp seaweedfs.yaml; no default_credentials.yaml line of its own.
+      "seaweedfs-admin-secret#adminPassword": {file_var: SEAWEEDFS_ADMIN_PASSWORD, user: ""}
+    # Marked items seeded without a map entry (markup variable = the Secret key):
+    # the object-store keys again, under their seaweedfs-s3-secret keys.
+    legacy_file_vars_excluded:
+      - "seaweedfs-s3-secret#admin_access_key_id"
+      - "seaweedfs-s3-secret#admin_secret_access_key"
     # Secrets a local install leaves to Helm (the vector_databases and edp charts).
     helm_owned: [vdb/redis-cluster-secret, edp/edp-postgresql-secret, edp/edp-redis-secret, edp/edp-access-secret,
                  edp/edp-celery-secrets]
@@ -91,25 +109,61 @@
 
     # --- the local env ---------------------------------------------------------------
 
-    - name: "app_secrets | test | migration | Generate the local credential file (local adapter)"
+    # As the roles do in local mode (chat_history, fingerprint, edp, vector_databases).
+    - name: "app_secrets | test | migration | Generate the local credential passwords"
+      ansible.builtin.include_role:
+        name: app_generate_password
+        tasks_from: generate_password.yaml
+      loop:
+        - {name: CHAT_HISTORY_POSTGRES, user: chat_history}
+        - {name: FINGERPRINT_POSTGRES, user: fingerprint}
+        - {name: EDP_REDIS, user: default}
+        - {name: EDP_POSTGRESQL, user: edp}
+        - {name: EDP_POSTGRESQL_ADMIN, user: admin}
+        - {name: REDIS, user: default}
+
+    - name: "app_secrets | test | migration | Generate the local credential keys"
+      ansible.builtin.include_role:
+        name: app_generate_password
+        tasks_from: generate_key.yaml
+      loop:
+        - {name: EDP_MINIO_ACCESS_KEY}
+        - {name: EDP_MINIO_SECRET_KEY}
+
+    # Builds app_secrets_catalog (config only, no store access).
+    - name: "app_secrets | test | migration | Load the credential catalog"
       ansible.builtin.include_role:
         name: app_secrets
-        tasks_from: ensure.yaml
+        tasks_from: preflight.yaml
       vars:
         secrets_backend: local
-        secret_ids: "{{ file_ids }}"
 
-    - name: "app_secrets | test | migration | Load the role ID lists"
-      ansible.builtin.include_vars:
-        file: "{{ playbook_dir }}/../../{{ item }}/defaults/main.yaml"
-        name: "{{ item }}_defaults"
-      loop: [app_pre_install, app_post_install]
+    - name: "app_secrets | test | migration | Fix the import IDs"
+      ansible.builtin.set_fact:
+        # The credentials the import selects without secret_ids (as
+        # app_pre_install calls it): every registry credential with a legacy
+        # Secret, in registry order (asserted on the importer plan below).
+        import_ids:
+          - keycloak/erag-admin
+          - keycloak/erag-user
+          - keycloak/erag-maintainer
+          - keycloak/mcp-client
+          - keycloak/grafana-oauth
+          - keycloak/edp-oidc
+          - nats/auth
+          - vector-db/redis
+          - vector-db/pgvector
+          - vector-db/mssql
+          - chat-history/postgres
+          - fingerprint/postgres
+          - edp/postgresql
+          - edp/redis
+          - edp/object-store
+          - seaweedfs/admin
 
-    - name: "app_secrets | test | migration | Both import ID lists are the registry credentials with a legacy Secret"
+    - name: "app_secrets | test | migration | The import IDs are the registry credentials with a legacy Secret"
       ansible.builtin.assert:
-        that:
-          - app_pre_install_defaults.app_pre_install_import_secret_ids == _expected
-          - app_post_install_defaults.app_post_install_import_secret_ids == _expected
+        that: import_ids == _expected
         fail_msg: "expected {{ _expected }}"
         quiet: true
       vars:
@@ -121,23 +175,34 @@
           {%- endfor -%}
           {{ out }}
 
-    - name: "app_secrets | test | migration | Fix the import IDs and the seed spec"
+    - name: "app_secrets | test | migration | Fix the seed spec"
       ansible.builtin.set_fact:
-        import_ids: "{{ app_pre_install_defaults.app_pre_install_import_secret_ids }}"
         # Every legacy Secret key of the importable credentials (vector-db: the
         # deployed engine only), as the local install left it.
         seed_refs: >-
           {%- set out = [] -%}
-          {%- for cid in app_pre_install_defaults.app_pre_install_import_secret_ids
+          {%- for cid in import_ids
                 if cid not in ['vector-db/pgvector', 'vector-db/mssql'] -%}
             {%- for i in app_secrets_catalog[cid].legacy if i.secret is mapping and i.kv_key is string -%}
               {%- set _ = out.append({'id': cid, 'kv_key': i.kv_key, 'namespace': i.secret.namespace, 'name': i.secret.name,
-                                      'key': i.secret.key, 'file_var': i.file_var, 'user': i.secret.user,
+                                      'key': i.secret.key,
+                                      'file_var': (legacy_file_vars[i.secret.name ~ '#' ~ i.secret.key] | default({})).file_var | default(none),
+                                      'user': (legacy_file_vars[i.secret.name ~ '#' ~ i.secret.key] | default({})).user | default(none),
                                       'markup': i.secret.markup | default(false),
                                       'path': 't1/' ~ app_secrets_catalog[cid].path}) -%}
             {%- endfor -%}
           {%- endfor -%}
           {{ out }}
+
+    - name: "app_secrets | test | migration | Every marked seed item has a file line entry or is excluded"
+      ansible.builtin.assert:
+        that: _unmapped | length == 0
+        fail_msg: "marked seed items in neither legacy_file_vars nor legacy_file_vars_excluded: {{ _unmapped }}"
+        quiet: true
+      vars:
+        _unmapped: >-
+          {{ seed_refs | selectattr('markup') | map(attribute='name') | zip(seed_refs | selectattr('markup') | map(attribute='key'))
+             | map('join', '#') | reject('in', legacy_file_vars.keys() | list + legacy_file_vars_excluded) | list }}
 
     - name: "app_secrets | test | migration | Write the seed spec"
       ansible.builtin.copy:
@@ -185,7 +250,7 @@
     - name: "app_secrets | test | migration | Run the conflict case"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: conflict, op: import, ids: "{{ import_ids }}"}
+        case: {name: conflict, op: import}
 
     - name: "app_secrets | test | migration | Count the entries after the conflict"
       ansible.builtin.command:
@@ -227,27 +292,27 @@
       vars:
         patch_key: Secret/keycloak/erag-credentials
         patch: {data: {KEYCLOAK_ERAG_USER_PASSWORD: null}}
-        case: {name: kc-missing, op: import, ids: "{{ import_ids }}"}
+        case: {name: kc-missing, op: import}
 
     - name: "app_secrets | test | migration | Two sources of one key disagree"
       ansible.builtin.include_tasks: openbao_state_case.yaml
       vars:
         patch_key: Secret/seaweedfs/seaweedfs-s3-secret
         patch: {data: {admin_access_key_id: ZGlmZmVyZW50LWFjY2Vzcy1rZXk=}}
-        case: {name: disagree, op: import, ids: "{{ import_ids }}"}
+        case: {name: disagree, op: import}
 
     - name: "app_secrets | test | migration | An entry with only some of its keys"
       ansible.builtin.include_tasks: openbao_state_case.yaml
       vars:
         patch_key: Secret/edp/edp-postgresql-secret
         patch: {data: {DATABASE_ADMIN_PASSWORD: null}}
-        case: {name: partial, op: import, ids: "{{ import_ids }}"}
+        case: {name: partial, op: import}
 
     # With s3 storage the object-store keys are not read from edp-access-secret.
     - name: "app_secrets | test | migration | Unreachable OpenBao (s3 storage)"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: unreachable, op: import, ids: "{{ import_ids }}", addr: "https://127.0.0.1:1"}
+        case: {name: unreachable, op: import, addr: "https://127.0.0.1:1"}
         edp_storage_type: s3
 
     - name: "app_secrets | test | migration | Note the unreachable run's plan"
@@ -301,7 +366,7 @@
     - name: "app_secrets | test | migration | Run the deleted-version case"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: deleted, op: import, ids: "{{ import_ids }}"}
+        case: {name: deleted, op: import}
 
     - name: "app_secrets | test | migration | Count the entries after the deleted-version case"
       ansible.builtin.command:
@@ -328,7 +393,7 @@
     - name: "app_secrets | test | migration | A Secret patch fails after the writes"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: handover-fail, op: import, ids: "{{ import_ids }}", env: {FAKE_KUBE_DENY_PATCH: keycloak/keycloak-admin-secret}}
+        case: {name: handover-fail, op: import, env: {FAKE_KUBE_DENY_PATCH: keycloak/keycloak-admin-secret}}
 
     - name: "app_secrets | test | migration | The failed patch is reported with what was already patched"
       ansible.builtin.assert:
@@ -349,7 +414,7 @@
     - name: "app_secrets | test | migration | Import"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: import, op: import, ids: "{{ import_ids }}"}
+        case: {name: import, op: import}
 
     - name: "app_secrets | test | migration | Note the importer run"
       ansible.builtin.set_fact:
@@ -389,7 +454,10 @@
           - _pod.automountServiceAccountToken == false
           - _pod.volumes | selectattr('secret', 'defined') | list | length == 0
           - _c.env | selectattr('valueFrom', 'defined') | list | length == 0
-          - _c.args | default([]) | length == 0
+          - _c.args == ['import']
+          - _c.image == 'docker.io/library/python:3.12-slim'
+          # istio_enabled is set (openbao_case.yaml): only rotator pods join the mesh.
+          - "'istio.io/dataplane-mode' not in _job.spec.template.metadata.labels"
           - _c.securityContext.readOnlyRootFilesystem
           - (_tokens | selectattr('path', 'equalto', 'openbao-token') | first).audience == 'vault'
           - (_tokens | selectattr('path', 'equalto', 'kube-token') | first).audience is not defined
@@ -584,7 +652,7 @@
     - name: "app_secrets | test | migration | Finalize while helm fails"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: finalize-fail, op: import, ids: "{{ import_ids }}", import_phase: finalize, env: {FAKE_HELM_FAIL: "1"}}
+        case: {name: finalize-fail, op: import, import_phase: finalize, env: {FAKE_HELM_FAIL: "1"}}
 
     - name: "app_secrets | test | migration | A failed finalize leaves the migration to the next run"
       ansible.builtin.assert:
@@ -598,7 +666,7 @@
     - name: "app_secrets | test | migration | Finalize"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: finalize, op: import, ids: "{{ import_ids }}", import_phase: finalize}
+        case: {name: finalize, op: import, import_phase: finalize}
 
     - name: "app_secrets | test | migration | Look at the env dir"
       ansible.builtin.stat:
@@ -638,7 +706,7 @@
     - name: "app_secrets | test | migration | Finalize again"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: finalize-2, op: import, ids: "{{ import_ids }}", import_phase: finalize}
+        case: {name: finalize-2, op: import, import_phase: finalize}
 
     - name: "app_secrets | test | migration | The migration is done once every erag release was upgraded"
       ansible.builtin.assert:
@@ -658,8 +726,8 @@
     - name: "app_secrets | test | migration | Re-run import and finalize"
       ansible.builtin.include_tasks: openbao_case.yaml
       loop:
-        - {name: rerun-import, op: import, ids: "{{ import_ids }}"}
-        - {name: rerun-finalize, op: import, ids: "{{ import_ids }}", import_phase: finalize}
+        - {name: rerun-import, op: import}
+        - {name: rerun-finalize, op: import, import_phase: finalize}
       loop_control:
         loop_var: case
         label: "{{ case.name }}"
@@ -688,8 +756,8 @@
     - name: "app_secrets | test | migration | Import on a fresh install (no local files: another env dir)"
       ansible.builtin.include_tasks: openbao_case.yaml
       loop:
-        - {name: fresh-import, op: import, ids: "{{ import_ids }}"}
-        - {name: fresh-rerun, op: import, ids: "{{ import_ids }}"}
+        - {name: fresh-import, op: import}
+        - {name: fresh-rerun, op: import}
       loop_control:
         loop_var: case
         label: "{{ case.name }}"
@@ -708,6 +776,28 @@
           - _importer_objects | length == 0
         fail_msg: "{{ obcases['fresh-import'].msg }} {{ obcases['fresh-rerun'].msg }}"
         quiet: true
+
+    - name: "app_secrets | test | migration | Forget the migration state (explicit-subset import)"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: "{{ _st | dict2items | rejectattr('key', 'equalto', 'ConfigMap/erag-secrets/erag-secrets-migration') | items2dict | to_json }}"
+
+    - name: "app_secrets | test | migration | Import with an explicit secret_ids subset"
+      ansible.builtin.include_tasks: openbao_case.yaml
+      vars:
+        case: {name: subset-import, op: import, ids: [chat-history/postgres, keycloak/grafana-oauth]}
+        log_dir: "{{ env_dir }}-fresh/logs"
+
+    - name: "app_secrets | test | migration | An explicit secret_ids plans exactly those credentials"
+      ansible.builtin.assert:
+        that:
+          - obcases['subset-import'].ok
+          - _plan.entries | map(attribute='id') | sort == ['chat-history/postgres', 'keycloak/grafana-oauth']
+        fail_msg: "subset-import: {{ obcases['subset-import'].msg }}; plan {{ _plan.entries | default([]) | map(attribute='id') | list }}"
+        quiet: true
+      vars:
+        _plan: "{{ _st['FakeJobRuns//all'].configmaps[_runs | last].data['plan.json'] | from_json }}"
 
     - name: "app_secrets | test | migration | Record every value stored in OpenBao"
       ansible.builtin.shell:
@@ -729,7 +819,7 @@
     - name: "app_secrets | test | migration | Import against a sealed OpenBao"
       ansible.builtin.include_tasks: openbao_case.yaml
       vars:
-        case: {name: sealed, op: import, ids: "{{ import_ids }}"}
+        case: {name: sealed, op: import}
 
     - name: "app_secrets | test | migration | A sealed OpenBao fails the import before anything changes"
       ansible.builtin.assert:

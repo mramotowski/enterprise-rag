@@ -3,8 +3,8 @@
 #
 # Rotate-only run (erag_rotate set, AD-9): tasks/install.yaml includes this
 # after the credential store probe and skips everything else; components.yaml
-# disables the other erag components. app_secrets rotate does the work (the
-# local backend refuses it: rotation needs the OpenBao backend).
+# disables the other erag components. app_secrets rotate does the work;
+# rotation needs the OpenBao backend (install.yaml refuses it in local mode).
 
 ---
 - name: "app_pre_install | Rotate | Fail when erag_rotate names no credential"
@@ -31,3 +31,4 @@
     tasks_from: rotate.yaml
   vars:
     secret_ids: "{{ app_pre_install_rotate_ids }}"
+  when: app_secrets_projected

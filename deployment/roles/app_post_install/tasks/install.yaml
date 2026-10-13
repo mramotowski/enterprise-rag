@@ -84,8 +84,7 @@
     name: app_secrets
     tasks_from: import.yaml
   vars:
-    secret_ids: "{{ app_post_install_import_secret_ids }}"
     import_phase: finalize
   when:
     - component_action | default('install') == 'install'
-    - app_secrets_projected | default(false)
+    - app_secrets_projected

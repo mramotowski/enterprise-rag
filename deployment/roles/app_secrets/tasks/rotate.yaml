@@ -14,5 +14,5 @@
   vars:
     app_secrets_op: rotate
 
-- name: "app_secrets | rotate | Run {{ secrets_backend }} adapter"
-  ansible.builtin.include_tasks: "adapters/{{ secrets_backend }}/rotate.yaml"
+- name: "app_secrets | rotate | Run the openbao adapter"
+  ansible.builtin.include_tasks: adapters/openbao/rotate.yaml

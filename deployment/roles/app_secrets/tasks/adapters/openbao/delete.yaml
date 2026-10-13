@@ -58,15 +58,15 @@
 
     - name: "app_secrets | delete | openbao | Build the worker plan"
       ansible.builtin.set_fact:
+        # A layer teardown adds purge: <cluster_id>/<layer> (else no purge key).
         app_secrets_worker_plan: >-
           {%- set out = [] -%}
           {%- for cid in app_secrets_selected_ids -%}
-            {%- set _ = out.append('delete ' ~ cid ~ ' ' ~ app_secrets_openbao_cluster_id ~ '/' ~ app_secrets_catalog[cid].path) -%}
+            {%- set _ = out.append({'action': 'delete', 'id': cid,
+                                    'path': app_secrets_openbao_cluster_id ~ '/' ~ app_secrets_catalog[cid].path}) -%}
           {%- endfor -%}
-          {%- if _app_secrets_delete_layer | bool -%}
-            {%- set _ = out.append('purge ' ~ _app_secrets_delete_prefix) -%}
-          {%- endif -%}
-          {{ out }}
+          {{ {'mount': app_secrets_openbao_kv_mount, 'entries': out}
+             | combine({'purge': _app_secrets_delete_prefix} if _app_secrets_delete_layer | bool else {}) }}
 
     - name: "app_secrets | delete | openbao | Run the worker"
       ansible.builtin.include_tasks: run_worker.yaml

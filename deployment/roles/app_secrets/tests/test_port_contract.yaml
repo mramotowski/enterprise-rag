@@ -1,0 +1,436 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# The app_secrets port contract, without a cluster:
+#   - the registry: the expected credential IDs, every Secret once, every data
+#     ref resolves, the nats/auth generator;
+#   - request validation: bad secret_ids, phases, backends and registries fail
+#     before anything runs, and every port op but preflight fails loudly in
+#     local mode (the port is openbao only);
+#   - the roles: every port call runs only when app_secrets_projected; every
+#     app_generate_password / app_password_mgmt call, default_credentials.*
+#     write and role Secret write is skipped then; every reader of app_secrets_projected
+#     resolves it at the top of tasks/main.yaml (install --only), and
+#     app_pre_install runs the switch-back guard before the local credential
+#     helpers.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_secrets/tests/test_port_contract.yaml
+
+---
+- name: "app_secrets | test | contract | Registry, requests and role guards"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    secrets_backend: local
+    secure_logs: true
+    registry_file: "{{ playbook_dir }}/../files/registry.yaml"
+    roles_dir: "{{ playbook_dir }}/../.."
+    # The expected erag credential IDs, one per credential (vector-db/<engine>
+    # is one entry that expands to one ID per engine).
+    inventory_registry_ids:
+      - keycloak/erag-admin
+      - keycloak/erag-user
+      - keycloak/erag-maintainer
+      - keycloak/mcp-client
+      - keycloak/grafana-oauth
+      - keycloak/edp-oidc
+      - nats/auth
+      - vector-db/<engine>
+      - chat-history/postgres
+      - fingerprint/postgres
+      - edp/postgresql
+      - edp/redis
+      - edp/object-store
+      - seaweedfs/admin
+      - user/edp-s3
+      - user/sharepoint
+      - user/keycloak-oidc
+      - user/ldap-bind
+      - user/hf-token
+  tasks:
+    - name: "app_secrets | test | contract | Create per-run temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: app_secrets_contract.
+      register: _test_tmp
+
+    - name: "app_secrets | test | contract | Registry checks"
+      block:
+        - name: "app_secrets | test | contract | Load registry"
+          ansible.builtin.include_vars:
+            file: "{{ registry_file }}"
+            name: test_registry
+
+        - name: "app_secrets | test | contract | Registry has exactly the expected credential IDs"
+          ansible.builtin.assert:
+            that:
+              - test_registry.credentials.keys() | sort == inventory_registry_ids | sort
+              - test_registry.credentials | length == 19
+            fail_msg: >-
+              missing: {{ inventory_registry_ids | difference(test_registry.credentials.keys() | list) }},
+              extra: {{ test_registry.credentials.keys() | list | difference(inventory_registry_ids) }}
+
+        - name: "app_secrets | test | contract | Credential entries carry no projections"
+          ansible.builtin.assert:
+            that: test_registry.credentials | dict2items | selectattr('value.projections', 'defined') | list | length == 0
+
+        # Builds app_secrets_catalog (the expanded credential IDs) through the
+        # config-only preflight op, the one op local mode may call.
+        - name: "app_secrets | test | contract | Load the catalog through the port"
+          ansible.builtin.include_role:
+            name: app_secrets
+            tasks_from: preflight.yaml
+
+        - name: "app_secrets | test | contract | The local backend does not project Secrets"
+          ansible.builtin.assert:
+            that:
+              - app_secrets_projected is defined
+              - not (app_secrets_projected | bool)
+            quiet: true
+
+        # YAML silently keeps the last of two equal keys, so check the raw file.
+        - name: "app_secrets | test | contract | Read the secrets: keys"
+          ansible.builtin.set_fact:
+            raw_secret_keys: >-
+              {{ lookup('ansible.builtin.file', registry_file)
+                 | regex_search('(?ms)^secrets:[ ]*$(.*)', '\1') | first
+                 | regex_findall('(?m)^  ([^#\s].*):\s*$') }}
+            # Reading the keys into a list resolves their namespace refs.
+            resolved_secret_keys: "{{ test_registry.secrets.keys() | list }}"
+
+        - name: "app_secrets | test | contract | Every Secret appears exactly once"
+          ansible.builtin.assert:
+            that:
+              - raw_secret_keys | length == test_registry.secrets | length
+              - raw_secret_keys | unique | length == raw_secret_keys | length
+              - resolved_secret_keys | unique | length == resolved_secret_keys | length
+              - resolved_secret_keys | reject('match', '^[a-z0-9-]+/[a-z0-9.-]+$') | list | length == 0
+            fail_msg: "raw: {{ raw_secret_keys }}; resolved: {{ resolved_secret_keys }}"
+
+        - name: "app_secrets | test | contract | Every Secret data ref resolves to a credential key or identifier"
+          ansible.builtin.assert:
+            that:
+              - _bad | length == 0
+              - (app_secrets_catalog.keys() | list) | difference(_used) | length == 0
+            fail_msg: "bad refs: {{ _bad }}; credentials in no Secret: {{ (app_secrets_catalog.keys() | list) | difference(_used) }}"
+          vars:
+            _checked: >-
+              {%- set bad = [] -%}
+              {%- set used = [] -%}
+              {%- for skey, s in test_registry.secrets.items() -%}
+                {%- if (s.data is defined) == (s.variants is defined) -%}
+                  {%- set _ = bad.append(skey ~ ': needs exactly one of data, variants') -%}
+                {%- endif -%}
+                {%- set datas = [s.data] if s.data is defined else (s.variants | default({}) | dict2items | map(attribute='value.data') | list) -%}
+                {%- for d in datas -%}
+                  {%- for k, src in d.items() -%}
+                    {%- set forms = ['from', 'identifier', 'value', 'value_from', 'template'] | select('in', src.keys() | list) | list -%}
+                    {%- if forms | length != 1 -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': needs exactly one of from, identifier, value, value_from, template') -%}
+                    {%- endif -%}
+                    {%- if src.enabled is defined and not (src.enabled is string or src.enabled is boolean) -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': enabled must be a config expression or a boolean') -%}
+                    {%- endif -%}
+                    {%- if src.value_from is defined and not (src.value_from is match('^[a-z_][a-z0-9_]*[.][A-Za-z0-9_]+$')) -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': value_from must be <fact>.<key>') -%}
+                    {%- endif -%}
+                    {%- if src.template is defined and src.template not in (test_registry.templates | default({}, true)) -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': template ' ~ src.template ~ ' is not defined') -%}
+                    {%- endif -%}
+                    {%- set key_refs = ([src['from']] if src['from'] is defined else []) + (src.sources if src.template is defined else []) -%}
+                    {%- if src.template is defined and src.sources is not defined -%}
+                      {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': template needs sources') -%}
+                    {%- endif -%}
+                    {%- for ref in key_refs -%}
+                      {%- set cid, kv = (ref ~ '.').split('.', 1)[0], ref.split('.', 1)[1] | default('') -%}
+                      {%- if cid not in app_secrets_catalog or kv not in app_secrets_catalog[cid]['keys'] -%}
+                        {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': ' ~ ref) -%}
+                      {%- else -%}
+                        {%- set _ = used.append(cid) -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {%- if src.identifier is defined -%}
+                      {%- set cid, name = (src.identifier ~ '.').split('.', 1)[0], src.identifier.split('.', 1)[1] | default('') -%}
+                      {%- if cid not in app_secrets_catalog or name not in (app_secrets_catalog[cid].identifiers | default({})) -%}
+                        {%- set _ = bad.append(skey ~ ' ' ~ k ~ ': identifier ' ~ src.identifier) -%}
+                      {%- endif -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ {'bad': bad, 'used': used | unique | list} }}
+            _bad: "{{ _checked.bad }}"
+            _used: "{{ _checked.used }}"
+
+        - name: "app_secrets | test | contract | nats/auth has one nkey_user generator for both keys"
+          ansible.builtin.assert:
+            that:
+              - _k.seed.generate.type == 'nkey_user'
+              - _k.seed.generate.writes | sort == ['public_key', 'seed']
+              - _k.public_key.generate is not defined
+              - _k.public_key.generated_by == 'seed'
+          vars:
+            _k: "{{ test_registry.credentials['nats/auth']['keys'] }}"
+
+      rescue:
+        - name: "app_secrets | test | contract | Remove temp dir after a failed registry check"
+          ansible.builtin.file:
+            path: "{{ _test_tmp.path }}"
+            state: absent
+
+        - name: "app_secrets | test | contract | Registry check failed"
+          ansible.builtin.fail:
+            msg: "registry check failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+
+    - name: "app_secrets | test | contract | Request validation"
+      vars:
+        test_dir: "{{ _test_tmp.path }}"
+      block:
+        - name: "app_secrets | test | contract | Collect failures"
+          ansible.builtin.set_fact:
+            test_failures: {}
+
+        - name: "app_secrets | test | contract | Run the failing cases"
+          ansible.builtin.include_tasks: expect_failure.yaml
+          loop: "{{ _cases }}"
+          loop_control:
+            loop_var: case
+            label: "{{ case.name }}"
+          vars:
+            _cases:
+              - {name: unknown-id, op: ensure, ids: [chat-history/postgres, foo/bar]}
+              - {name: base-id, op: ensure, ids: [chat-history/postgres, "vector-db/<engine>"]}
+              - {name: ids-string, op: ensure, ids: chat-history/postgres}
+              - {name: ids-mapping, op: ensure, ids: {chat-history/postgres: true}}
+              - {name: ids-empty, op: ensure, ids: []}
+              - {name: unknown-backend, op: ensure, ids: [chat-history/postgres], backend: vault}
+              - {name: invalid-registry, op: ensure, ids: [chat-history/postgres], registry: "{{ playbook_dir }}/fixtures/invalid_registry.yaml"}
+              - {name: ensure-no-ids, op: ensure, ids: null}
+              # Without secret_ids, import selects the whole catalog (here it
+              # then fails: local mode); delete still needs an explicit list.
+              - {name: import-all-ids, op: import}
+              - {name: delete-no-ids, op: delete}
+              - {name: delete-empty-ids, op: delete, ids: []}
+              - {name: unknown-import-phase, op: import, ids: [chat-history/postgres], import_phase: migrate}
+              # platform/* entries are read by the import only (markup removal).
+              - {name: platform-id, op: ensure, ids: [platform/keycloak-admin]}
+              # Valid requests in local mode: the port is openbao only.
+              - {name: local-probe, op: probe, ids: [chat-history/postgres]}
+              - {name: local-ensure, op: ensure, ids: [chat-history/postgres]}
+              - {name: local-status, op: status, ids: [chat-history/postgres]}
+              - {name: local-delete, op: delete, ids: [chat-history/postgres]}
+              - {name: local-import, op: import, ids: [chat-history/postgres]}
+              - {name: local-finalize, op: import, ids: [chat-history/postgres], import_phase: finalize}
+              - {name: local-rotate, op: rotate, ids: [chat-history/postgres]}
+
+        - name: "app_secrets | test | contract | Failure messages"
+          ansible.builtin.assert:
+            that:
+              - "'foo/bar' in _m['unknown-id']"
+              - "'Valid IDs:' in _m['unknown-id']"
+              - "'chat-history/postgres' in _m['unknown-id']"
+              - "'vector-db/mssql' in _m['unknown-id']"
+              - "'platform/keycloak-admin' not in _m['unknown-id']"
+              - "'unknown credential ID(s): vector-db/<engine>' in _m['base-id']"
+              - "'secret_ids must be a non-empty list' in _m['ids-string']"
+              - "'secret_ids must be a non-empty list' in _m['ids-mapping']"
+              - "'secret_ids must be a non-empty list' in _m['ids-empty']"
+              - "\"unknown secrets_backend 'vault'\" in _m['unknown-backend']"
+              - "'invalid registry entries' in _m['invalid-registry']"
+              - "'Bad_Id/x: id is not lower-kebab' in _m['invalid-registry']"
+              - "'bad/no-rotate: missing rotate' in _m['invalid-registry']"
+              - "'bad/hook: unknown rotate.hook vector-db-password-change' in _m['invalid-registry']"
+              - "'bad/restart: rotate.restart must list names of the registry workloads' in _m['invalid-registry']"
+              - "'bad/keys: rotate.keys must name exactly one kv_key with a password or hex generator' in _m['invalid-registry']"
+              - "'bad/target: rotate.target of postgres-alter-user needs host, port, database, user' in _m['invalid-registry']"
+              - "'bad/operator: rotate.hook operator-write is for erag/user/* entries' in _m['invalid-registry']"
+              - "'workloads bad-kind: a list of {namespace, kind' in _m['invalid-registry']"
+              - "'workloads ok' not in _m['invalid-registry']"
+              - "'chat-history/postgres:' not in _m['invalid-registry']"
+              - "'secret_ids must be a non-empty list' in _m['ensure-no-ids']"
+              - "'the port is openbao only' in _m['import-all-ids']"
+              - _import_all_ids | sort == app_secrets_catalog.keys() | sort
+              - "'secret_ids must be a non-empty list' in _m['delete-no-ids']"
+              - "'secret_ids must be a non-empty list' in _m['delete-empty-ids']"
+              - "\"unknown import_phase 'migrate'\" in _m['unknown-import-phase']"
+              - "'unknown credential ID(s): platform/keycloak-admin' in _m['platform-id']"
+              - _local | length == 7
+              - _local | reject('search', 'the port is openbao only') | list | length == 0
+            fail_msg: "{{ _m | to_json }}"
+          vars:
+            _m: "{{ dict(test_failures.keys() | zip(test_failures.values() | map(attribute='msg'))) }}"
+            _local: "{{ test_failures | dict2items | selectattr('key', 'match', '^local-') | map(attribute='value.msg') | list }}"
+            _import_all_ids: "{{ (_m['import-all-ids'] | regex_search('requested: ([^)]*)[)]', '\\1') | default([''], true) | first).split(', ') }}"
+
+      rescue:
+        - name: "app_secrets | test | contract | Remove temp dir after a failed request check"
+          ansible.builtin.file:
+            path: "{{ _test_tmp.path }}"
+            state: absent
+
+        - name: "app_secrets | test | contract | Request check failed"
+          ansible.builtin.fail:
+            msg: "request check failed: {{ ansible_failed_result.msg | default('see above') }}"
+
+    - name: "app_secrets | test | contract | Role guards"
+      block:
+        - name: "app_secrets | test | contract | Find the role task files"
+          ansible.builtin.find:
+            paths: "{{ roles_dir }}"
+            patterns: "*.yaml"
+            recurse: true
+          register: _role_find
+
+        # Every role task file except the port and the local helpers themselves.
+        - name: "app_secrets | test | contract | Select the role task files"
+          ansible.builtin.set_fact:
+            _role_task_files: >-
+              {{ _role_find.files | map(attribute='path') | select('search', '/app_[a-z_]+/tasks/')
+                 | reject('search', '/(app_secrets|app_generate_password|app_password_mgmt)/') | sort | list }}
+
+        # check_projected_guards.py prints "found <file>: <task>" per task it
+        # checks, "unguarded ..." per task without its guard, and "checked <n>".
+        - name: "app_secrets | test | contract | Run the guard checks"
+          ansible.builtin.command:
+            argv: "{{ [ansible_playbook_python, playbook_dir ~ '/files/check_projected_guards.py'] + item.args }}"
+          loop:
+            # The port is openbao only (a call reached in local mode fails, above):
+            # every role port call (probe/ensure/status/delete/import/rotate) runs
+            # only when app_secrets_projected. 24 = the port calls in the roles.
+            - {name: port-calls, count: 24, args: "{{ ['--port-calls'] + _role_task_files }}"}
+            # Local mode is the upstream code: every app_generate_password /
+            # app_password_mgmt include and every default_credentials.* write is
+            # skipped when Secrets are projected. 20 = 19 helper calls + the
+            # default_credentials.txt write of app_keycloak_config.
+            - name: local-calls
+              count: 20
+              args: "{{ ['--local-calls'] + _role_task_files }}"
+            # With projected Secrets ESO owns every registry Secret: each Secret
+            # write of the data-service and Keycloak roles is skipped then. Only
+            # the SeaweedFS IAM config is local by design (refused with projected
+            # Secrets). 11 = the Secret writes in these files.
+            - name: secret-writes
+              count: 11
+              args: >-
+                {{ ['seaweedfs-iam-config']
+                   + (['app_vector_databases/tasks/install.yaml', 'app_chat_history/tasks/install.yaml',
+                       'app_fingerprint/tasks/install.yaml', 'app_nats/tasks/install.yaml',
+                       'app_edp/tasks/install.yaml', 'app_edp/tasks/seaweedfs.yaml',
+                       'app_keycloak_config/tasks/configure_keycloak.yaml',
+                       'app_keycloak_config/tasks/configure_grafana_sso.yaml']
+                      | map('regex_replace', '^', roles_dir ~ '/') | list) }}
+          loop_control:
+            label: "{{ item.name }}"
+          register: _guard_checks
+          changed_when: false
+          failed_when: false
+
+        - name: "app_secrets | test | contract | Every guard check passed with the expected count"
+          ansible.builtin.assert:
+            that:
+              - item.rc == 0
+              - item.stdout_lines[-1] | default('') == 'checked ' ~ item.item.count
+            fail_msg: >-
+              {{ item.item.name }}: rc {{ item.rc }}, expected checked {{ item.item.count }};
+              {{ item.stdout_lines | map('regex_replace', '^.*/roles/', '') | list | to_json }} {{ item.stderr }}
+            quiet: true
+          loop: "{{ _guard_checks.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+
+        # Story 16: in local mode the switch-back guard runs before the
+        # upstream credential lookup and generation.
+        - name: "app_secrets | test | contract | app_pre_install guards the switch back before the local credentials"
+          ansible.builtin.assert:
+            that:
+              - _guard_at | int >= 0
+              - _guard_at | int < _lookup_at | int
+              - _guard_at | int < _generate_at | int
+              - _tasks[_guard_at | int].when == 'not app_secrets_projected'
+            fail_msg: "switch guard {{ _guard_at }}, lookup {{ _lookup_at }}, generate {{ _generate_at }}"
+            quiet: true
+          vars:
+            _tasks: "{{ lookup('ansible.builtin.file', roles_dir ~ '/app_pre_install/tasks/install.yaml') | from_yaml }}"
+            # <role>/<tasks_from> per task ("/main.yaml" for one that includes no role).
+            _calls: >-
+              {%- set out = [] -%}
+              {%- for t in _tasks -%}
+                {%- set r = t['ansible.builtin.include_role'] | default({}) -%}
+                {%- set _ = out.append(r.name | default('') ~ '/' ~ r.tasks_from | default('main.yaml')) -%}
+              {%- endfor -%}
+              {{ out }}
+            _guard_at: "{{ _calls.index('app_secrets/switch_guard.yaml') if 'app_secrets/switch_guard.yaml' in _calls else -1 }}"
+            _lookup_at: "{{ _calls.index('app_password_mgmt/lookup.yaml') }}"
+            _generate_at: "{{ _calls.index('app_generate_password/main.yaml') }}"
+
+        # `install <component> --only` skips app_pre_install: every role that reads
+        # app_secrets_projected resolves it first, at the top of its tasks/main.yaml.
+        - name: "app_secrets | test | contract | Find the readers of app_secrets_projected"
+          ansible.builtin.command:
+            argv: [grep, -rl, --include=*.yaml, --include=*.j2, app_secrets_projected, "{{ roles_dir }}"]
+          register: _readers_grep
+          changed_when: false
+
+        - name: "app_secrets | test | contract | Roles that read app_secrets_projected"
+          ansible.builtin.set_fact:
+            _reader_roles: >-
+              {{ _readers_grep.stdout_lines
+                 | map('regex_replace', '^.*/(app_[a-z_]+)/(tasks|templates)/[^/]+$', '\1')
+                 | select('match', '^app_[a-z_]+$') | reject('equalto', 'app_secrets') | unique | sort | list }}
+
+        - name: "app_secrets | test | contract | Readers found"
+          ansible.builtin.assert:
+            that: _reader_roles | length >= 12
+            fail_msg: "{{ _reader_roles | to_json }}"
+            quiet: true
+
+        - name: "app_secrets | test | contract | Every reader resolves app_secrets_projected in main.yaml"
+          ansible.builtin.assert:
+            that:
+              - _first['ansible.builtin.include_role'].name == 'app_secrets'
+              - _first['ansible.builtin.include_role'].tasks_from == 'mode.yaml'
+              - _first.when == 'app_secrets_projected is not defined'
+            fail_msg: "{{ item }}/tasks/main.yaml: {{ _first }}"
+            quiet: true
+          loop: "{{ _reader_roles }}"
+          loop_control:
+            label: "{{ item }}"
+          vars:
+            _first: "{{ (lookup('ansible.builtin.file', roles_dir ~ '/' ~ item ~ '/tasks/main.yaml') | from_yaml)[0] }}"
+
+        # A fresh host has no app_secrets_projected (see the "Entry point" play).
+        - name: "app_secrets | test | contract | Add the entry point host"
+          ansible.builtin.add_host:
+            name: mode_entry
+            groups: [contract_mode]
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+      always:
+        - name: "app_secrets | test | contract | Remove per-run temp dir"
+          ansible.builtin.file:
+            path: "{{ _test_tmp.path }}"
+            state: absent
+
+# --- A consumer entry point without app_secrets_projected (install --only) ----------------
+
+- name: "app_secrets | test | contract | Entry point without app_secrets_projected"
+  hosts: contract_mode
+  gather_facts: false
+  tasks:
+    - name: "app_secrets | test | contract | Run app_nats tasks/main.yaml (no-op action)"
+      ansible.builtin.include_role:
+        name: app_nats
+      vars:
+        secrets_backend: local
+        # main.yaml dispatches to "<component_action>.yaml".
+        component_action: "{{ playbook_dir }}/files/noop_action"
+
+    - name: "app_secrets | test | contract | Undefined app_secrets_projected resolved to false (local)"
+      ansible.builtin.assert:
+        that:
+          - app_secrets_projected is defined
+          - app_secrets_projected is false
+        quiet: true

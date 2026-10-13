@@ -14,8 +14,7 @@
 #                  the entry holds secret material only, in lower_snake keys
 #   keys           {kv_key: {generate: <spec>}}; spec type is one of password (length,
 #                  special), hex (bytes), nkey_user (writes seed + public_key),
-#                  static (operator-supplied). openbao-mode specs only.
-#                  Local mode keeps the legacy format (see local.mechanism).
+#                  static (operator-supplied).
 #                  A key filled by another key's generator has {generated_by: <kv_key>}.
 #   identifiers    non-secret values (literals or config var refs)
 #   user_supplied  (erag/user/* only) {kv_key: [config_var, ...]}: the config vars
@@ -25,27 +24,18 @@
 #   user_supplied_env  (optional, erag/user/* only) {kv_key: [ENV_VAR, ...]}: the
 #                  environment variables that also supply the key in local mode;
 #                  preflight reports them like the config vars
-#   legacy         where the value lives today: [{kv_key, file_var, user, secret}]
-#                    file_var  line in default_credentials.yaml (or .txt, see comment)
-#                    user      username app_generate_password writes (<NAME>_USERNAME)
-#                    secret    {namespace, name, key, user}: the Secret and the
-#                              app_password_mgmt markup mapping. user is always
-#                              present: the markup user, or null when the mapping
-#                              has none (or an empty one). secret is null when
-#                              there is no legacy Secret
-#                    skip_if_defined  (optional) fact name; the local adapter skips
-#                              the item when that fact is already defined
-#                    secret.markup    (optional) true when the local adapter marks the
-#                              Secret (meta.erag/* label + password-mappings
-#                              annotation) after deploy, as the roles do today
-#                    secret.variable  (optional) markup variable when it is not file_var
-#                    file      (optional) default_credentials.txt for the lines the
-#                              local adapter writes from the Secret after deploy
-#                              (default: default_credentials.yaml)
-#                    file_identifier  (with file) {var, key}: the identifier line
-#                              written before the file_var line
-#                    file_optional    (with file) skip the lines when the Secret
-#                              lacks the key
+#   legacy         where a local-mode env keeps the value (read by the openbao
+#                  import, AD-12): [{kv_key, secret}], may be empty
+#                    kv_key    the KV key the Secret key holds; null (platform:
+#                              entries) = the Secret is only unmarked, never imported
+#                    secret    {namespace, name, key}: the Secret key holding it
+#                    secret.markup    (optional) true when the roles mark the Secret
+#                              in local mode (app_password_mgmt meta.erag/* label and
+#                              password-mappings annotation); the import removes it.
+#                              The import unmarks per Secret, so one item per
+#                              marked Secret is enough: e.g. seaweedfs/admin lists
+#                              only adminPassword, not the adminUser key of the
+#                              same Secret (an identifier, nothing to import)
 #                    import_enabled   (optional) config expression; when it resolves
 #                              false, the openbao import does not read the item
 #                              (e.g. a Secret whose key holds another value in
@@ -79,22 +69,13 @@
 #                            client secret, through the admin REST API
 #                  restart [<workloads: name>]: restarted after the sync
 #                  (may be empty)
-#   local          {mechanism: file_password | file_key | role_managed | user_supplied}
-#                  role_managed may add:
-#                    generator  {type: lookup_password, length, chars, facts: {kv_key: fact}}
-#                               or {type: gen_nkey, facts: {seed: fact, public_key: fact}}:
-#                               local ensure runs today's generator and sets the facts on
-#                               every call; the owning role decides when to call it and
-#                               writes the value to its Secret
-#                    refresh_file_after_deploy  true: ensure (after_deploy) re-renders
-#                               default_credentials.yaml from the marked Secrets afterwards
 #   variants       (vector-db/<engine> only) concrete IDs <component>/<variant>;
 #                  each variant's fields override the base entry
 #
-# platform: platform-owned Secrets erag marks in local mode (never generated,
-# imported or projected; an OpenBao migration only removes the markup). Keyed
-# platform/<name>; fields owner_role and legacy (secret items as above, all with
-# markup). Valid only for ensure with ensure_phase: after_deploy.
+# platform: platform-owned Secrets the roles mark in local mode (never generated,
+# imported or projected; no port op takes their IDs: an OpenBao migration only
+# removes the markup). Keyed platform/<name>; fields owner_role and legacy
+# (items with kv_key: null and secret.markup: true).
 #
 # secrets: every k8s Secret the credentials are delivered in, exactly once, keyed
 # <namespace>/<name> (the namespace may be a config var ref). One entry = one
@@ -154,16 +135,9 @@ credentials:
     identifiers:
       username: erag-admin
     legacy:
-      # file_var lands in default_credentials.txt (written from erag-credentials).
-      - kv_key: password
-        file_var: KEYCLOAK_ERAG_ADMIN_PASSWORD
-        file: default_credentials.txt
-        file_identifier: {var: KEYCLOAK_ERAG_ADMIN_USERNAME, key: KEYCLOAK_ERAG_ADMIN_USERNAME}
-        user: erag-admin
-        secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: KEYCLOAK_ERAG_ADMIN_PASSWORD, user: null}
+      - {kv_key: password, secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: KEYCLOAK_ERAG_ADMIN_PASSWORD}}
     import_required: true
     rotate: {none: true, reason: "the Keycloak configurator does not update existing users"}
-    local: {mechanism: role_managed}
 
   keycloak/erag-user:
     owner_role: app_keycloak_config
@@ -174,15 +148,9 @@ credentials:
     identifiers:
       username: erag-user
     legacy:
-      - kv_key: password
-        file_var: KEYCLOAK_ERAG_USER_PASSWORD
-        file: default_credentials.txt
-        file_identifier: {var: KEYCLOAK_ERAG_USER_USERNAME, key: KEYCLOAK_ERAG_USER_USERNAME}
-        user: erag-user
-        secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: KEYCLOAK_ERAG_USER_PASSWORD, user: null}
+      - {kv_key: password, secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: KEYCLOAK_ERAG_USER_PASSWORD}}
     import_required: true
     rotate: {none: true, reason: "the Keycloak configurator does not update existing users"}
-    local: {mechanism: role_managed}
 
   keycloak/erag-maintainer:
     owner_role: app_keycloak_config
@@ -193,15 +161,9 @@ credentials:
     identifiers:
       username: erag-maintainer
     legacy:
-      - kv_key: password
-        file_var: KEYCLOAK_ERAG_MAINTAINER_PASSWORD
-        file: default_credentials.txt
-        file_identifier: {var: KEYCLOAK_ERAG_MAINTAINER_USERNAME, key: KEYCLOAK_ERAG_MAINTAINER_USERNAME}
-        user: erag-maintainer
-        secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: KEYCLOAK_ERAG_MAINTAINER_PASSWORD, user: null}
+      - {kv_key: password, secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: KEYCLOAK_ERAG_MAINTAINER_PASSWORD}}
     import_required: true
     rotate: {none: true, reason: "the Keycloak configurator does not update existing users"}
-    local: {mechanism: role_managed}
 
   keycloak/mcp-client:
     owner_role: app_keycloak_config
@@ -211,13 +173,7 @@ credentials:
     identifiers:
       client_id: "{{ mcp_keycloak_client_id | default('mcp-client') }}"
     legacy:
-      - kv_key: client_secret
-        file_var: MCP_CLIENT_SECRET
-        file: default_credentials.txt
-        file_identifier: {var: MCP_CLIENT_ID, key: MCP_CLIENT_ID}
-        file_optional: true
-        user: null
-        secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: MCP_CLIENT_SECRET, user: null}
+      - {kv_key: client_secret, secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: erag-credentials, key: MCP_CLIENT_SECRET}}
     import_required: "{{ mcp_enabled | default(false) | bool }}"
     # No erag workload reads it at runtime (the MCP gateway only validates
     # tokens; external agents hold the secret): nothing restarts, and agents
@@ -227,7 +183,6 @@ credentials:
       keys: [client_secret]
       target: {realm: "{{ erag_keycloak_realm | default('EnterpriseRAG') }}", client_id: "{{ mcp_keycloak_client_id | default('mcp-client') }}"}
       restart: []
-    local: {mechanism: role_managed}
 
   keycloak/grafana-oauth:
     owner_role: app_keycloak_config
@@ -237,10 +192,7 @@ credentials:
     identifiers:
       client_id: grafana-oauth
     legacy:
-      - kv_key: client_secret
-        file_var: null
-        user: null
-        secret: {namespace: "{{ grafana_oauth_namespace | default(observability_namespace | default('monitoring')) }}", name: "{{ grafana_oauth_secret_name | default('grafana-sso-env') }}", key: GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET, user: null}
+      - {kv_key: client_secret, secret: {namespace: "{{ grafana_oauth_namespace | default(observability_namespace | default('monitoring')) }}", name: "{{ grafana_oauth_secret_name | default('grafana-sso-env') }}", key: GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET}}
     # Not import_required: grafana-sso-env exists only when the platform Grafana
     # does; without it the configurator sets a new value in Keycloak and ESO
     # projects it to Grafana (no user-facing credential).
@@ -252,9 +204,6 @@ credentials:
       keys: [client_secret]
       target: {realm: "{{ grafana_oauth_realm | default(erag_keycloak_realm | default('EnterpriseRAG')) }}", client_id: grafana-oauth}
       restart: [grafana]
-    local:
-      mechanism: role_managed
-      generator: {type: lookup_password, length: 32, chars: "ascii_letters,digits", facts: {client_secret: grafana_oauth_client_secret}}
 
   # Ensured by app_keycloak_config before the configurator, which sets it on the
   # EnterpriseRAG-oidc-minio client (openbao); app_edp ensures it again for its Secrets.
@@ -266,17 +215,13 @@ credentials:
     identifiers:
       client_id: "{{ edp_client_id | default('EnterpriseRAG-oidc-minio') }}"
     legacy:
-      - kv_key: client_secret
-        file_var: null
-        user: null
-        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: keycloak-minio-secret, key: client-secret, user: null}
+      - {kv_key: client_secret, secret: {namespace: "{{ edp_namespace | default('edp') }}", name: keycloak-minio-secret, key: client-secret}}
     import_required: "{{ edp_enabled | default(false) | bool }}"
     rotate:
       hook: keycloak-client-secret-set
       keys: [client_secret]
       target: {realm: "{{ erag_keycloak_realm | default('EnterpriseRAG') }}", client_id: "{{ edp_client_id | default('EnterpriseRAG-oidc-minio') }}"}
       restart: [edp]
-    local: {mechanism: role_managed}
 
   # --- NATS -----------------------------------------------------------------
 
@@ -289,18 +234,9 @@ credentials:
       public_key: {generated_by: seed}
     identifiers: {}
     legacy:
-      - kv_key: seed
-        file_var: null
-        user: null
-        secret: {namespace: "{{ nats_namespace | default('nats') }}", name: "{{ nats_auth_secret_name | default('nats-auth') }}", key: user.nk, user: null}
-      - kv_key: public_key
-        file_var: null
-        user: null
-        secret: {namespace: "{{ nats_namespace | default('nats') }}", name: "{{ nats_auth_secret_name | default('nats-auth') }}", key: user.pub, user: null}
+      - {kv_key: seed, secret: {namespace: "{{ nats_namespace | default('nats') }}", name: "{{ nats_auth_secret_name | default('nats-auth') }}", key: user.nk}}
+      - {kv_key: public_key, secret: {namespace: "{{ nats_namespace | default('nats') }}", name: "{{ nats_auth_secret_name | default('nats-auth') }}", key: user.pub}}
     rotate: {none: true, reason: "the NATS server and clients read the key only at start"}
-    local:
-      mechanism: role_managed
-      generator: {type: gen_nkey, facts: {seed: nats_auth_nkey_seed, public_key: nats_auth_nkey_public}}
 
   # --- Vector database (one registry entry; one concrete ID per engine) ------
 
@@ -308,7 +244,6 @@ credentials:
     owner_role: app_vector_databases
     keys:
       password: {generate: {type: password, length: 32, special: false}}
-    local: {mechanism: file_password}
     variants:
       redis:
         path: erag/vector-db/redis
@@ -317,12 +252,7 @@ credentials:
           vector_store: redis-cluster
         rotate: {none: true, reason: "Redis Cluster rotation (every node and masterauth) is not implemented yet"}
         legacy:
-          # Legacy app_vector_databases generates it only when REDIS_PASSWORD is not defined.
-          - kv_key: password
-            file_var: REDIS_PASSWORD
-            user: default
-            skip_if_defined: REDIS_PASSWORD
-            secret: {namespace: "{{ vector_databases_namespace | default('vdb') }}", name: redis-cluster-secret, key: REDIS_PASSWORD, user: default, markup: true}
+          - {kv_key: password, secret: {namespace: "{{ vector_databases_namespace | default('vdb') }}", name: redis-cluster-secret, key: REDIS_PASSWORD, markup: true}}
       pgvector:
         path: erag/vector-db/pgvector
         identifiers:
@@ -336,10 +266,7 @@ credentials:
           target: {host: "pgvector.{{ vector_databases_namespace | default('vdb') }}.svc", port: 5432, database: vdb, user: edp}
           restart: [retriever, edp, edp-vector-db]
         legacy:
-          - kv_key: password
-            file_var: POSTGRES_PASSWORD
-            user: edp
-            secret: {namespace: "{{ vector_databases_namespace | default('vdb') }}", name: pgvector-secret, key: POSTGRES_PASSWORD, user: edp, markup: true}
+          - {kv_key: password, secret: {namespace: "{{ vector_databases_namespace | default('vdb') }}", name: pgvector-secret, key: POSTGRES_PASSWORD, markup: true}}
       mssql:
         path: erag/vector-db/mssql
         identifiers:
@@ -347,11 +274,7 @@ credentials:
           vector_store: mssql
         rotate: {none: true, reason: "the rotator has no SQL Server (TDS) client yet"}
         legacy:
-          # Recorded as is: generated with user "default", marked up with user "edp".
-          - kv_key: password
-            file_var: MSSQL_PASSWORD
-            user: default
-            secret: {namespace: "{{ vector_databases_namespace | default('vdb') }}", name: mssql-secret, key: MSSQL_PASSWORD, user: edp, markup: true}
+          - {kv_key: password, secret: {namespace: "{{ vector_databases_namespace | default('vdb') }}", name: mssql-secret, key: MSSQL_PASSWORD, markup: true}}
 
   # --- Chat history and fingerprint ------------------------------------------
 
@@ -363,10 +286,7 @@ credentials:
     identifiers:
       username: "{{ chat_history_db_user | default('chat_history') }}"
     legacy:
-      - kv_key: password
-        file_var: CHAT_HISTORY_POSTGRES_PASSWORD
-        user: "{{ chat_history_db_user | default('chat_history') }}"
-        secret: {namespace: "{{ chat_history_namespace | default('chat-history') }}", name: "{{ chat_history_db_password_secret_name | default('mongo-database-secret') }}", key: POSTGRES_PASSWORD, user: "{{ chat_history_db_user | default('chat_history') }}", markup: true}
+      - {kv_key: password, secret: {namespace: "{{ chat_history_namespace | default('chat-history') }}", name: "{{ chat_history_db_password_secret_name | default('mongo-database-secret') }}", key: POSTGRES_PASSWORD, markup: true}}
     # The server (FerretDB's Postgres) reads the password only at initdb.
     rotate:
       hook: postgres-alter-user
@@ -377,7 +297,6 @@ credentials:
         database: postgres
         user: "{{ chat_history_db_user | default('chat_history') }}"
       restart: [chat-history]
-    local: {mechanism: file_password}
 
   fingerprint/postgres:
     owner_role: app_fingerprint
@@ -387,10 +306,7 @@ credentials:
     identifiers:
       username: "{{ fingerprint_db_user | default('fingerprint') }}"
     legacy:
-      - kv_key: password
-        file_var: FINGERPRINT_POSTGRES_PASSWORD
-        user: "{{ fingerprint_db_user | default('fingerprint') }}"
-        secret: {namespace: "{{ fingerprint_namespace | default('fingerprint') }}", name: "{{ fingerprint_db_password_secret_name | default('fingerprint-postgresql-secret') }}", key: password, user: "{{ fingerprint_db_user | default('fingerprint') }}", markup: true}
+      - {kv_key: password, secret: {namespace: "{{ fingerprint_namespace | default('fingerprint') }}", name: "{{ fingerprint_db_password_secret_name | default('fingerprint-postgresql-secret') }}", key: password, markup: true}}
     rotate:
       hook: postgres-alter-user
       keys: [password]
@@ -400,7 +316,6 @@ credentials:
         database: "{{ fingerprint_db_name | default('system_fingerprint') }}"
         user: "{{ fingerprint_db_user | default('fingerprint') }}"
       restart: [fingerprint, gmc-controller]
-    local: {mechanism: file_password}
 
   # --- EDP -------------------------------------------------------------------
 
@@ -414,14 +329,8 @@ credentials:
       username: "{{ edp_postgresql_user_username | default('edp') }}"
       admin_username: "{{ edp_postgresql_admin_username | default('admin') }}"
     legacy:
-      - kv_key: password
-        file_var: EDP_POSTGRESQL_PASSWORD
-        user: "{{ edp_postgresql_user_username | default('edp') }}"
-        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-postgresql-secret, key: DATABASE_PASSWORD, user: "{{ edp_postgresql_user_username | default('edp') }}", markup: true}
-      - kv_key: admin_password
-        file_var: EDP_POSTGRESQL_ADMIN_PASSWORD
-        user: "{{ edp_postgresql_admin_username | default('admin') }}"
-        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-postgresql-secret, key: DATABASE_ADMIN_PASSWORD, user: "{{ edp_postgresql_admin_username | default('admin') }}", markup: true}
+      - {kv_key: password, secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-postgresql-secret, key: DATABASE_PASSWORD, markup: true}}
+      - {kv_key: admin_password, secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-postgresql-secret, key: DATABASE_ADMIN_PASSWORD, markup: true}}
     # Only password is a database login (the chart's user edp); admin_password
     # is no server credential and keeps its value.
     rotate:
@@ -429,7 +338,6 @@ credentials:
       keys: [password]
       target: {host: "edp-postgresql.{{ edp_namespace | default('edp') }}.svc", port: 5432, database: edp, user: edp}
       restart: [edp]
-    local: {mechanism: file_password}
 
   edp/redis:
     owner_role: app_edp
@@ -439,17 +347,13 @@ credentials:
     identifiers:
       username: "{{ edp_redis_username | default('default') }}"
     legacy:
-      - kv_key: password
-        file_var: EDP_REDIS_PASSWORD
-        user: "{{ edp_redis_username | default('default') }}"
-        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: "{{ edp_redis_password_secret_name | default('edp-redis-secret') }}", key: password, user: "{{ edp_redis_username | default('default') }}", markup: true}
+      - {kv_key: password, secret: {namespace: "{{ edp_namespace | default('edp') }}", name: "{{ edp_redis_password_secret_name | default('edp-redis-secret') }}", key: password, markup: true}}
     # edp-redis reads it with --requirepass at start; ACL SETUSER changes it live.
     rotate:
       hook: redis-acl-set
       keys: [password]
       target: {host: "edp-redis.{{ edp_namespace | default('edp') }}.svc", port: 6379, user: "{{ edp_redis_username | default('default') }}"}
       restart: [edp]
-    local: {mechanism: file_password}
 
   edp/object-store:
     owner_role: app_edp
@@ -460,31 +364,19 @@ credentials:
     identifiers: {}
     legacy:
       - kv_key: access_key
-        file_var: EDP_MINIO_ACCESS_KEY
-        user: null
-        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-access-secret, key: EDP_ACCESS_KEY, user: null, markup: true}
+        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-access-secret, key: EDP_ACCESS_KEY, markup: true}
         # With s3 / s3compatible storage these keys of edp-access-secret hold the
         # operator's S3 keys (erag/user/edp-s3), not the object-store keys. The
         # storage type as app_edp resolves it (the edp_storage_type environment
         # variable first; it runs after this import).
         import_enabled: "{{ (lookup('env', 'edp_storage_type') or edp_storage_type if edp_storage_type is defined else 'seaweedfs') == 'seaweedfs' }}"
       - kv_key: secret_key
-        file_var: EDP_MINIO_SECRET_KEY
-        user: null
-        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-access-secret, key: EDP_SECRET_KEY, user: null, markup: true}
+        secret: {namespace: "{{ edp_namespace | default('edp') }}", name: edp-access-secret, key: EDP_SECRET_KEY, markup: true}
         import_enabled: "{{ (lookup('env', 'edp_storage_type') or edp_storage_type if edp_storage_type is defined else 'seaweedfs') == 'seaweedfs' }}"
-      # Same values, marked in seaweedfs-s3-secret under other variable names
-      # (lines that reach the file only through the markup).
-      - kv_key: access_key
-        file_var: null
-        user: null
-        secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-s3-secret, key: admin_access_key_id, user: null, variable: EDP_SEAWEEDFS_ACCESS_KEY, markup: true}
-      - kv_key: secret_key
-        file_var: null
-        user: null
-        secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-s3-secret, key: admin_secret_access_key, user: null, variable: EDP_SEAWEEDFS_SECRET_KEY, markup: true}
+      # Same values, also marked in seaweedfs-s3-secret.
+      - {kv_key: access_key, secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-s3-secret, key: admin_access_key_id, markup: true}}
+      - {kv_key: secret_key, secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-s3-secret, key: admin_secret_access_key, markup: true}}
     rotate: {none: true, reason: "how SeaweedFS reloads its S3 identities is unverified (revisit)"}
-    local: {mechanism: file_key}
 
   # --- SeaweedFS -------------------------------------------------------------
 
@@ -496,23 +388,8 @@ credentials:
     identifiers:
       username: admin
     legacy:
-      # The username identifier is marked too (before the password, as today).
-      - kv_key: null
-        identifier: username
-        file_var: null
-        user: null
-        secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-admin-secret, key: adminUser, user: null, variable: SEAWEEDFS_ADMIN_USER, markup: true}
-      # file_var reaches default_credentials.yaml only through the markup.
-      - kv_key: password
-        file_var: SEAWEEDFS_ADMIN_PASSWORD
-        user: null
-        secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-admin-secret, key: adminPassword, user: null, markup: true}
+      - {kv_key: password, secret: {namespace: "{{ edp_seaweedfs_namespace | default('seaweedfs') }}", name: seaweedfs-admin-secret, key: adminPassword, markup: true}}
     rotate: {none: true, reason: "upstream SeaweedFS chart reload behavior is unverified (revisit)"}
-    local:
-      mechanism: role_managed
-      generator: {type: lookup_password, length: 16, chars: "ascii_letters,digits", facts: {password: seaweedfs_admin_password}}
-      # Legacy seaweedfs.yaml refreshes the file right after marking its Secrets.
-      refresh_file_after_deploy: true
 
   # --- Operator-supplied (erag/user/*) ---------------------------------------
 
@@ -531,17 +408,8 @@ credentials:
     user_supplied_env:
       access_key_id: [s3_access_key]
       secret_access_key: [s3_secret_key]
-    legacy:
-      - kv_key: access_key_id
-        file_var: null
-        user: null
-        secret: null
-      - kv_key: secret_access_key
-        file_var: null
-        user: null
-        secret: null
+    legacy: []
     rotate: {hook: operator-write, restart: [edp]}
-    local: {mechanism: user_supplied}
 
   user/sharepoint:
     owner_role: app_edp
@@ -553,13 +421,8 @@ credentials:
     # from erag_keycloak_oidc_client_secret.
     user_supplied:
       client_secret: [erag_keycloak_oidc_client_secret]
-    legacy:
-      - kv_key: client_secret
-        file_var: null
-        user: null
-        secret: null
+    legacy: []
     rotate: {hook: operator-write, restart: [edp]}
-    local: {mechanism: user_supplied}
 
   user/keycloak-oidc:
     owner_role: app_keycloak_config
@@ -569,13 +432,8 @@ credentials:
     identifiers: {}
     user_supplied:
       client_secret: [erag_keycloak_oidc_client_secret]
-    legacy:
-      - kv_key: client_secret
-        file_var: null
-        user: null
-        secret: null
+    legacy: []
     rotate: {none: true, reason: "the Keycloak configurator applies it: write a new version (bao kv put), then run a normal install"}
-    local: {mechanism: user_supplied}
 
   user/ldap-bind:
     owner_role: app_keycloak_config
@@ -585,13 +443,8 @@ credentials:
     identifiers: {}
     user_supplied:
       password: [erag_keycloak_federation_bind_password]
-    legacy:
-      - kv_key: password
-        file_var: null
-        user: null
-        secret: null
+    legacy: []
     rotate: {none: true, reason: "the Keycloak configurator applies it: write a new version (bao kv put), then run a normal install"}
-    local: {mechanism: user_supplied}
 
   user/hf-token:
     owner_role: app_pre_install
@@ -604,27 +457,20 @@ credentials:
       token: [hugging_token]
     user_supplied_env:
       token: [HF_TOKEN]
-    legacy:
-      - kv_key: token
-        file_var: null
-        user: null
-        secret: null
+    legacy: []
     # Read when a model or the vector-dims Job downloads, and by pods at start:
     # rotate syncs the projections; the next start uses the new token.
     rotate: {hook: operator-write, restart: []}
-    local: {mechanism: user_supplied}
 
 platform:
 
-  # keycloak-admin-secret is owned by the platform; erag only marks it in local
-  # mode, so the realm admin password lands in default_credentials.yaml.
+  # keycloak-admin-secret is owned by the platform; app_keycloak_config marks
+  # it in local mode (the realm admin password lands in default_credentials.yaml),
+  # and a migration to OpenBao removes that markup.
   platform/keycloak-admin:
     owner_role: app_keycloak_config
     legacy:
-      - kv_key: null
-        file_var: null
-        user: null
-        secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: "{{ keycloak_admin_secret_name | default('keycloak-admin-secret') }}", key: password, user: "{{ keycloak_admin_user | default('admin') }}", variable: KEYCLOAK_REALM_ADMIN_PASSWORD, markup: true}
+      - {kv_key: null, secret: {namespace: "{{ keycloak_namespace | default('keycloak') }}", name: "{{ keycloak_admin_secret_name | default('keycloak-admin-secret') }}", key: password, markup: true}}
 
 workloads:
 

@@ -74,9 +74,8 @@
     name: app_secrets
     tasks_from: import.yaml
   vars:
-    secret_ids: "{{ app_post_install_import_secret_ids }}"
     import_phase: finalize
-  when: app_secrets_projected | default(false)
+  when: app_secrets_projected
 
 - name: "app_post_install | Upgrade complete"
   ansible.builtin.debug:

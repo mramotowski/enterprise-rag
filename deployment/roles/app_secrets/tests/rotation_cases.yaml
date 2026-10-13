@@ -279,6 +279,8 @@
           # Every rotator runs under the worker ServiceAccount as the worker role.
           - _rotators | length >= 10
           - _rotators | map('extract', _jobs) | map(attribute='spec.template.spec.serviceAccountName') | unique == ['erag-secrets-worker']
+          - _rotators | map('extract', _jobs) | map(attribute='spec.template.spec.containers.0.image') | unique
+            == ['docker.io/library/python:3.12-slim']
           # Only the Keycloak runs get the API token, and only then does the Role exist.
           - _kc_runs | length == 3
           - _kc_runs | map('extract', _jobs) | map(attribute='spec.template.spec.containers.0.env') | flatten
@@ -368,6 +370,44 @@
     - name: "app_secrets | test | rotation | The rotate-only branch reached app_secrets rotate"
       ansible.builtin.assert:
         that: "'nats/auth: the NATS server and clients read the key only at start' in _branch_rotate_msg | default('')"
+        quiet: true
+
+    # Local mode: the rotate-only run is refused before the local credential
+    # helpers (switch guard, app_password_mgmt lookup, app_generate_password)
+    # write default_credentials.yaml.
+    - name: "app_secrets | test | rotation | A local rotate-only run"
+      block:
+        - name: "app_secrets | test | rotation | app_pre_install install with secrets_backend local, erag_rotate=[edp/redis]"
+          ansible.builtin.include_role:
+            name: app_pre_install
+            tasks_from: install.yaml
+          vars:
+            erag_rotate: "[edp/redis]"
+            secrets_backend: local
+            app_secrets_projected: false
+            log_dir: "{{ out_dir }}/local-rotate"
+            tmp_dir: "{{ out_dir }}/local-rotate/tmp"
+            # load_settings.yaml derives the domain names from it (and needs
+            # the pipeline dirs with MCP).
+            base_domain_name: solutions.ai
+            mcp_enabled: false
+      rescue:
+        - name: "app_secrets | test | rotation | Note the local rotate failure"
+          ansible.builtin.set_fact:
+            _local_rotate_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "app_secrets | test | rotation | Look for a local credential file"
+      ansible.builtin.stat:
+        path: "{{ out_dir }}/local-rotate/rag/default_credentials.yaml"
+      register: _local_rotate_file
+
+    - name: "app_secrets | test | rotation | A local rotate-only run is refused before any credential file is written"
+      ansible.builtin.assert:
+        that:
+          - "'rotation requires secrets_backend: openbao' in _local_rotate_msg | default('')"
+          - "'edp/redis' in _local_rotate_msg | default('')"
+          - not _local_rotate_file.stat.exists
+        fail_msg: "{{ _local_rotate_msg | default('no failure') }}; file written: {{ _local_rotate_file.stat.exists }}"
         quiet: true
 
     - name: "app_secrets | test | rotation | Evaluate the erag component switches"

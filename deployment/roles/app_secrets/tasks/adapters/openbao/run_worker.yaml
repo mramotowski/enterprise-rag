@@ -1,18 +1,17 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# openbao adapter: one worker run. Deletes the previous worker Jobs, applies
-# the ConfigMap (script + plan) and Job of templates/worker-job.yaml.j2, waits
-# for the Job and parses its result lines (ERAG_SECRETS_RESULT <json>; the
-# worker never prints a value).
+# openbao adapter: one secrets Job run. Deletes the previous Jobs of the same
+# component, applies the ConfigMap (script + plan) and Job of
+# templates/secrets-job.yaml.j2, waits for the Job and parses its result lines
+# (ERAG_SECRETS_RESULT <json>; files/secrets_job.py never prints a value).
 # Expects: app_secrets_op, app_secrets_worker_op (probe | ensure | status |
-# delete | import), app_secrets_worker_plan (list of plan lines, see
-# files/secrets_worker.sh). The importer (import.yaml) sets
-# app_secrets_job_template: importer-job.yaml.j2 and app_secrets_job_component:
-# importer, and passes its plan as app_secrets_importer_plan.
+# delete | import | rotate), app_secrets_worker_plan (the plan, a dict, see
+# files/secrets_job.py), app_secrets_job_component (worker | importer |
+# rotator; default worker).
 # Sets: app_secrets_worker_result = {probe: {...}, done: {...},
 #       credentials: {<id>: {action, result, version, error}},
-#       purge: {prefix, state, removed, error} (delete with a purge line, else none),
+#       purge: {prefix, state, removed, error} (delete with a purge, else none),
 #       legacy: {found} (importer, else none),
 #       stage: {id, stage, version, previous_version} (rotator, after its write),
 #       secrets: [{namespace, name, action, result, error}] (importer),
@@ -22,7 +21,7 @@
 - name: "app_secrets | {{ app_secrets_op }} | openbao | Name the worker run"
   ansible.builtin.set_fact:
     _app_secrets_job_name: >-
-      erag-secrets-{{ app_secrets_worker_op }}-{{ (app_secrets_worker_op ~ (app_secrets_worker_plan | join('\n'))
+      erag-secrets-{{ app_secrets_worker_op }}-{{ (app_secrets_worker_op ~ (app_secrets_worker_plan | to_json)
       ~ now(utc=true).isoformat()) | hash('sha1') | truncate(10, true, '') }}
 
 - name: "app_secrets | {{ app_secrets_op }} | openbao | Find previous worker runs"
@@ -64,11 +63,11 @@
       register: _app_secrets_worker_dir
       no_log: true
 
-    # Rendered to a file and applied with src: the worker script is applied
+    # Rendered to a file and applied with src: the script is applied
     # verbatim, never re-read as a template (the file holds no value).
     - name: "app_secrets | {{ app_secrets_op }} | openbao | Render the worker Job"
       ansible.builtin.template:
-        src: "{{ app_secrets_job_template | default('worker-job.yaml.j2') }}"
+        src: secrets-job.yaml.j2
         dest: "{{ _app_secrets_worker_dir.path }}/worker-job.yaml"
         mode: "0600"
       no_log: true

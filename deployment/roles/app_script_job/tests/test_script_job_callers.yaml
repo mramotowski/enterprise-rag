@@ -1,0 +1,135 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Render and verdict check of the drift (app_keycloak_config) and edge auth
+# (app_mcp_gateway) Jobs: the real caller tasks (run_case.yaml, one fake cluster per
+# case) against the app_secrets fake kubernetes.core, whose Job hook
+# (files/fake_script_job.py) keeps a copy of the Job and logs the case's result line.
+# Checks secretKeyRef-only env (drift clients from the registry, per feature),
+# hostAliases, pod security, no value in any object, this run deleted after it, each
+# caller's verdict on passing and failing lines, and a result line that is not JSON.
+#
+# Run from the enterprise-rag repo root:
+#   ANSIBLE_COLLECTIONS_PATH=deployment/roles/app_secrets/tests/fake_collections:$HOME/.ansible/collections:/usr/share/ansible/collections \
+#   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
+#     deployment/roles/app_script_job/tests/test_script_job_callers.yaml
+
+---
+- name: "app_script_job | test | drift and edge auth Jobs"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # The Secret the edge Job reads and a gateway Service.
+    seed:
+      "Secret/keycloak/erag-credentials": {kind: Secret, data: {MCP_CLIENT_ID: eA==, MCP_CLIENT_SECRET: "{{ _value | b64encode }}"}}
+      "Service/envoy-gateway-system/eg":
+        {kind: Service, spec: {clusterIP: 10.96.0.10}, metadata: {labels: {gateway.envoyproxy.io/owning-gateway-name: eg-gateway,
+         gateway.envoyproxy.io/owning-gateway-namespace: envoy-gateway-system}}}
+    _drift: {role: app_keycloak_config, tasks_from: check_client_drift_job.yaml}
+    _edge: {role: app_mcp_gateway, tasks_from: verify_edge_auth_job.yaml}
+    _all3: {mcp-client: match, grafana-oauth: match, EnterpriseRAG-oidc-minio: match}
+    _edge_ok: {credentials: true, token: true, token_http: 200, edge_http: 404, attempts: 1}
+    cases:
+      - "{{ _drift | combine({'name': 'drift', 'log': {'clients': _all3, 'admin_login': true}}) }}"
+      - "{{ _drift | combine({'name': 'drift-drift', 'log': {'clients': _all3 | combine({'mcp-client': 'drift'}), 'admin_login': true}}) }}"
+      - "{{ _drift | combine({'name': 'drift-off', 'mcp_enabled': false, 'grafana_oauth_domain': '',
+                              'log': {'clients': {'EnterpriseRAG-oidc-minio': 'match'}, 'admin_login': true}}) }}"
+      - "{{ _edge | combine({'name': 'edge', 'log': _edge_ok}) }}"
+      - "{{ _edge | combine({'name': 'edge-401', 'log': _edge_ok | combine({'edge_http': 401, 'attempts': 11})}) }}"
+      - "{{ _edge | combine({'name': 'edge-no-creds', 'log': {'credentials': false, 'token': false, 'token_http': -1, 'edge_http': -1}}) }}"
+      - "{{ _edge | combine({'name': 'edge-not-json', 'log': '{\"edge_http\": 404, broken'}) }}"
+  tasks:
+    - name: "app_script_job | test | Create a temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: script_job_test_
+      register: _tmp
+
+    - name: "app_script_job | test | Run"
+      block:
+        - name: "app_script_job | test | Fix the test secret value"
+          ansible.builtin.set_fact:
+            _value: "leak_{{ 1000000000 | random | string | hash('sha256') | truncate(24, true, '') }}"
+          no_log: true
+
+        - name: "app_script_job | test | Load the app_secrets registry"
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../../app_secrets/files/registry.yaml"
+            name: app_secrets_registry
+
+        - name: "app_script_job | test | Run the cases"
+          ansible.builtin.include_tasks: run_case.yaml
+          loop: "{{ cases }}"
+          loop_control:
+            loop_var: case
+            label: "{{ case.name }}"
+
+        - name: "app_script_job | test | Pick the rendered Jobs"
+          ansible.builtin.set_fact:
+            _j: >-
+              {%- set out = {} -%}
+              {%- for name, r in _r.items() -%}
+                {%- set f = r.state | dict2items | selectattr('key', 'match', '^FakeRendered/') | map(attribute='value') | first -%}
+                {%- set pod = f.job.spec.template.spec -%}
+                {%- set env = pod.containers[0].env -%}
+                {%- set _ = out.update({name: {'cm': f.configmap, 'pod': pod, 'c': pod.containers[0],
+                      'clients': (env | selectattr('name', 'equalto', 'DRIFT_CLIENTS') | map(attribute='value') | first | default('[]')) | from_json,
+                      'refs': env | selectattr('valueFrom', 'defined') | map(attribute='valueFrom.secretKeyRef') | list}}) -%}
+              {%- endfor -%}
+              {{ out }}
+
+        - name: "app_script_job | test | Results"
+          ansible.builtin.assert:
+            that:
+              - "_j['drift'].clients == [
+                   {'client_id': 'mcp-client', 'realm': 'EnterpriseRAG', 'env': 'PROJECTED_MCP_CLIENT'},
+                   {'client_id': 'grafana-oauth', 'realm': 'EnterpriseRAG', 'env': 'PROJECTED_GRAFANA_OAUTH'},
+                   {'client_id': 'EnterpriseRAG-oidc-minio', 'realm': 'EnterpriseRAG', 'env': 'PROJECTED_EDP_OIDC'}]"
+              - "_j['drift'].refs == [
+                   {'name': 'keycloak-admin-secret', 'key': 'password', 'optional': true},
+                   {'name': 'erag-credentials', 'key': 'MCP_CLIENT_SECRET', 'optional': true},
+                   {'name': 'keycloak-configurator-sensitive', 'key': 'grafana-oauth-client-secret', 'optional': true},
+                   {'name': 'keycloak-configurator-sensitive', 'key': 'edp-oidc-client-secret', 'optional': true}]"
+              # MCP and Grafana SSO off: those clients are left out.
+              - "_j['drift-off'].clients == [{'client_id': 'EnterpriseRAG-oidc-minio', 'realm': 'EnterpriseRAG', 'env': 'PROJECTED_EDP_OIDC'}]"
+              - "_j['drift-off'].refs == [{'name': 'keycloak-admin-secret', 'key': 'password', 'optional': true},
+                   {'name': 'keycloak-configurator-sensitive', 'key': 'edp-oidc-client-secret', 'optional': true}]"
+              - "_j['edge'].refs == [{'name': 'erag-credentials', 'key': 'MCP_CLIENT_ID', 'optional': true},
+                   {'name': 'erag-credentials', 'key': 'MCP_CLIENT_SECRET', 'optional': true}]"
+              - "(_j['drift'].c.env + _j['edge'].c.env) | selectattr('valueFrom', 'defined') | selectattr('value', 'defined') | list == []"
+              - "_j['drift'].c.command == ['python3', '-I', '/etc/client-drift-check/check_client_drift.py']"
+              - "_j['edge'].c.command == ['python3', '-I', '/etc/edge-auth-check/verify_edge_auth.py']"
+              - _j['drift'].cm.data['check_client_drift.py'] == lookup('file', playbook_dir ~ '/../../app_keycloak_config/files/check_client_drift.py')
+              - _j['drift'].pod.hostAliases is not defined
+              - "_j['edge'].pod.hostAliases == [{'ip': '10.96.0.10', 'hostnames': ['auth.solutions.ai', 'solutions.ai']}]"
+              - "[_j['drift'].pod, _j['edge'].pod] | map(attribute='automountServiceAccountToken') | list == [false, false]"
+              - "[_j['drift'].pod, _j['edge'].pod] | map(attribute='securityContext.runAsNonRoot') | list == [true, true]"
+              - "[_j['drift'].pod, _j['edge'].pod] | map(attribute='securityContext.seccompProfile.type') | list == ['RuntimeDefault', 'RuntimeDefault']"
+              - "[_j['drift'].c.securityContext, _j['edge'].c.securityContext] == [_csc, _csc]"
+              # This run's Job and ConfigMap are deleted after it.
+              - _r.values() | map(attribute='state') | map('dict2items') | map('selectattr', 'key', 'match', '^(Job|ConfigMap)/') | map('list') | flatten == []
+              - _j | to_json is not search(_value)
+              - _j | to_json is not search(_value | b64encode)
+              # Verdicts. Passing: no reason, and the result the assert compares (all three
+              # drift clients, the edge's 404).
+              - _r.drift.ok and _r.drift.reason == '' and _r.drift.result.clients.keys() | sort == _j['drift'].clients | map(attribute='client_id') | sort
+              - _r['drift-off'].ok
+              - not _r['drift-drift'].ok
+              - "'Keycloak holds another client secret than OpenBao for: mcp-client' in _r['drift-drift'].msg"
+              - "'rotate the id: keycloak/mcp-client)' in _r['drift-drift'].msg"
+              - _r.edge.ok and _r.edge.reason == '' and _r.edge.result.edge_http == 404
+              - not _r['edge-401'].ok
+              - "'HTTP 401 for 150s (11 attempts from Job keycloak/mcp-edge-auth-' in _r['edge-401'].msg"
+              - not _r['edge-no-creds'].ok
+              - "'carries no MCP_CLIENT_ID / MCP_CLIENT_SECRET' in _r['edge-no-creds'].msg"
+              - _r['edge-not-json'].ok and _r['edge-not-json'].reason == 'result line is not JSON' and _r['edge-not-json'].result == {}
+            fail_msg: "{{ _r | dict2items | map(attribute='value') | map('dict2items') | map('rejectattr', 'key', 'equalto', 'state') | map('items2dict') | list | to_json }}"
+            quiet: true
+          vars:
+            _csc: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+
+      always:
+        - name: "app_script_job | test | Remove the temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

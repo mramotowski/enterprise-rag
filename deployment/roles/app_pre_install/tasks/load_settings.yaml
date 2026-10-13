@@ -17,7 +17,7 @@
     file: resolve_vector_dims.yaml
   when:
     - not (_vector_dims_explicit | bool)
-    - not (app_secrets_projected | default(false))
+    - not app_secrets_projected
 
 # Detection never ran, so record why rather than leaving the summary at 'pending'.
 - name: "app_pre_install | Record explicitly configured vector_dims"
@@ -28,7 +28,7 @@
 - name: "app_pre_install | Verify vector_dims"
   ansible.builtin.include_tasks:
     file: verify_vector_dims.yaml
-  when: (_vector_dims_explicit | bool) or not (app_secrets_projected | default(false))
+  when: (_vector_dims_explicit | bool) or not app_secrets_projected
 
 - name: "app_pre_install | Validate mcp_enabled"
   ansible.builtin.include_tasks:
@@ -53,7 +53,7 @@
         • Variant: {{ pipeline_variant | default('base') }}{{ ' (upload mode: embedding only, no chat)' if (pipeline_variant | default('base')) == 'upload' else '' }}
 
       Environment Configuration:
-      {% if app_secrets_projected | default(false) %}
+      {% if app_secrets_projected %}
         • hugging_token: read from OpenBao erag/user/hf-token (checked once the store is opened)
       {% else %}
         • hugging_token: {{ 'SET' if hugging_token is defined and hugging_token != '' else 'NOT SET (ensure models are publicly available)' }}

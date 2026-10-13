@@ -301,21 +301,23 @@ mirror them and pin them by digest in `env/<name>/config.erag.yaml`:
 
 | Job | What it does | Image setting (default) |
 |---|---|---|
-| worker (`erag-secrets-worker`) | probe, ensure, status, delete | `app_secrets_worker_image` (`quay.io/openbao/openbao:2.7.0`) |
-| importer (`erag-secrets-importer`) | [migration](#migrate-an-existing-deployment) | `app_secrets_importer_image` (= `vector_dims_job_image`) |
-| rotator | [rotation](#rotate-a-credential) | `app_secrets_rotator_image` (= `app_secrets_importer_image`) |
+| worker (`erag-secrets-worker`) | probe, ensure, status, delete | `app_secrets_job_image` (= `vector_dims_job_image`) |
+| importer (`erag-secrets-importer`) | [migration](#migrate-an-existing-deployment) | `app_secrets_job_image` |
+| rotator | [rotation](#rotate-a-credential) | `app_secrets_job_image` |
 | vector-dims (`erag-vector-dims-<hash>`) | looks up the embedding size of `embedding_model_id` with the projected HF token | `vector_dims_job_image` (`docker.io/library/python:3.12-slim`) |
 | MCP edge check (keycloak namespace) | gets an agent token through the gateway and checks that the MCP route accepts it (status codes only); needs to reach the Envoy gateway Service | `mcp_edge_auth_job_image` (= `vector_dims_job_image`) |
 | Keycloak client drift check (keycloak namespace, `validate erag` only) | compares each erag Keycloak client secret with the OpenBao value through the Keycloak admin API (match/drift only) | `keycloak_drift_job_image` (= `vector_dims_job_image`) |
 
 ```yaml
 # env/<name>/config.erag.yaml
-app_secrets_worker_image: "registry.example.com/openbao/openbao@sha256:<digest>"
 vector_dims_job_image: "registry.example.com/library/python@sha256:<digest>"
+# Defaults to vector_dims_job_image; set it only for another image.
+app_secrets_job_image: "registry.example.com/library/python@sha256:<digest>"
 ```
 
-The worker needs the `bao` CLI and busybox, which the OpenBao server image has. The
-others need only Python 3 and its standard library.
+Every one of them needs only Python 3 and its standard library. The worker, importer and
+rotator are one script, `deployment/roles/app_secrets/files/secrets_job.py`, run with the op
+as its only argument.
 
 **The vector-dims Job.** It runs only when `vector_databases_vector_dims` is not set.
 Its log holds only the JSON result line, never the token. When it fails, the install

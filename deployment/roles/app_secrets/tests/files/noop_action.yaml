@@ -1,0 +1,10 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# No-op component action for test_port_contract.yaml: lets a role's tasks/main.yaml
+# run its preamble without installing anything.
+
+---
+- name: "app_secrets | test | No-op component action"
+  ansible.builtin.debug:
+    msg: "no-op"

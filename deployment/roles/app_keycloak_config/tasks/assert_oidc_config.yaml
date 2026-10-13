@@ -13,7 +13,7 @@
          | reject('in', _erag_oidc_store_vars) | list }}
     # Projected Secrets: the client secret is read from the store
     # (erag/user/keycloak-oidc, whose ensure fails naming the path), not config.
-    _erag_oidc_store_vars: "{{ ['erag_keycloak_oidc_client_secret'] if app_secrets_projected | default(false) else [] }}"
+    _erag_oidc_store_vars: "{{ ['erag_keycloak_oidc_client_secret'] if app_secrets_projected else [] }}"
   block:
     - name: "app_keycloak_config | Assert Single Sign-On configuration is complete"
       ansible.builtin.assert:

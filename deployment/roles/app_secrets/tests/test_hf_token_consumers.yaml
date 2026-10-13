@@ -12,6 +12,8 @@
 # model-manager opt-in); projected mode renders no chart Secret, references the
 # ESO projection only when the token is in the store, and runs model-manager
 # with MM_HF_TOKEN_FROM_SECRET=true and an empty HF_TOKEN.
+# With app_secrets_projected undefined (no port op ran), rendering fails
+# instead of taking the local path.
 #
 # Run from the enterprise-rag repo root:
 #   ANSIBLE_ROLES_PATH=deployment/roles ansible-playbook -i localhost, -c local \
@@ -36,8 +38,8 @@
     rag_log_dir: /tmp
     deployment_dir: "{{ playbook_dir | dirname | dirname | dirname }}"
     cases:
-      - {name: local-none, vars: {hugging_token: ""}}
-      - {name: local-token, vars: {hugging_token: "{{ tok }}"}}
+      - {name: local-none, vars: {hugging_token: "", app_secrets_projected: false}}
+      - {name: local-token, vars: {hugging_token: "{{ tok }}", app_secrets_projected: false}}
       - {name: projected-token, vars: {hugging_token: "", app_secrets_projected: true, hugging_token_projected: true}}
       - {name: projected-none, vars: {hugging_token: "", app_secrets_projected: true, hugging_token_projected: false}}
   tasks:
@@ -52,6 +54,32 @@
         - name: "app_secrets | test | HF token consumers | Load the app_pipeline defaults"
           ansible.builtin.include_vars:
             file: "{{ roles_dir }}/app_pipeline/defaults/main.yaml"
+
+        # Before any case sets it: a consumer that runs without an app_secrets
+        # port op must fail, not fall back to the local path.
+        - name: "app_secrets | test | HF token consumers | Render app_pipeline values without app_secrets_projected"
+          block:
+            - name: "app_secrets | test | HF token consumers | Render with the fact undefined"
+              ansible.builtin.set_fact:
+                _undef_render: "{{ lookup('ansible.builtin.template', roles_dir ~ '/app_pipeline/templates/values.yaml.j2') }}"
+              vars:
+                hugging_token: ""
+
+            - name: "app_secrets | test | HF token consumers | Undefined app_secrets_projected rendered"
+              ansible.builtin.set_fact:
+                _undef_msg: "UNEXPECTED SUCCESS"
+          rescue:
+            - name: "app_secrets | test | HF token consumers | Record the failure"
+              ansible.builtin.set_fact:
+                _undef_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+        - name: "app_secrets | test | HF token consumers | Undefined app_secrets_projected fails loudly"
+          ansible.builtin.assert:
+            that:
+              - app_secrets_projected is not defined
+              - _undef_msg is search("'app_secrets_projected' is undefined")
+            fail_msg: "{{ _undef_msg }}"
+            quiet: true
 
         - name: "app_secrets | test | HF token consumers | Render the app_pipeline values"
           ansible.builtin.include_tasks: hf_consumer_render.yaml

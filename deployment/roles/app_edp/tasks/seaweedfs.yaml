@@ -39,7 +39,7 @@
             - "List"
             - "Tagging"
             - "Admin"
-  when: not (app_secrets_projected | default(false))
+  when: not app_secrets_projected
 
 - name: "app_edp | Set OIDC endpoints for SeaweedFS"
   vars:
@@ -141,20 +141,22 @@
     namespace: "{{ edp_seaweedfs_namespace }}"
   register: seaweedfs_admin_secret_check
 
-- name: "app_edp | Set SeaweedFS admin user"
-  ansible.builtin.set_fact:
-    seaweedfs_admin_user: "admin"
-  when: seaweedfs_admin_secret_check.resources | length == 0
-
-# Sets seaweedfs_admin_password (local); with projected Secrets the port
-# renders seaweedfs-admin-secret on every run.
 - name: "app_edp | Generate SeaweedFS admin password"
+  ansible.builtin.set_fact:
+    seaweedfs_admin_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+    seaweedfs_admin_user: "admin"
+  when:
+    - seaweedfs_admin_secret_check.resources | length == 0
+    - not app_secrets_projected
+
+# With projected Secrets the port renders seaweedfs-admin-secret on every run.
+- name: "app_edp | Ensure the SeaweedFS admin password in the credential store"
   ansible.builtin.include_role:
     name: app_secrets
     tasks_from: ensure.yaml
   vars:
     secret_ids: [seaweedfs/admin]
-  when: (app_secrets_projected | default(false)) or seaweedfs_admin_secret_check.resources | length == 0
+  when: app_secrets_projected
 
 - name: "app_edp | Create SeaweedFS admin secret"
   kubernetes.core.k8s:
@@ -171,7 +173,7 @@
         adminPassword: "{{ seaweedfs_admin_password | b64encode }}"
   when:
     - seaweedfs_admin_secret_check.resources | length == 0
-    - not (app_secrets_projected | default(false))
+    - not app_secrets_projected
 
 - name: "app_edp | Create SeaweedFS S3 secret"
   kubernetes.core.k8s:
@@ -187,7 +189,7 @@
         admin_access_key_id: "{{ EDP_MINIO_ACCESS_KEY | b64encode }}"
         admin_secret_access_key: "{{ EDP_MINIO_SECRET_KEY | b64encode }}"
         seaweedfs_s3_config: "{{ s3_auth_config | to_json | b64encode }}"
-  when: not (app_secrets_projected | default(false))
+  when: not app_secrets_projected
 
 - name: "app_edp | Ensure SeaweedFS Helm repository"
   kubernetes.core.helm_repository:
@@ -232,12 +234,32 @@
     state: present
     definition: "{{ lookup('template', 'seaweedfs-httproutes.yaml.j2') | from_yaml_all | list }}"
 
-# Marks seaweedfs-s3-secret and seaweedfs-admin-secret, then refreshes the
-# credentials file from the marked Secrets.
 - name: "app_edp | Mark SeaweedFS secrets for password management"
   ansible.builtin.include_role:
-    name: app_secrets
-    tasks_from: ensure.yaml
+    name: app_password_mgmt
+    tasks_from: markup.yaml
   vars:
-    secret_ids: [edp/object-store, seaweedfs/admin]
-    ensure_phase: after_deploy
+    namespace: "{{ edp_seaweedfs_namespace }}"
+    secret_name: "seaweedfs-s3-secret"
+    password_mappings:
+      - { key: admin_access_key_id, variable: EDP_SEAWEEDFS_ACCESS_KEY, user: "" }
+      - { key: admin_secret_access_key, variable: EDP_SEAWEEDFS_SECRET_KEY, user: "" }
+  when: not app_secrets_projected
+
+- name: "app_edp | Mark SeaweedFS admin secrets for password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: markup.yaml
+  vars:
+    namespace: "{{ edp_seaweedfs_namespace }}"
+    secret_name: "seaweedfs-admin-secret"
+    password_mappings:
+      - { key: adminUser, variable: SEAWEEDFS_ADMIN_USER, user: "" }
+      - { key: adminPassword, variable: SEAWEEDFS_ADMIN_PASSWORD, user: "" }
+  when: not app_secrets_projected
+
+- name: "app_edp | Update credentials file from password management"
+  ansible.builtin.include_role:
+    name: app_password_mgmt
+    tasks_from: lookup.yaml
+  when: not app_secrets_projected

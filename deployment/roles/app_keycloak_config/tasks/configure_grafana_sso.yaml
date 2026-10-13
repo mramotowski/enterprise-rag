@@ -48,7 +48,7 @@
         grafana_sso_config: >-
           {{ _grafana_sso_env | dict2items
              | rejectattr('key', 'equalto', 'GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET') | items2dict }}
-      when: app_secrets_projected | default(false)
+      when: app_secrets_projected
 
     - name: "app_keycloak_config | grafana-sso | Project grafana-sso-env"
       ansible.builtin.include_role:
@@ -56,7 +56,7 @@
         tasks_from: ensure.yaml
       vars:
         secret_ids: [keycloak/grafana-oauth]
-      when: app_secrets_projected | default(false)
+      when: app_secrets_projected
 
     - name: "app_keycloak_config | grafana-sso | Create/update grafana-sso-env Secret"
       kubernetes.core.k8s:
@@ -72,7 +72,7 @@
               app.kubernetes.io/component: grafana-sso
           type: Opaque
           stringData: "{{ _grafana_sso_env }}"
-      when: not (app_secrets_projected | default(false))
+      when: not app_secrets_projected
       no_log: "{{ secure_logs | default(true) }}"
 
     - name: "app_keycloak_config | grafana-sso | Wire Secret into Grafana + roll"
@@ -90,7 +90,7 @@
                 annotations:
                   # Projected: over the non-secret settings only (the value stays in the store).
                   erag.intel.com/grafana-sso-config-hash: >-
-                    {{ (grafana_sso_config if app_secrets_projected | default(false) else _grafana_sso_env)
+                    {{ (grafana_sso_config if app_secrets_projected else _grafana_sso_env)
                        | to_json | hash('sha1') }}
               spec:
                 initContainers:

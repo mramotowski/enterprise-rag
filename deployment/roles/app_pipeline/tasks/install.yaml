@@ -285,7 +285,7 @@
 # only when the operator wrote the token (app_pre_install checked it).
 - name: "app_pipeline | Project the HF token into the pipeline namespace"
   when:
-    - app_secrets_projected | default(false)
+    - app_secrets_projected
     - hugging_token_projected | default(false) | bool
   block:
     - name: "app_pipeline | Enable the pipeline HF token projection"

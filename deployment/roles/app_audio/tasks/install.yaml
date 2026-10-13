@@ -45,7 +45,7 @@
 # token (app_pre_install checked it).
 - name: "app_audio | Project the HF token into the audio namespace"
   when:
-    - app_secrets_projected | default(false)
+    - app_secrets_projected
     - hugging_token_projected | default(false) | bool
   block:
     - name: "app_audio | Enable the audio HF token projection"

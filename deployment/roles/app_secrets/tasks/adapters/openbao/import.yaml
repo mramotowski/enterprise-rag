@@ -12,11 +12,12 @@
 #      legacy Secret keys of each KV key (legacy[].secret, import_enabled),
 #      whether it must import (import_required), the Secrets to hand over to
 #      ESO (every registry projection target and legacy Secret) and the
-#      Secrets to unmark (legacy markup: true, and the platform: entries);
+#      Secrets to unmark (legacy markup: true of the planned credentials, and
+#      the platform: entries);
 #   4. the importer's ServiceAccount, and a Role + RoleBinding in each existing
 #      namespace of the plan, limited by resourceNames to the planned Secrets
 #      (get + patch; platform Secrets: patch only);
-#   5. one importer Job (templates/importer-job.yaml.j2, files/secrets_importer.py):
+#   5. one importer Job (templates/secrets-job.yaml.j2, files/secrets_job.py import):
 #      it reads the legacy Secrets in-cluster, writes each credential with
 #      cas=0 (an existing other value is a conflict), then annotates the
 #      Helm-managed Secrets helm.sh/resource-policy: keep (the upgrade that
@@ -139,7 +140,7 @@
           {{ out | unique | list }}
         _unmark: >-
           {%- set out = _platform | list -%}
-          {%- for cid in app_secrets_selected_ids -%}
+          {%- for cid in _entries | map(attribute='id') -%}
             {%- for i in app_secrets_catalog[cid].legacy | default([], true)
                   if i.secret is mapping and i.secret.markup | default(false) | bool -%}
               {%- set _ = out.append({'namespace': i.secret.namespace | string, 'name': i.secret.name | string}) -%}
@@ -249,8 +250,7 @@
           vars:
             app_secrets_op: import
             app_secrets_worker_op: import
-            app_secrets_worker_plan: "{{ _app_secrets_import_entries | map(attribute='id') | list }}"
-            app_secrets_job_template: importer-job.yaml.j2
+            app_secrets_worker_plan: "{{ app_secrets_importer_plan }}"
             app_secrets_job_component: importer
 
       always:

@@ -111,19 +111,25 @@
           - _pod.serviceAccountName == 'erag-secrets-worker'
           - _c.args == ['ensure']
           - _c.env | selectattr('valueFrom', 'defined') | list | length == 0
-          - _c.env | map(attribute='name') | sort == ['BAO_ADDR', 'BAO_CACERT', 'BAO_CLIENT_TIMEOUT', 'OB_AUTH_MOUNT', 'OB_JWT_FILE', 'OB_KV_MOUNT', 'OB_PLAN_FILE', 'OB_ROLE', 'OB_WORK_DIR']
+          - _c.env | map(attribute='name') | sort == ['BAO_ADDR', 'BAO_CACERT', 'BAO_CLIENT_TIMEOUT', 'OB_AUTH_MOUNT', 'OB_JWT_FILE', 'OB_PLAN_FILE', 'OB_ROLE', 'PYTHONDONTWRITEBYTECODE']
           - _pod.volumes | selectattr('secret', 'defined') | list | length == 0
-          - (_pod.volumes | selectattr('name', 'equalto', 'openbao-token') | first).projected.sources[0].serviceAccountToken.audience == 'vault'
+          - (_pod.volumes | selectattr('name', 'equalto', 'tokens') | first).projected.sources | length == 1
+          - (_pod.volumes | selectattr('name', 'equalto', 'tokens') | first).projected.sources[0].serviceAccountToken.audience == 'vault'
           - (_pod.volumes | selectattr('name', 'equalto', 'openbao-ca') | first).configMap.name == 'openbao-ca-bundle'
           - _c.securityContext.readOnlyRootFilesystem
-          - _plan == ['write edp/postgresql t1/erag/edp/postgresql password=password:32:0 admin_password=password:32:0']
+          - _c.image == 'docker.io/library/python:3.12-slim'
+          - _plan == _want
         fail_msg: "worker Job shape: {{ _job.metadata.name }} plan {{ _plan }}"
         quiet: true
       vars:
         _job: "{{ _st['FakeJobRuns//all'].jobs[_runs[1]] }}"
         _pod: "{{ _job.spec.template.spec }}"
         _c: "{{ _pod.containers[0] }}"
-        _plan: "{{ _st['FakeJobRuns//all'].configmaps[_runs[1]].data.plan | trim | split('\n') }}"
+        _plan: "{{ _st['FakeJobRuns//all'].configmaps[_runs[1]].data['plan.json'] | from_json }}"
+        _pw32: {type: password, length: 32, special: false}
+        _want:
+          mount: intel-ai
+          entries: [{action: write, id: edp/postgresql, path: t1/erag/edp/postgresql, keys: {password: "{{ _pw32 }}", admin_password: "{{ _pw32 }}"}}]
 
     - name: "app_secrets | test | openbao | Check created values in OpenBao and the projected Secret"
       ansible.builtin.command:
@@ -595,7 +601,7 @@
       ansible.builtin.include_vars:
         file: "{{ ds_out }}/edp-seaweedfs/registry-vars.yaml"
 
-    # --- race, deleted, after_deploy ------------------------------------------------
+    # --- race, deleted ------------------------------------------------------------
 
     - name: "app_secrets | test | openbao | Another writer creates fingerprint/postgres first"
       ansible.builtin.command:
@@ -617,7 +623,7 @@
       changed_when: true
       failed_when: _del.stdout != 'rc=0'
 
-    - name: "app_secrets | test | openbao | Run the race, deleted and after_deploy cases"
+    - name: "app_secrets | test | openbao | Run the race and deleted cases"
       ansible.builtin.include_tasks: openbao_case.yaml
       loop:
         - {name: race, op: ensure, ids: [fingerprint/postgres], env: {FAKE_OPENBAO_RACE_PATH: t1/erag/fingerprint/postgres}}
@@ -627,26 +633,19 @@
         loop_var: case
         label: "{{ case.name }}"
 
-    - name: "app_secrets | test | openbao | Count the worker runs before after_deploy"
-      ansible.builtin.set_fact:
-        _runs_before_after_deploy: "{{ _runs | length }}"
-
-    - name: "app_secrets | test | openbao | after_deploy is a no-op"
-      ansible.builtin.include_tasks: openbao_case.yaml
-      vars:
-        case: {name: after-deploy, op: ensure, ids: [edp/postgresql, platform/keycloak-admin], phase: after_deploy}
-
     - name: "app_secrets | test | openbao | Digest after the race"
       ansible.builtin.command:
         argv: "{{ harness.split(' ') + ['digest', obdir, 't1/erag/fingerprint/postgres'] }}"
       register: _digest_after
       changed_when: false
 
-    - name: "app_secrets | test | openbao | Race, deleted and after_deploy results"
+    - name: "app_secrets | test | openbao | Race and deleted results"
       ansible.builtin.assert:
         that:
           - obcases['race'].ok
           - obcases['race'].worker.credentials['fingerprint/postgres'].result == 'exists'
+          # The injected "not found" did fire (the harness marker).
+          - (obdir ~ '/race-fired') is file
           - _digest_before.stdout == _digest_after.stdout
           - _digest_before.stdout != 'none'
           - not obcases['deleted'].ok
@@ -655,8 +654,6 @@
           - "'undelete' in obcases['deleted'].msg"
           - obcases['deleted-status'].status['edp/postgresql'].deleted
           - not obcases['deleted-status'].status['edp/postgresql'].exists
-          - obcases['after-deploy'].ok
-          - (_runs | length) == (_runs_before_after_deploy | int)
         fail_msg: "{{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
         quiet: true
 
@@ -701,6 +698,7 @@
         - {name: unreachable, op: probe, ids: [chat-history/postgres], addr: "https://127.0.0.1:1"}
         - {name: ensure-unreachable, op: ensure, ids: [chat-history/postgres], addr: "https://127.0.0.1:1"}
         - {name: rotate, op: rotate, ids: [chat-history/postgres]}
+        - {name: sigterm, op: probe, ids: [chat-history/postgres], env: {FAKE_JOB_SIGTERM: "2"}}
       loop_control:
         loop_var: case
         label: "{{ case.name }}"
@@ -977,7 +975,9 @@
           - obcases['delete-partial'].ok
           - obcases['delete-partial'].worker.credentials['chat-history/postgres'].result == 'removed'
           - obcases['delete-partial'].worker.purge is none
-          - _st['FakeJobRuns//all'].configmaps[_runs[-1]].data.plan | trim == 'delete chat-history/postgres t1/erag/chat-history/postgres'
+          - "'purge' not in (_st['FakeJobRuns//all'].configmaps[_runs[-1]].data['plan.json'] | from_json)"
+          - "(_st['FakeJobRuns//all'].configmaps[_runs[-1]].data['plan.json'] | from_json).entries
+            == [{'action': 'delete', 'id': 'chat-history/postgres', 'path': 't1/erag/chat-history/postgres'}]"
           - _counts_partial.results | map(attribute='stdout') | list == ['0', '3']
           # Only the ExternalSecrets (and Secrets) that read it are gone.
           - _ch_es | select('in', _st.keys() | list) | list | length == 0
@@ -1201,8 +1201,30 @@
           - "'is sealed' in obcases['delete-sealed'].msg"
           # No server here: the rotator runs and fails before it writes (test_rotation.yaml covers rotate).
           - "'chat-history/postgres (postgres-alter-user):' in obcases['rotate'].msg"
+          # A Job killed mid-run (deadline, eviction) still reports done.
+          - not obcases['sigterm'].ok
+          - obcases['sigterm'].worker.done.state == 'failed'
+          - "'interrupted by signal' in obcases['sigterm'].worker.done.error"
         fail_msg: "{{ obcases | dict2items | map(attribute='key') | zip(obcases | dict2items | map(attribute='value.msg')) | list | to_json }}"
         quiet: true
+
+    - name: "app_secrets | test | openbao | Only rotator pods join the Istio ambient mesh (istio_enabled)"
+      ansible.builtin.assert:
+        that:
+          - _mesh.rotate | default([]) | unique == ['ambient']
+          - _mesh.probe | default([]) | unique == ['none']
+          - _mesh.ensure | default([]) | unique == ['none']
+        fail_msg: "{{ _mesh | to_json }}"
+        quiet: true
+      vars:
+        # {<op>: [the pod's istio.io/dataplane-mode label or none, per run]}
+        _mesh: >-
+          {%- set out = {} -%}
+          {%- for j in _st['FakeJobRuns//all'].jobs.values() -%}
+            {%- set op = j.metadata.labels['erag-secrets/op'] -%}
+            {%- set _ = out.update({op: out.get(op, []) + [j.spec.template.metadata.labels.get('istio.io/dataplane-mode', 'none')]}) -%}
+          {%- endfor -%}
+          {{ out }}
 
 # The role defaults as plain vars on their own hosts (no case runs there).
 - name: "app_secrets | test | openbao | Role defaults: address, namespace and cluster id"

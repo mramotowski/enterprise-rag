@@ -4,7 +4,8 @@ name: Ansible playbook tests
 # Runs the offline Ansible test playbooks of the deployment roles (no cluster:
 # fake kubernetes.core, a fake Kubernetes API, OpenBao and Postgres in Docker,
 # helm template). One job per entry playbook, so a regression fails only its job.
-# Each job runs the command from the playbook's header comment.
+# Each job runs the command from the playbook's header comment. A separate job
+# checks the module arguments of every task (scripts/check_module_args.py).
 #
 # Actions are pinned to full commit SHAs (the trailing `# vX.Y.Z` is the tag
 # that SHA corresponded to); helm and the direct pip packages to exact
@@ -46,20 +47,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: app_secrets local adapter
-            playbook: deployment/roles/app_secrets/tests/test_local_adapter.yaml
+          - name: app_secrets port contract
+            playbook: deployment/roles/app_secrets/tests/test_port_contract.yaml
             inventory: "localhost,"
             fake_collections: false
             helm: false
             images: ""
             timeout: 20
-          - name: app_secrets role calls
-            playbook: deployment/roles/app_secrets/tests/test_role_calls.yaml
-            inventory: "localhost,"
-            fake_collections: true
-            helm: false
-            images: ""
-            timeout: 30
           - name: app_secrets data services
             playbook: deployment/roles/app_secrets/tests/test_data_services.yaml
             inventory: deployment/roles/app_secrets/tests/fixtures/data_services_inventory.yaml
@@ -118,6 +112,13 @@ jobs:
             timeout: 20
           - name: app_pre_install vector-dims Job
             playbook: deployment/roles/app_pre_install/tests/test_vector_dims_job.yaml
+            inventory: "localhost,"
+            fake_collections: true
+            helm: false
+            images: ""
+            timeout: 20
+          - name: app_script_job drift and edge auth Jobs
+            playbook: deployment/roles/app_script_job/tests/test_script_job_callers.yaml
             inventory: "localhost,"
             fake_collections: true
             helm: false
@@ -187,17 +188,72 @@ jobs:
           fi
           ansible-playbook -i "${INVENTORY}" -c local "${PLAYBOOK}"
 
+  # Unknown module arguments (e.g. k8s_info label_selector instead of
+  # label_selectors) pass ansible-lint and the static tests above, and fail
+  # only on a live run. Checks every task with mapping args against ansible-doc.
+  # ansible-lint's args rule (checked with kubernetes.core installed) passes the
+  # fixture's label_selector on k8s_info and fail_mesg on assert; only
+  # syntax-check catches its include_tasks typo. Hence this separate check.
+  module-args:
+    name: "Module arguments"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+
+      # kubernetes.core: the pin of enterprise-ai-solutions
+      # collections/requirements.yml (es_auto_installer.sh installs it over the
+      # copy bundled with the ansible package). Bump both together.
+      - name: Install Ansible and the pinned collections
+        run: |
+          pip install --disable-pip-version-check \
+            "ansible==12.3.0" "ansible-core==2.19.13" "Jinja2==3.1.6" "PyYAML==6.0.3"
+          ansible-galaxy collection install "kubernetes.core:==6.3.0" --force \
+            -p "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          ansible-galaxy collection list kubernetes.core
+
+      # The fixture has three unknown arguments: the check must fail on it,
+      # report exactly those three and resolve every module.
+      - name: Self-test of the check
+        run: |
+          out="$(python3 scripts/check_module_args.py scripts/testdata/check_module_args 2>&1)" && rc=0 || rc=$?
+          echo "${out}"
+          fail() { echo "check_module_args.py self-test: $1"; exit 1; }
+          [ "${rc}" -ne 0 ] || fail "exit 0 on the fixture"
+          [ "$(grep -c 'unknown argument' <<<"${out}" || true)" -eq 3 ] || fail "expected 3 unknown argument lines"
+          for arg in label_selector fail_mesg task_from; do
+            grep -q "unknown argument(s) \['${arg}'\]" <<<"${out}" || fail "${arg} not reported"
+          done
+          if grep -q 'not found' <<<"${out}"; then fail "a module was not found"; fi
+
+      - name: Check module arguments
+        run: python3 scripts/check_module_args.py deployment/roles deployment/backup.yaml
+
   # Single stable check for branch protection, independent of matrix entries.
   playbook-tests-result:
     name: "Ansible playbook tests result"
     if: always()
-    needs: playbook-test
+    needs: [playbook-test, module-args]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check the playbook test results
         env:
           RESULT: ${{ needs.playbook-test.result }}
+          ARGS_RESULT: ${{ needs.module-args.result }}
         run: |
-          echo "playbook-test: ${RESULT}"
-          [[ "${RESULT}" == "success" ]]
+          echo "playbook-test: ${RESULT}, module-args: ${ARGS_RESULT}"
+          [[ "${RESULT}" == "success" && "${ARGS_RESULT}" == "success" ]]

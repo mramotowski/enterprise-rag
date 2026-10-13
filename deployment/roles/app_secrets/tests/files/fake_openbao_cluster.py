@@ -13,33 +13,39 @@ Plays the cluster side of tests/test_openbao_adapter.yaml without a cluster:
                      that OpenBao's Kubernetes auth calls. Writes <dir>/env.json.
   stop <dir>         removes the container and the TokenReview server.
   hook <state> <key> FAKE_K8S_ON_APPLY of the fake kubernetes.core.k8s:
-                       Job            runs the Job's container in Docker exactly
-                                      as specified (command, args, env values,
-                                      ConfigMap and emptyDir volumes, projected
-                                      token minted for its audience), stores the
-                                      log and the Job status;
+                       Job            runs the Job's python3 command on this
+                                      host as specified (args, env values,
+                                      ConfigMap volumes, projected tokens
+                                      minted for their audience; the mount
+                                      paths in its env and argv remapped to
+                                      temp dirs), stores the log and the Job
+                                      status; KUBE_API points to a fake
+                                      Kubernetes API over TLS (the OpenBao dev
+                                      certificate) that serves and merge-
+                                      patches the Secrets of the state file and
+                                      enforces the Roles/RoleBindings of the
+                                      Job's ServiceAccount (resourceNames
+                                      included). Every API request is recorded
+                                      in "FakeKubeApi//requests", and the
+                                      Roles/RoleBindings present at run time in
+                                      the run archive (rbac);
                        ExternalSecret plays ESO: reads each remoteRef from
                                       OpenBao, renders target.template and writes
                                       the Secret and the Ready condition. An
                                       existing Secret is adopted: its labels and
                                       annotations stay, ESO's owner reference
                                       and the data replace the rest.
-                     A Job whose container runs python3 (the importer) runs
-                     on this host instead (no python image in Docker here):
-                     the volume mount paths in its env are remapped to temp
-                     dirs, KUBE_API points to a fake Kubernetes API over TLS
-                     (the OpenBao dev certificate) that serves and merge-
-                     patches the Secrets of the state file and enforces the
-                     Roles/RoleBindings of the Job's ServiceAccount
-                     (resourceNames included). Every API request is recorded in
-                     "FakeKubeApi//requests", and the Roles/RoleBindings present
-                     at run time in the run archive (rbac).
                      With FAKE_K8S_POLLS=<n> the final Job status / Ready
                      condition shows only after n reads (fake k8s_info); with
-                     FAKE_ESO_FAIL set, ESO reports Ready=False.
+                     FAKE_ESO_FAIL set, ESO reports Ready=False; with
+                     FAKE_JOB_SIGTERM=<s> the Job's OpenBao never answers and
+                     the Job gets SIGTERM after <s> seconds.
   root <dir> <args>  one bao command with the dev root token (test setup only).
   verify-nkey <dir> <kv path>
                      prints "ok" when seed and public_key form one NKey pair.
+  nkey-vectors <secrets_job.py> <count>
+                     prints "ok" when its ed25519 public keys match the RFC 8032
+                     vectors and cryptography, and <count> NKey pairs verify.
   check <dir> <kv path> <key> <regex>
                      prints "ok" when the value matches the regex.
   secret-equals <dir> <state> <ns>/<name> <secret key> <expected>
@@ -59,8 +65,8 @@ Plays the cluster side of tests/test_openbao_adapter.yaml without a cluster:
   seed-legacy <state> <spec.json> <credentials file> <values out>
                      the Secrets of a local-mode env (migration tests): the
                      legacy Secret keys of spec.json get the value of their
-                     file_var line in the credentials file (written by the local
-                     adapter), else a random one per credential key; markup,
+                     file_var line in the credentials file (written by
+                     app_generate_password), else a random one per credential key; markup,
                      Helm ownership and extra Secrets as the spec says. Every
                      value goes to <values out> (for the leak grep).
   secret-digests <state> <out.json>
@@ -89,8 +95,10 @@ import io
 import json
 import os
 import re
+import runpy
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -295,103 +303,7 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
-def run_job(state_path, key):
-    state = load_state(state_path)
-    job = state[key]
-    namespace = job["metadata"]["namespace"]
-    pod = job["spec"]["template"]["spec"]
-    (container,) = pod["containers"]
-    if container["command"][0] == "python3":
-        return run_host_job(state_path, key)
-    volumes = {v["name"]: v for v in pod.get("volumes", [])}
-    problems = []
-    if pod.get("automountServiceAccountToken") is not False:
-        problems.append("automountServiceAccountToken is not false")
-    if any("secret" in v for v in volumes.values()):
-        problems.append("a Secret volume is mounted")
-    work = tempfile.mkdtemp(prefix="job-", dir=os.environ["FAKE_OPENBAO_DIR"])
-    limit = (container.get("resources", {}).get("limits", {}) or {}).get("memory", "")
-    cmd = ["docker", "run", "--rm", "--network", "host", "--read-only", "--cap-drop", "ALL",
-           "--security-opt", "no-new-privileges"]
-    if limit:
-        # Same memory limit as the pod (Mi -> m), so the in-pod dev server fits.
-        mem = limit.replace("Mi", "m").replace("Gi", "g")
-        cmd += ["--memory", mem, "--memory-swap", mem]
-    cmd += [
-           "-u", "%s:%s" % (pod["securityContext"]["runAsUser"], pod["securityContext"]["runAsGroup"])]
-    for item in container.get("env", []):
-        if "value" not in item or "valueFrom" in item:
-            problems.append("env %s is not a plain value" % item.get("name"))
-            continue
-        value = item["value"]
-        if item["name"] == "BAO_ADDR" and os.environ.get("FAKE_OPENBAO_ADDR_OVERRIDE"):
-            value = os.environ["FAKE_OPENBAO_ADDR_OVERRIDE"]
-        cmd += ["-e", "%s=%s" % (item["name"], value)]
-    for mount in container.get("volumeMounts", []):
-        vol = volumes[mount["name"]]
-        host = os.path.join(work, mount["name"])
-        os.makedirs(host)
-        if "configMap" in vol:
-            cm = state.get("ConfigMap/%s/%s" % (namespace, vol["configMap"]["name"]))
-            if cm is None:
-                problems.append("ConfigMap %s missing" % vol["configMap"]["name"])
-                continue
-            items = vol["configMap"].get("items") or [{"key": k, "path": k} for k in cm.get("data", {})]
-            for it in items:
-                with open(os.path.join(host, it["path"]), "w", encoding="utf-8") as handle:
-                    handle.write(cm["data"][it["key"]])
-                os.chmod(os.path.join(host, it["path"]), 0o444)
-            cmd += ["-v", "%s:%s:ro" % (host, mount["mountPath"])]
-        elif "projected" in vol:
-            for src in vol["projected"]["sources"]:
-                token = src["serviceAccountToken"]
-                with open(os.path.join(host, token["path"]), "w", encoding="utf-8") as handle:
-                    handle.write(mint_jwt(namespace, pod["serviceAccountName"], token["audience"]))
-                os.chmod(os.path.join(host, token["path"]), 0o444)
-            cmd += ["-v", "%s:%s:ro" % (host, mount["mountPath"])]
-        elif "emptyDir" in vol:
-            cmd += ["--tmpfs", "%s:rw,size=16m,mode=0700,uid=%s,gid=%s" % (
-                mount["mountPath"], pod["securityContext"]["runAsUser"], pod["securityContext"]["runAsGroup"])]
-        else:
-            problems.append("unsupported volume %s" % mount["name"])
-    shim = os.environ.get("FAKE_OPENBAO_RACE_PATH")
-    if shim:
-        # Test-only race: the first metadata read of this path answers "not
-        # found", so the worker's cas=0 write meets an existing entry.
-        sdir = os.path.join(work, "shim")
-        os.makedirs(sdir)
-        with open(os.path.join(sdir, "bao"), "w", encoding="utf-8") as handle:
-            handle.write('#!/bin/sh\ncase "$*" in *"metadata/%s"*) [ -e /work/.raced ] || { : > /work/.raced; '
-                         'echo "No value found at x" >&2; exit 2; } ;; esac\nexec /usr/bin/bao "$@"\n' % shim)
-        os.chmod(os.path.join(sdir, "bao"), 0o555)
-        cmd += ["-v", "%s:/shim:ro" % sdir, "-e", "PATH=/shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-    cmd += ["--entrypoint", container["command"][0], container["image"]] + container["command"][1:] + container.get("args", [])
-    if problems:
-        lines, rc = ["fake-cluster: refused to run the Job: " + "; ".join(problems)], 1
-    else:
-        run = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        lines = (run.stdout + run.stderr).splitlines()
-        rc = run.returncode
-    state = load_state(state_path)
-    final = {"succeeded" if rc == 0 else "failed": 1}
-    polls = int(os.environ.get("FAKE_K8S_POLLS", "0"))
-    if polls > 0:
-        # k8s_info shows the final status only after <polls> reads (fake k8s_info).
-        state[key]["_fake_polls_left"] = polls
-        state[key]["_fake_final_status"] = final
-    else:
-        state[key].setdefault("status", {}).update(final)
-    state["JobLog/%s/%s" % (namespace, job["metadata"]["name"])] = {"lines": lines, "rc": rc}
-    # Archive the run: the adapter deletes old worker Jobs before each run.
-    runs = state.setdefault("FakeJobRuns//all", {"names": [], "jobs": {}, "configmaps": {}})
-    runs["names"].append(job["metadata"]["name"])
-    runs["jobs"][job["metadata"]["name"]] = job
-    runs["configmaps"][job["metadata"]["name"]] = state.get("ConfigMap/%s/%s" % (namespace, job["metadata"]["name"]))
-    save_state(state_path, state)
-    subprocess.run(["rm", "-rf", work], check=False)
-
-
-# --- host-run (python) Jobs and the fake Kubernetes API ----------------------------------
+# --- Jobs (run on this host) and the fake Kubernetes API ----------------------------------
 
 KUBE_AUDIENCE = "https://kubernetes.default.svc"
 
@@ -512,7 +424,7 @@ def remap_endpoints(work):
     with open(path, encoding="utf-8") as handle:
         endpoints = json.load(handle)
     for root, _dirs, files in os.walk(work):
-        if "plan.json" not in files or "secrets_rotator.py" not in files:
+        if "plan.json" not in files or "secrets_job.py" not in files:
             continue
         plan_path = os.path.join(root, "plan.json")
         with open(plan_path, encoding="utf-8") as handle:
@@ -529,8 +441,43 @@ def remap_endpoints(work):
             json.dump(plan, handle)
 
 
-def run_host_job(state_path, key):
-    """The importer Job: its python3 command on this host (see the module doc)."""
+# Test-only race (FAKE_OPENBAO_RACE_PATH): the first metadata read of that path
+# answers "not found", so the Job's cas=0 write meets an existing entry; the
+# injection creates the file FAKE_OPENBAO_RACE_MARKER (the test asserts it).
+RACE = """import os, runpy, sys
+script, sys.argv = sys.argv[1], sys.argv[1:]
+job = runpy.run_path(script, run_name="secrets_job")
+target, call = "/metadata/" + os.environ.pop("FAKE_OPENBAO_RACE_PATH"), job["Http"].call
+def raced(self, method, path, *args, **kwargs):
+    if target in path and not raced.done:
+        raced.done = True
+        open(os.environ.pop("FAKE_OPENBAO_RACE_MARKER"), "w").close()
+        return 404, {"errors": []}
+    return call(self, method, path, *args, **kwargs)
+raced.done = False
+job["Http"].call = raced
+sys.exit(job["main"]())
+"""
+
+
+def run_killed(argv, env, work, delay):
+    """FAKE_JOB_SIGTERM=<seconds>: the Job talks to an OpenBao that accepts the
+    connection and never answers, and gets SIGTERM after <seconds> (as a Job
+    past its deadline does). Returns (log lines, exit code)."""
+    hole = socket.socket()
+    hole.bind(("127.0.0.1", 0))
+    hole.listen(8)
+    env = dict(env, BAO_ADDR="https://127.0.0.1:%d" % hole.getsockname()[1])
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, cwd=work)
+    time.sleep(delay)
+    proc.send_signal(signal.SIGTERM)
+    out, _ = proc.communicate(timeout=60)
+    hole.close()
+    return out.splitlines(), proc.returncode
+
+
+def run_job(state_path, key):
+    """A Job: its python3 command on this host (see the module doc)."""
     state = load_state(state_path)
     job = state[key]
     namespace = job["metadata"]["namespace"]
@@ -581,18 +528,33 @@ def run_host_job(state_path, key):
         if item["name"] == "KUBE_API":
             value = "https://127.0.0.1:%d" % port
         env[item["name"]] = value
+    if container["command"][0] != "python3":
+        problems.append("the command is not python3")
     argv = [sys.executable] + container["command"][1:] + container.get("args", [])
     argv = [next((h + a[len(m):] for m, h in remap.items() if a.startswith(m + "/")), a) for a in argv]
+    if os.environ.get("FAKE_OPENBAO_RACE_PATH"):
+        env["FAKE_OPENBAO_RACE_PATH"] = os.environ["FAKE_OPENBAO_RACE_PATH"]
+        env["FAKE_OPENBAO_RACE_MARKER"] = os.path.join(os.environ["FAKE_OPENBAO_DIR"], "race-fired")
+        argv = argv[:2] + ["-c", RACE] + argv[2:]
     rbac = {k: v for k, v in state.items() if k.split("/", 1)[0] in ("Role", "RoleBinding")}
     if problems:
         lines, rc = ["fake-cluster: refused to run the Job: " + "; ".join(problems)], 1
+    elif os.environ.get("FAKE_JOB_SIGTERM"):
+        lines, rc = run_killed(argv, env, work, float(os.environ["FAKE_JOB_SIGTERM"]))
     else:
         run = subprocess.run(argv, capture_output=True, text=True, check=False, env=env, cwd=work, timeout=120)
         lines = (run.stdout + run.stderr).splitlines()
         rc = run.returncode
     server.shutdown()
     state = load_state(state_path)
-    state[key].setdefault("status", {}).update({"succeeded" if rc == 0 else "failed": 1})
+    final = {"succeeded" if rc == 0 else "failed": 1}
+    polls = int(os.environ.get("FAKE_K8S_POLLS", "0"))
+    if polls > 0:
+        # k8s_info shows the final status only after <polls> reads (fake k8s_info).
+        state[key]["_fake_polls_left"] = polls
+        state[key]["_fake_final_status"] = final
+    else:
+        state[key].setdefault("status", {}).update(final)
     state["JobLog/%s/%s" % (namespace, job["metadata"]["name"])] = {"lines": lines, "rc": rc}
     runs = state.setdefault("FakeJobRuns//all", {"names": [], "jobs": {}, "configmaps": {}})
     runs["names"].append(job["metadata"]["name"])
@@ -720,6 +682,44 @@ def verify_nkey(directory, path):
     print("ok" if ok else "mismatch")
 
 
+# RFC 8032 7.1 (TEST 1, 2, 3, 1024): secret key (the seed) -> public key.
+ED25519_VECTORS = [
+    ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+    ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+     "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"),
+    ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+     "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"),
+    ("f5e5767cf153319517630f226876b86c8160cc583bc013744c6bf255f5cc0ee5",
+     "278117fc144c72340f67d0f2316e8386ceffbf2b2428c9c51fef7c597f1d426e"),
+]
+
+
+def nkey_vectors(script, count):
+    """The pure-Python ed25519 public key of secrets_job.py against the RFC 8032
+    vectors and against cryptography for <count> random seeds, and <count>
+    generated NKey pairs through verify_nkey's checks."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    job = runpy.run_path(script, run_name="secrets_job")
+    bad = [s for s, p in ED25519_VECTORS if job["ed25519_public"](bytes.fromhex(s)).hex() != p]
+    for _ in range(int(count)):
+        seed = secrets.token_bytes(32)
+        want = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        bad += [] if job["ed25519_public"](seed) == want else ["random seed"]
+        sk, pk = job["nkey_user"]()
+        raw_seed, raw_pub = b32decode(sk), b32decode(pk)
+        ok = (len(sk) == 58 and sk.startswith("SU") and len(pk) == 56 and pk.startswith("U")
+              and raw_seed[:2] == bytes([0x95, 0x00]) and raw_pub[0] == 0xA0
+              and crc16(raw_seed[:-2]) == int.from_bytes(raw_seed[-2:], "little")
+              and crc16(raw_pub[:-2]) == int.from_bytes(raw_pub[-2:], "little")
+              and Ed25519PrivateKey.from_private_bytes(raw_seed[2:34]).public_key().public_bytes(
+                  Encoding.Raw, PublicFormat.Raw) == raw_pub[1:33])
+        bad += [] if ok else ["nkey pair"]
+    print("ok" if not bad else "mismatch: %d" % len(bad))
+
+
 def check(directory, path, key, regex):
     data = kv_get(load_env(directory), path) or {}
     print("ok" if key in data and re.fullmatch(regex, data[key]) else "mismatch")
@@ -790,7 +790,7 @@ def test_registry(src, out):
     with open(src, encoding="utf-8") as handle:
         reg = yaml.safe_load(handle)
     reg["templates"]["zz-embed"] = "x-${0}"
-    base = {"owner_role": "app_secrets", "legacy": [], "local": {"mechanism": "role_managed"},
+    base = {"owner_role": "app_secrets", "legacy": [],
             "rotate": {"none": True, "reason": "test"}, "identifiers": {}}
 
     def cred(cid, keys, **extra):
@@ -1457,6 +1457,8 @@ def main():
         verify_nkey(*args)
     elif cmd == "check":
         check(*args)
+    elif cmd == "nkey-vectors":
+        nkey_vectors(*args)
     elif cmd == "secret-equals":
         secret_equals(*args)
     elif cmd == "values":

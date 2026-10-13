@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Invalid registry for test_local_adapter.yaml: every entry except
+# Invalid registry for test_port_contract.yaml: every entry except
 # chat-history/postgres (and workloads ok) breaks one validation rule.
 
 credentials:
@@ -11,9 +11,8 @@ credentials:
     keys:
       password: {generate: {type: password, length: 32, special: false}}
     legacy:
-      - {kv_key: password, file_var: CHAT_HISTORY_POSTGRES_PASSWORD, user: chat_history, secret: null}
+      - {kv_key: password, secret: {namespace: chat-history, name: mongo-database-secret, key: POSTGRES_PASSWORD, markup: true}}
     rotate: {none: true, reason: test}
-    local: {mechanism: file_password}
 
   Bad_Id/x:
     owner_role: app_chat_history
@@ -21,22 +20,12 @@ credentials:
     keys: {}
     legacy: []
     rotate: {none: true, reason: test}
-    local: {mechanism: file_password}
-
-  bad/mechanism:
-    owner_role: app_chat_history
-    path: erag/bad/mechanism
-    keys: {}
-    legacy: []
-    rotate: {none: true, reason: test}
-    local: {mechanism: vault_file}
 
   bad/no-rotate:
     owner_role: app_chat_history
     path: erag/bad/no-rotate
     keys: {}
     legacy: []
-    local: {mechanism: file_password}
 
   bad/hook:
     owner_role: app_chat_history
@@ -44,7 +33,6 @@ credentials:
     keys: {password: {generate: {type: password, length: 16}}}
     legacy: []
     rotate: {hook: vector-db-password-change, keys: [password], target: {}, restart: []}
-    local: {mechanism: file_password}
 
   bad/restart:
     owner_role: app_chat_history
@@ -52,7 +40,6 @@ credentials:
     keys: {password: {generate: {type: password, length: 16}}}
     legacy: []
     rotate: {hook: redis-acl-set, keys: [password], target: {host: h, port: 1, user: u}, restart: [model-pods]}
-    local: {mechanism: file_password}
 
   bad/keys:
     owner_role: app_chat_history
@@ -60,7 +47,6 @@ credentials:
     keys: {token: {generate: {type: static}}}
     legacy: []
     rotate: {hook: redis-acl-set, keys: [token], target: {host: h, port: 1, user: u}, restart: []}
-    local: {mechanism: file_password}
 
   bad/target:
     owner_role: app_chat_history
@@ -68,7 +54,6 @@ credentials:
     keys: {password: {generate: {type: password, length: 16}}}
     legacy: []
     rotate: {hook: postgres-alter-user, keys: [password], target: {host: h, port: 1}, restart: [ok]}
-    local: {mechanism: file_password}
 
   bad/operator:
     owner_role: app_chat_history
@@ -76,7 +61,6 @@ credentials:
     keys: {token: {generate: {type: static}}}
     legacy: []
     rotate: {hook: operator-write, restart: []}
-    local: {mechanism: user_supplied}
 
 workloads:
   ok:
